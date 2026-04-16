@@ -89,7 +89,7 @@ define_register_enum!(
     PresentLoad => (0x3C, 2, "Present Load"),
     PresentVoltage => (0x3E, 1, "Present Voltage"),
     PresentTemperature => (0x3F, 1, "Present Temperature"),
-    Status => (0x40, 1, "Communication Status"),
+    Status => (0x41, 1, "Motor Status"),
     Moving => (0x42, 1, "Moving Status"),
     PresentCurrent => (0x45, 2, "Present Current"),
 );
