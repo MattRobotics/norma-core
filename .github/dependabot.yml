@@ -1,0 +1,13 @@
+version: 2
+registries: {}
+
+updates:
+  - package-ecosystem: "npm"
+    directory: "/software/station/clients/station-viewer"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "deps"
