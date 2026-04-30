@@ -7,7 +7,33 @@ Built on [SmolVLA](https://huggingface.co/docs/lerobot/smolvla) and
 [`lerobot`](https://github.com/huggingface/lerobot) by 🤗 HuggingFace.
 See [Credits](#-credits) below.
 
-## 🏋️ Train
+## ☁️ Train remotely
+
+For a single serverless fine-tune run (e.g. on Nebius GPUs), bundle the code
+and dataset into a self-contained zip and ship it to the remote.
+
+**1. Build the bundle:**
+
+```bash
+./scripts/build_bundle.sh path/to/dataset.parquet [more.parquet ...]
+```
+
+Produces `smolvla-bundle.zip` with `pyproject.toml`, `uv.lock`, the `smolvla/`
+package, `scripts/train.py`, `scripts/merge_datasets.py`, and the staged
+parquets under `datasets/`. Everything the trainer needs is inside.
+
+**2. Submit the job.** Bundling is the only step that differs from a local
+run; everything else — `uv sync`, `scripts/train.py`, hyperparam flags — is
+identical, just executed on the remote against the bundle's own `datasets/`
+directory. 
+
+The full Nebius recipe (upload bundle, create bucket, create job,
+fetch checkpoints) is in [`nebius.md`](./nebius.md).
+
+## 🏋️ Train locally
+
+Same training entry point, run directly on your own GPU — useful for short
+development runs or if you'd rather not spin up a cloud job:
 
 ```bash
 uv sync
@@ -22,20 +48,7 @@ over the full set. Checkpoints land in `--output/step-NNNNNN/` and
 `--output/final/`. See `--help` for the full hyperparam list (`--lr`,
 `--warmup-steps`, `--decay-steps`, `--save-every`, ...).
 
-For a remote single fine-tune run on Nebius serverless GPUs, see
-[`nebius.md`](./nebius.md). ☁️
-
-## 📦 Bundle code + dataset
-
-```bash
-./scripts/build_bundle.sh path/to/dataset.parquet [more.parquet ...]
-```
-
-Outputs `smolvla-bundle.zip` with `pyproject.toml`, `uv.lock`, the `smolvla/`
-package, `scripts/`, and the staged parquets under `datasets/`. The remote
-job extracts this and trains against it.
-
-To merge several parquets into one before bundling:
+If you have many parquets to merge first:
 
 ```bash
 uv run python scripts/merge_datasets.py \
