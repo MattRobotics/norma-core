@@ -91,10 +91,11 @@ Start the build container:
 docker run --rm -it \
   --name yocto-x8 \
   --userns=keep-id \
-  -e HOME=/workdir/target/yocto-portenta-x8/.home \
+  -e HOME=/workdir/.home \
   -e USER=builder \
-  -v "$NORMACORE_ROOT:/workdir:Z" \
-  -w /workdir/target/yocto-portenta-x8 \
+  -v "$YOCTO_WORKSPACE:/workdir:Z" \
+  -v "$NORMACORE_ROOT:/norma-core:ro,Z" \
+  -w /workdir \
   hub.foundries.io/lmp-sdk:95 \
   bash
 ```
@@ -104,19 +105,18 @@ Inside the container:
 **Inside Docker:**
 
 ```text
-/workdir                          # NormaCore checkout
-/workdir/target/yocto-portenta-x8 # Yocto workspace root
+/workdir    # Yocto workspace root
+/norma-core # read-only NormaCore checkout
 ```
 
 ## 1. Fetch The NXP Base BSP 📦
 
-Inside the container, from `/workdir/target/yocto-portenta-x8`, use the
-official NXP i.MX manifest:
+Inside the container, from `/workdir`, use the official NXP i.MX manifest:
 
 **Inside Docker:**
 
 ```bash
-cd /workdir/target/yocto-portenta-x8
+cd /workdir
 
 git config --global user.email "you@example.com"
 git config --global user.name "Your Name"
@@ -155,7 +155,7 @@ From the Yocto workspace root, symlink this NormaCore checkout into
 **Inside Docker:**
 
 ```bash
-ln -s ../../.. sources/norma-core
+ln -s /norma-core sources/norma-core
 ```
 
 ## 3. Create The Build Directory 🛠️
@@ -165,7 +165,7 @@ Start from the workspace root:
 **Inside Docker:**
 
 ```bash
-cd /workdir/target/yocto-portenta-x8
+cd /workdir
 ```
 
 Use the NormaCore Yocto template:
@@ -173,8 +173,8 @@ Use the NormaCore Yocto template:
 **Inside Docker:**
 
 ```bash
-TEMPLATECONF=/workdir/target/yocto-portenta-x8/sources/norma-core/device-support/arduino-portenta-x8/yocto/meta-normacore-x8/conf/templates/normacore-x8 \
-  source /workdir/target/yocto-portenta-x8/sources/poky/oe-init-build-env bld-x8
+TEMPLATECONF=/workdir/sources/norma-core/device-support/arduino-portenta-x8/yocto/meta-normacore-x8/conf/templates/normacore-x8 \
+  source /workdir/sources/poky/oe-init-build-env bld-x8
 ```
 
 This creates:
@@ -268,7 +268,7 @@ From the workspace root:
 **Inside Docker:**
 
 ```bash
-cd /workdir/target/yocto-portenta-x8
+cd /workdir
 mkdir -p flash-x8
 cd flash-x8
 
