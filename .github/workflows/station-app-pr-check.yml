@@ -1,4 +1,4 @@
-name: Station Viewer PR Check
+name: Station App PR Check
 
 env:
   NODE_VERSION: "22"
@@ -6,8 +6,8 @@ env:
 on:
   pull_request:
     paths:
-      - ".github/workflows/station-viewer-pr-check.yml"
-      - "software/station/clients/station-viewer/**"
+      - ".github/workflows/station-app-pr-check.yml"
+      - "software/station/clients/station-app/**"
 
 jobs:
   lint-typecheck-and-build:
@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: software/station/clients/station-viewer
+        working-directory: software/station/clients/station-app
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,7 +25,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: "npm"
-          cache-dependency-path: software/station/clients/station-viewer/package-lock.json
+          cache-dependency-path: software/station/clients/station-app/package-lock.json
 
       - name: Install dependencies
         run: npm ci
