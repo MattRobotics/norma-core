@@ -19,7 +19,6 @@
     "type-check": "tsc -b"
   },
   "dependencies": {
-    "@tailwindcss/aspect-ratio": "^0.4.2",
     "@types/three": "^0.184.0",
     "long": "^5.2.3",
     "lucide-react": "^0.552.0",
