@@ -5,7 +5,7 @@
 //! never changes Position Offset, and never freezes calibration arcs.
 
 use crate::protocol::{self, RamRegister};
-use crate::st3215_proto::{InferenceState, TxEnvelope};
+use crate::st3215_proto::{CommandResult, InferenceState, TxEnvelope};
 use crate::state::{CalibrationStatus, ST3215BusCommunicator};
 use bytes::Bytes;
 use log::{error, info};
@@ -142,6 +142,8 @@ impl HybridContactDetector {
         if observation.has_driver_error
             || observation.status != 0
             || !observation.torque_enabled
+            || observation.torque_limit != PILOT_TORQUE_LIMIT
+            || observation.goal_position != commanded_target
             || observation.current >= self.config.hard_current_abort_raw
         {
             return ContactState::HardAbort;
@@ -194,6 +196,56 @@ struct ContactResult {
     second_tick: u16,
     spread_ticks: u16,
     baseline: BaselineStats,
+}
+
+fn combine_pilot_and_cleanup(
+    pilot: Result<ContactResult, String>,
+    cleanup: Result<(), String>,
+) -> Result<ContactResult, String> {
+    match (pilot, cleanup) {
+        (Ok(contact), Ok(())) => Ok(contact),
+        (Err(pilot_err), Ok(())) => Err(pilot_err),
+        (Ok(_), Err(cleanup_err)) => Err(format!(
+            "MATDOG pilot completed but torque-OFF cleanup failed: {cleanup_err}"
+        )),
+        (Err(pilot_err), Err(cleanup_err)) => Err(format!(
+            "{pilot_err}; torque-OFF cleanup also failed: {cleanup_err}"
+        )),
+    }
+}
+
+fn is_allowed_matdog_ram_register(register: RamRegister) -> bool {
+    matches!(
+        register,
+        RamRegister::TorqueEnable
+            | RamRegister::Acc
+            | RamRegister::GoalPosition
+            | RamRegister::GoalSpeed
+            | RamRegister::TorqueLimit
+    )
+}
+
+fn validate_ram_write(register: RamRegister, value: &[u8]) -> Result<(), DynError> {
+    if !is_allowed_matdog_ram_register(register) {
+        return Err(format!("MATDOG RAM write is not allowlisted: {}", register.name()).into());
+    }
+    if value.len() != register.size() as usize {
+        return Err(format!(
+            "MATDOG RAM write size mismatch for {}: expected={}, actual={}",
+            register.name(),
+            register.size(),
+            value.len()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn global_torque_off_writes() -> Vec<(u8, Vec<u8>)> {
+    MATDOG_MOTOR_IDS
+        .iter()
+        .map(|&motor_id| (motor_id, vec![0]))
+        .collect()
 }
 
 pub fn is_exact_matdog_motor_set(found: &[u8]) -> bool {
@@ -287,11 +339,15 @@ async fn run_native_m12_min_pilot(
         None,
     );
 
-    let result = calibrator.run_pilot().await;
-    let cleanup = calibrator.global_torque_off_verified().await;
+    let result = calibrator.run_pilot().await.map_err(|err| err.to_string());
+    // This is the single final cleanup point for both success and every error path.
+    let cleanup = calibrator
+        .global_torque_off_verified()
+        .await
+        .map_err(|err| err.to_string());
 
-    match (result, cleanup) {
-        (Ok(contact), Ok(())) => {
+    match combine_pilot_and_cleanup(result, cleanup) {
+        Ok(contact) => {
             info!(
                 "MATDOG M12 MIN complete: first={}, second={}, spread={}, baseline_median={}, baseline_mad={}",
                 contact.first_tick,
@@ -303,17 +359,7 @@ async fn run_native_m12_min_pilot(
             calibrator.mark_done();
             Ok(())
         }
-        (Err(err), Ok(())) => {
-            calibrator.mark_failed(&err.to_string());
-            Err(err)
-        }
-        (Ok(_), Err(cleanup_err)) => {
-            let message = format!("MATDOG pilot completed but torque-OFF cleanup failed: {cleanup_err}");
-            calibrator.mark_failed(&message);
-            Err(message.into())
-        }
-        (Err(err), Err(cleanup_err)) => {
-            let message = format!("{err}; torque-OFF cleanup also failed: {cleanup_err}");
+        Err(message) => {
             calibrator.mark_failed(&message);
             Err(message.into())
         }
@@ -325,6 +371,7 @@ struct MatdogRamOnlyCalibrator {
     comm: Arc<ST3215BusCommunicator>,
     inference_rx: watch::Receiver<InferenceState>,
     stop_requested: Arc<AtomicBool>,
+    command_nonce: u64,
     command_counter: u64,
     current_step: u32,
     total_steps: u32,
@@ -342,6 +389,7 @@ impl MatdogRamOnlyCalibrator {
             comm,
             inference_rx,
             stop_requested,
+            command_nonce: systime::get_monotonic_stamp_ns(),
             command_counter: 0,
             current_step: 0,
             total_steps: 0,
@@ -357,7 +405,7 @@ impl MatdogRamOnlyCalibrator {
 
         self.next_phase("Prime and configure M12 RAM only")?;
         let initial = self.latest_observation(PILOT_MOTOR_ID)?;
-        self.ensure_observation_safe(initial, false)?;
+        self.ensure_observation_safe(initial, false, None)?;
         self.set_goal_verified(initial.position).await?;
         self.write_ram_verified(
             RamRegister::TorqueLimit,
@@ -389,20 +437,14 @@ impl MatdogRamOnlyCalibrator {
         let second_tick = self.approach_min(FINE_STEP_TICKS, baseline).await?;
 
         self.next_phase("Verify repeatability")?;
-        let spread_ticks = circular_distance(first_tick, second_tick);
-        if spread_ticks > REPEATABILITY_TOLERANCE_TICKS {
-            return Err(format!(
-                "M12 contact not repeatable: first={first_tick}, second={second_tick}, spread={spread_ticks}"
-            )
-            .into());
-        }
+        let spread_ticks = repeatability_spread(first_tick, second_tick)
+            .map_err(|message| -> DynError { message.into() })?;
 
         self.next_phase("Return M12 home")?;
         self.stop_pressure(second_tick).await?;
         self.move_to(HOME_TICK, HOME_TOLERANCE_TICKS).await?;
 
         self.next_phase("Final verified global torque OFF")?;
-        self.global_torque_off_verified().await?;
 
         Ok(ContactResult {
             first_tick,
@@ -426,7 +468,7 @@ impl MatdogRamOnlyCalibrator {
                 .wait_for_observation_after(last_stamp, TELEMETRY_TIMEOUT)
                 .await?;
             last_stamp = observation.monotonic_stamp_ns;
-            self.ensure_observation_safe(observation, true)?;
+            self.ensure_observation_safe(observation, true, Some(BASELINE_TARGET_TICK))?;
 
             if circular_distance(observation.position, previous_position) > 0
                 || speed_magnitude(observation.velocity) > 0
@@ -463,7 +505,7 @@ impl MatdogRamOnlyCalibrator {
         baseline: BaselineStats,
     ) -> Result<u16, DynError> {
         let start = self.latest_observation(PILOT_MOTOR_ID)?;
-        self.ensure_observation_safe(start, true)?;
+        self.ensure_observation_safe(start, true, None)?;
         let mut detector = HybridContactDetector::new(
             start.position,
             baseline,
@@ -513,9 +555,12 @@ impl MatdogRamOnlyCalibrator {
                     ContactState::HardAbort => {
                         self.stop_pressure(observation.position).await?;
                         return Err(format!(
-                            "M12 hard abort: tick={}, current={}, status=0x{:02X}, driver_error={}",
+                            "M12 hard abort: tick={}, goal={}, current={}, torque_enabled={}, torque_limit={}, status=0x{:02X}, driver_error={}",
                             observation.position,
+                            observation.goal_position,
                             observation.current,
+                            observation.torque_enabled,
+                            observation.torque_limit,
                             observation.status,
                             observation.has_driver_error
                         )
@@ -525,7 +570,7 @@ impl MatdogRamOnlyCalibrator {
             }
 
             let observation = last_observation.ok_or("M12 settle window produced no telemetry")?;
-            self.ensure_observation_safe(observation, true)?;
+            self.ensure_observation_safe(observation, true, Some(target))?;
             if circular_distance(observation.position, target) > step_ticks.saturating_add(4) {
                 self.stop_pressure(observation.position).await?;
                 return Err(format!(
@@ -577,7 +622,7 @@ impl MatdogRamOnlyCalibrator {
                 .wait_for_observation_after(last_stamp, TELEMETRY_TIMEOUT)
                 .await?;
             last_stamp = observation.monotonic_stamp_ns;
-            self.ensure_observation_safe(observation, true)?;
+            self.ensure_observation_safe(observation, true, Some(target))?;
             if circular_distance(observation.position, target) <= tolerance {
                 return Ok(observation);
             }
@@ -617,10 +662,7 @@ impl MatdogRamOnlyCalibrator {
     }
 
     async fn global_torque_off_verified(&mut self) -> Result<(), DynError> {
-        let writes: Vec<(u8, Vec<u8>)> = MATDOG_MOTOR_IDS
-            .iter()
-            .map(|&motor_id| (motor_id, vec![0]))
-            .collect();
+        let writes = global_torque_off_writes();
         self.sync_write_ram_verified(RamRegister::TorqueEnable, &writes)
             .await?;
         for motor_id in MATDOG_MOTOR_IDS {
@@ -641,6 +683,7 @@ impl MatdogRamOnlyCalibrator {
         register: RamRegister,
         value: Vec<u8>,
     ) -> Result<(), DynError> {
+        validate_ram_write(register, &value)?;
         let initial_stamp = self.latest_observation(PILOT_MOTOR_ID)?.monotonic_stamp_ns;
         let command_id = self.next_command_id();
         let envelope = TxEnvelope {
@@ -672,6 +715,19 @@ impl MatdogRamOnlyCalibrator {
         register: RamRegister,
         writes: &[(u8, Vec<u8>)],
     ) -> Result<(), DynError> {
+        if writes.is_empty() {
+            return Err("MATDOG sync-write cannot be empty".into());
+        }
+        let mut unique_motor_ids = BTreeSet::new();
+        for (motor_id, value) in writes {
+            validate_ram_write(register, value)?;
+            if !MATDOG_MOTOR_IDS.contains(motor_id) {
+                return Err(format!("non-MATDOG sync-write motor ID: {motor_id}").into());
+            }
+            if !unique_motor_ids.insert(*motor_id) {
+                return Err(format!("duplicate MATDOG sync-write motor ID: {motor_id}").into());
+            }
+        }
         let initial_stamps: Vec<(u8, u64)> = writes
             .iter()
             .map(|(motor_id, _)| {
@@ -722,7 +778,6 @@ impl MatdogRamOnlyCalibrator {
         initial_stamp: u64,
     ) -> Result<(), DynError> {
         let deadline = Instant::now() + COMMAND_TIMEOUT;
-        let address = register.address() as usize;
         let mut last_stamp = initial_stamp;
 
         while Instant::now() < deadline {
@@ -732,9 +787,7 @@ impl MatdogRamOnlyCalibrator {
             last_stamp = observation.monotonic_stamp_ns;
             let state = self.current_state();
             let motor = find_motor(&state, &self.target_bus_serial, motor_id)?;
-            if motor.state.len() >= address + expected.len()
-                && &motor.state[address..address + expected.len()] == expected
-            {
+            if motor_ram_register_matches(motor, register, expected) {
                 return Ok(());
             }
         }
@@ -751,11 +804,16 @@ impl MatdogRamOnlyCalibrator {
         loop {
             let state = self.current_state();
             if let Some(result) = command_result_for(&state, &self.target_bus_serial, command_id) {
-                match result {
-                    1 => return Ok(()),
-                    2 => return Err("ST3215 command rejected".into()),
-                    3 => return Err("ST3215 command failed".into()),
-                    _ => {}
+                match CommandResult::try_from(result) {
+                    Ok(CommandResult::CrSuccess) => return Ok(()),
+                    Ok(CommandResult::CrRejected) => {
+                        return Err("ST3215 command rejected".into());
+                    }
+                    Ok(CommandResult::CrFailed) => return Err("ST3215 command failed".into()),
+                    Ok(CommandResult::CrProcessing) => {}
+                    Err(_) => {
+                        return Err(format!("invalid ST3215 command result: {result}").into());
+                    }
                 }
             }
             tokio::select! {
@@ -776,8 +834,7 @@ impl MatdogRamOnlyCalibrator {
         loop {
             let state = self.current_state();
             if let Ok(found) = motor_ids_for_bus(&state, &self.target_bus_serial) {
-                let found_vec: Vec<u8> = found.iter().copied().collect();
-                if is_exact_matdog_motor_set(&found_vec) {
+                if is_exact_matdog_motor_set(&found) {
                     return Ok(());
                 }
                 if found.len() >= MATDOG_MOTOR_IDS.len() {
@@ -852,6 +909,7 @@ impl MatdogRamOnlyCalibrator {
         &self,
         observation: MotorObservation,
         require_torque: bool,
+        expected_goal: Option<u16>,
     ) -> Result<(), DynError> {
         if observation.has_driver_error {
             return Err("M12 driver error present".into());
@@ -861,6 +919,22 @@ impl MatdogRamOnlyCalibrator {
         }
         if require_torque && !observation.torque_enabled {
             return Err("M12 torque unexpectedly disabled".into());
+        }
+        if require_torque && observation.torque_limit != PILOT_TORQUE_LIMIT {
+            return Err(format!(
+                "M12 torque-limit readback changed: expected={}, observed={}",
+                PILOT_TORQUE_LIMIT, observation.torque_limit
+            )
+            .into());
+        }
+        if let Some(expected_goal) = expected_goal {
+            if observation.goal_position != expected_goal {
+                return Err(format!(
+                    "M12 goal-position readback changed: expected={expected_goal}, observed={}",
+                    observation.goal_position
+                )
+                .into());
+            }
         }
         if observation.current >= HARD_CURRENT_ABORT_RAW {
             return Err(format!(
@@ -918,7 +992,11 @@ impl MatdogRamOnlyCalibrator {
 
     fn next_command_id(&mut self) -> Bytes {
         self.command_counter += 1;
-        Bytes::from(self.command_counter.to_le_bytes().to_vec())
+        make_command_id(
+            systime::get_app_start_id(),
+            self.command_nonce,
+            self.command_counter,
+        )
     }
 }
 
@@ -938,13 +1016,29 @@ fn find_motor<'a>(
         .ok_or_else(|| format!("M{motor_id} not found on bus {bus_serial}").into())
 }
 
-fn motor_ids_for_bus(state: &InferenceState, bus_serial: &str) -> Result<BTreeSet<u8>, DynError> {
+fn motor_ids_for_bus(state: &InferenceState, bus_serial: &str) -> Result<Vec<u8>, DynError> {
     let bus = state
         .buses
         .iter()
         .find(|bus| bus.bus.as_ref().map(|bus| bus.serial_number.as_str()) == Some(bus_serial))
         .ok_or_else(|| format!("ST3215 bus not found: {bus_serial}"))?;
-    Ok(bus.motors.iter().map(|motor| motor.id as u8).collect())
+    bus.motors
+        .iter()
+        .map(|motor| -> Result<u8, DynError> {
+            u8::try_from(motor.id)
+                .map_err(|_| format!("invalid ST3215 motor ID in inference: {}", motor.id).into())
+        })
+        .collect()
+}
+
+fn motor_ram_register_matches(
+    motor: &crate::st3215_proto::inference_state::MotorState,
+    register: RamRegister,
+    expected: &[u8],
+) -> bool {
+    let address = register.address() as usize;
+    motor.state.len() >= address + expected.len()
+        && &motor.state[address..address + expected.len()] == expected
 }
 
 fn observation_from_state(
@@ -998,6 +1092,25 @@ fn median(values: &[u16]) -> u16 {
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
     sorted[sorted.len() / 2]
+}
+
+fn repeatability_spread(first_tick: u16, second_tick: u16) -> Result<u16, String> {
+    let spread_ticks = circular_distance(first_tick, second_tick);
+    if spread_ticks > REPEATABILITY_TOLERANCE_TICKS {
+        Err(format!(
+            "M12 contact not repeatable: first={first_tick}, second={second_tick}, spread={spread_ticks}"
+        ))
+    } else {
+        Ok(spread_ticks)
+    }
+}
+
+fn make_command_id(app_start_id: u64, nonce: u64, counter: u64) -> Bytes {
+    let mut bytes = Vec::with_capacity(24);
+    bytes.extend_from_slice(&app_start_id.to_le_bytes());
+    bytes.extend_from_slice(&nonce.to_le_bytes());
+    bytes.extend_from_slice(&counter.to_le_bytes());
+    Bytes::from(bytes)
 }
 
 fn signed_tick_delta(value: u16, reference: u16) -> i16 {
