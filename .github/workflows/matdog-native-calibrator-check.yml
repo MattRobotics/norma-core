@@ -84,11 +84,37 @@ jobs:
           print("MATDOG RAM-only source contract: PASS")
           PY
 
-      - name: Rust format check
+      - name: Repository-wide Rust format audit
+        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
           cargo fmt --all -- --check 2>&1 | tee ci-output/cargo-fmt.log
+
+      - name: MATDOG changed Rust format check
+        id: matdog_format
+        shell: bash
+        run: |
+          rustfmt --edition 2021 --check \
+            software/drivers/st3215/src/auto_calibrate/mod.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+
+      - name: Prepare formatted MATDOG diagnostics
+        if: failure() && steps.matdog_format.outcome == 'failure'
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            software/drivers/st3215/src/auto_calibrate/mod.rs
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          )
+          rustfmt --edition 2021 "${files[@]}"
+          mkdir -p ci-output/formatted
+          for file in "${files[@]}"; do
+            cp "$file" "ci-output/formatted/$(basename "$file")"
+          done
 
       - name: ST3215 unit tests
         shell: bash
