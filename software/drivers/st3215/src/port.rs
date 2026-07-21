@@ -28,6 +28,12 @@ const NO_COMMAND_SEARCH_DELAY_MS: u64 = 500;
 const MIN_TIME_BETWEEN_SEARCHES_MS: u64 = 100;
 pub const MAX_MOTORS_CNT: u8 = 8;
 
+// MATDOG uses sparse servo IDs up to 43:
+// 11-13, 21-23, 31-33, 41-43.
+// Keep MAX_MOTORS_CNT unchanged for upstream calibration routines;
+// only extend automatic bus discovery.
+const MAX_SCAN_MOTOR_ID: u8 = 43;
+
 pub struct St3215Port {
     port_info: SerialPortInfo,
     bus_info: St3215BusProto,
@@ -408,7 +414,7 @@ impl St3215Port {
         }
         match Self::search_motors_ignoring(
             port,
-            MAX_MOTORS_CNT,
+            MAX_SCAN_MOTOR_ID,
             &currently_seen_motors,
             com,
             bus_info,
