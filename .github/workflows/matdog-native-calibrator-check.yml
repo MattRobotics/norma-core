@@ -9,6 +9,14 @@ on:
       - "software/drivers/st3215/**"
       - "software/station/bin/station/**"
       - "protobufs/drivers/st3215/**"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/matdog-native-calibrator-check.yml"
+      - "software/drivers/st3215/**"
+      - "software/station/bin/station/**"
+      - "protobufs/drivers/st3215/**"
   workflow_dispatch:
 
 jobs:
