@@ -95,7 +95,7 @@ jobs:
         id: matdog_format
         shell: bash
         run: |
-          rustfmt --edition 2021 --check \
+          rustfmt --edition 2021 --check --config skip_children=true \
             software/drivers/st3215/src/auto_calibrate/mod.rs \
             software/drivers/st3215/src/auto_calibrate/matdog.rs \
             software/drivers/st3215/src/auto_calibrate/matdog_test.rs
@@ -110,7 +110,7 @@ jobs:
             software/drivers/st3215/src/auto_calibrate/matdog.rs
             software/drivers/st3215/src/auto_calibrate/matdog_test.rs
           )
-          rustfmt --edition 2021 "${files[@]}"
+          rustfmt --edition 2021 --config skip_children=true "${files[@]}"
           mkdir -p ci-output/formatted
           for file in "${files[@]}"; do
             cp "$file" "ci-output/formatted/$(basename "$file")"
