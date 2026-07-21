@@ -67,6 +67,10 @@ fn hybrid_contact_requires_position_velocity_current_and_persistence() {
     );
     assert_eq!(
         detector.observe(observation(1984, 0, 20, 1968), 1968),
+        ContactState::FreeMotion
+    );
+    assert_eq!(
+        detector.observe(observation(1984, 0, 20, 1968), 1968),
         ContactState::ContactSuspected
     );
     assert_eq!(
@@ -108,6 +112,10 @@ fn stall_without_current_rise_becomes_ambiguous() {
         HOME_TICK,
         baseline,
         HybridContactConfig::default(),
+    );
+    assert_eq!(
+        detector.observe(observation(1984, 0, 12, 1968), 1968),
+        ContactState::FreeMotion
     );
     assert_eq!(
         detector.observe(observation(1984, 0, 12, 1968), 1968),
