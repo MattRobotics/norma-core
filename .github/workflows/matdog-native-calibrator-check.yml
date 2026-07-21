@@ -1,14 +1,6 @@
 name: MATDOG Native Calibrator Check
 
 on:
-  push:
-    branches:
-      - "matdog/native-calibrator-foundation"
-    paths:
-      - ".github/workflows/matdog-native-calibrator-check.yml"
-      - "software/drivers/st3215/**"
-      - "software/station/bin/station/**"
-      - "protobufs/drivers/st3215/**"
   pull_request:
     branches:
       - main
@@ -19,7 +11,6 @@ on:
       - "protobufs/drivers/st3215/**"
   workflow_dispatch:
 
-# Hardware-independent gate: no Station process and no serial access.
 jobs:
   rust-offline-gate:
     name: Rust tests and Station build
