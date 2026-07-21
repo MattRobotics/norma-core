@@ -1,0 +1,152 @@
+name: MATDOG Native Calibrator Offline Check
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/matdog-native-calibrator-check.yml"
+      - "protobufs/drivers/st3215/**"
+      - "software/drivers/st3215/**"
+      - "software/station/bin/station/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matdog-native-calibrator-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-foundation:
+    name: RAM-only contract, Rust tests, Station build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout reviewed revision
+        uses: actions/checkout@v4
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
+      - name: Install native Station build dependency
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Prepare verification logs
+        run: mkdir -p ci-output
+
+      - name: Enforce MATDOG RAM-only source contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee ci-output/ram-only-contract.log
+          from pathlib import Path
+
+          source = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs").read_text()
+          forbidden = (
+              "EepromRegister",
+              "RamRegister::Lock",
+              "ST3215Request::",
+              "reg_write: Some",
+              "reset: Some",
+              "reset_calibration: Some",
+              "freeze_calibration: Some",
+              "action: Some",
+              "Offset.address",
+              "reg_write_with_action",
+              "ram_write_with_action",
+          )
+          required = (
+              "MATDOG_MOTOR_IDS",
+              "is_allowed_matdog_ram_register",
+              "RamRegister::PresentCurrent",
+              "global_torque_off_verified",
+              "M12_MIN_GUARD_TICK",
+          )
+
+          found = [token for token in forbidden if token in source]
+          missing = [token for token in required if token not in source]
+          if found or missing:
+              if found:
+                  print(f"forbidden MATDOG source tokens: {found}")
+              if missing:
+                  print(f"missing MATDOG source requirements: {missing}")
+              raise SystemExit(1)
+
+          print("MATDOG RAM-only source contract: PASS")
+          PY
+
+      - name: Repository-wide Rust format audit
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo fmt --all -- --check 2>&1 | tee ci-output/cargo-fmt.log
+
+      - name: MATDOG changed Rust format check
+        id: matdog_format
+        shell: bash
+        run: |
+          rustfmt --edition 2021 --check --config skip_children=true \
+            software/drivers/st3215/src/auto_calibrate/mod.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+
+      - name: Prepare formatted MATDOG diagnostics
+        if: failure() && steps.matdog_format.outcome == 'failure'
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            software/drivers/st3215/src/auto_calibrate/mod.rs
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          )
+          rustfmt --edition 2021 --config skip_children=true "${files[@]}"
+          mkdir -p ci-output/formatted
+          for file in "${files[@]}"; do
+            cp "$file" "ci-output/formatted/$(basename "$file")"
+          done
+
+      - name: ST3215 unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
+
+      - name: Create CI-only minimal Station viewer asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset=software/station/clients/station-viewer/dist/index.html
+          test ! -e "$asset"
+          mkdir -p "$(dirname "$asset")"
+          printf '<!doctype html><title>MATDOG offline build gate</title>\n' > "$asset"
+          echo "Created ignored CI-only viewer stub; no product asset is committed." \
+            | tee ci-output/station-viewer-stub.log
+
+      - name: Station release build
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release --package station 2>&1 | tee ci-output/station-build.log
+
+      - name: Remove CI-only viewer asset
+        if: always()
+        run: rm -rf software/station/clients/station-viewer/dist
+
+      - name: Upload offline verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matdog-native-calibrator-offline-logs
+          path: ci-output/
+          if-no-files-found: error
