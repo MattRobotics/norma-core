@@ -33,12 +33,7 @@ fn set_register(bytes: &mut [u8], register: RamRegister, value: &[u8]) {
     bytes[address..address + value.len()].copy_from_slice(value);
 }
 
-fn observation(
-    position: u16,
-    velocity: u16,
-    current: u16,
-    goal: u16,
-) -> MotorObservation {
+fn observation(position: u16, velocity: u16, current: u16, goal: u16) -> MotorObservation {
     MotorObservation {
         monotonic_stamp_ns: position as u64 + 1,
         position,
@@ -114,11 +109,8 @@ fn hybrid_contact_requires_position_velocity_current_and_persistence() {
         median_current: 10,
         mad_current: 1,
     };
-    let mut detector = HybridContactDetector::new(
-        HOME_TICK,
-        baseline,
-        HybridContactConfig::default(),
-    );
+    let mut detector =
+        HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
 
     assert_eq!(
         detector.observe(observation(2016, 20, 12, 1984), 1984),
@@ -148,11 +140,8 @@ fn current_rise_without_kinematic_stall_does_not_confirm_contact() {
         median_current: 10,
         mad_current: 1,
     };
-    let mut detector = HybridContactDetector::new(
-        HOME_TICK,
-        baseline,
-        HybridContactConfig::default(),
-    );
+    let mut detector =
+        HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
     for position in [2016, 1984, 1952, 1920] {
         assert_ne!(
             detector.observe(observation(position, 25, 40, position - 32), position - 32),
@@ -167,11 +156,8 @@ fn hybrid_detector_resets_persistence_after_free_motion() {
         median_current: 10,
         mad_current: 1,
     };
-    let mut detector = HybridContactDetector::new(
-        HOME_TICK,
-        baseline,
-        HybridContactConfig::default(),
-    );
+    let mut detector =
+        HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
 
     assert_eq!(
         detector.observe(observation(1984, 0, 20, 1968), 1968),
@@ -197,11 +183,8 @@ fn stall_without_current_rise_becomes_ambiguous() {
         median_current: 10,
         mad_current: 1,
     };
-    let mut detector = HybridContactDetector::new(
-        HOME_TICK,
-        baseline,
-        HybridContactConfig::default(),
-    );
+    let mut detector =
+        HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
     assert_eq!(
         detector.observe(observation(1984, 0, 12, 1968), 1968),
         ContactState::FreeMotion
@@ -236,7 +219,10 @@ fn servo_status_driver_error_torque_loss_and_hard_current_abort() {
     let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
     let mut driver_error = observation(1984, 0, 20, 1968);
     driver_error.has_driver_error = true;
-    assert_eq!(detector.observe(driver_error, 1968), ContactState::HardAbort);
+    assert_eq!(
+        detector.observe(driver_error, 1968),
+        ContactState::HardAbort
+    );
 
     let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
     let mut torque_lost = observation(1984, 0, 20, 1968);
@@ -245,10 +231,7 @@ fn servo_status_driver_error_torque_loss_and_hard_current_abort() {
 
     let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
     assert_eq!(
-        detector.observe(
-            observation(1984, 0, HARD_CURRENT_ABORT_RAW, 1968),
-            1968
-        ),
+        detector.observe(observation(1984, 0, HARD_CURRENT_ABORT_RAW, 1968), 1968),
         ContactState::HardAbort
     );
 
@@ -262,10 +245,7 @@ fn servo_status_driver_error_torque_loss_and_hard_current_abort() {
 
     let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
     let stale_goal = observation(1984, 0, 20, 1976);
-    assert_eq!(
-        detector.observe(stale_goal, 1968),
-        ContactState::HardAbort
-    );
+    assert_eq!(detector.observe(stale_goal, 1968), ContactState::HardAbort);
 
     let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
     assert_eq!(
@@ -412,7 +392,10 @@ fn global_torque_off_cleanup_is_exact_and_failure_preserving() {
     let writes = global_torque_off_writes();
     assert_eq!(writes.len(), MATDOG_MOTOR_IDS.len());
     assert!(is_exact_matdog_motor_set(
-        &writes.iter().map(|(motor_id, _)| *motor_id).collect::<Vec<_>>()
+        &writes
+            .iter()
+            .map(|(motor_id, _)| *motor_id)
+            .collect::<Vec<_>>()
     ));
     assert!(writes.iter().all(|(_, value)| value.as_slice() == &[0]));
 
@@ -430,11 +413,12 @@ fn global_torque_off_cleanup_is_exact_and_failure_preserving() {
         combine_pilot_and_cleanup(Err("pilot".into()), Ok(())),
         Err("pilot".into())
     );
-    assert!(combine_pilot_and_cleanup(Ok(contact), Err("cleanup".into()))
-        .unwrap_err()
-        .contains("cleanup failed"));
-    let both = combine_pilot_and_cleanup(Err("pilot".into()), Err("cleanup".into()))
-        .unwrap_err();
+    assert!(
+        combine_pilot_and_cleanup(Ok(contact), Err("cleanup".into()))
+            .unwrap_err()
+            .contains("cleanup failed")
+    );
+    let both = combine_pilot_and_cleanup(Err("pilot".into()), Err("cleanup".into())).unwrap_err();
     assert!(both.contains("pilot"));
     assert!(both.contains("cleanup"));
 }

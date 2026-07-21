@@ -123,11 +123,7 @@ struct HybridContactDetector {
 }
 
 impl HybridContactDetector {
-    fn new(
-        start_position: u16,
-        baseline: BaselineStats,
-        config: HybridContactConfig,
-    ) -> Self {
+    fn new(start_position: u16, baseline: BaselineStats, config: HybridContactConfig) -> Self {
         Self {
             start_position,
             previous_position: start_position,
@@ -414,11 +410,8 @@ impl MatdogRamOnlyCalibrator {
         .await?;
         self.write_ram_verified(RamRegister::Acc, vec![PILOT_ACCELERATION])
             .await?;
-        self.write_ram_verified(
-            RamRegister::GoalSpeed,
-            PILOT_SPEED.to_le_bytes().to_vec(),
-        )
-        .await?;
+        self.write_ram_verified(RamRegister::GoalSpeed, PILOT_SPEED.to_le_bytes().to_vec())
+            .await?;
         self.set_torque_verified(true).await?;
 
         self.next_phase("Return M12 to home 2048")?;
@@ -477,8 +470,7 @@ impl MatdogRamOnlyCalibrator {
             }
             previous_position = observation.position;
 
-            if circular_distance(observation.position, BASELINE_TARGET_TICK)
-                <= HOME_TOLERANCE_TICKS
+            if circular_distance(observation.position, BASELINE_TARGET_TICK) <= HOME_TOLERANCE_TICKS
                 && samples.len() >= BASELINE_MIN_SAMPLES
             {
                 break;
@@ -488,7 +480,8 @@ impl MatdogRamOnlyCalibrator {
         if samples.len() < BASELINE_MIN_SAMPLES {
             return Err(format!(
                 "insufficient moving baseline samples: {} < {}",
-                samples.len(), BASELINE_MIN_SAMPLES
+                samples.len(),
+                BASELINE_MIN_SAMPLES
             )
             .into());
         }
@@ -506,11 +499,8 @@ impl MatdogRamOnlyCalibrator {
     ) -> Result<u16, DynError> {
         let start = self.latest_observation(PILOT_MOTOR_ID)?;
         self.ensure_observation_safe(start, true, None)?;
-        let mut detector = HybridContactDetector::new(
-            start.position,
-            baseline,
-            HybridContactConfig::default(),
-        );
+        let mut detector =
+            HybridContactDetector::new(start.position, baseline, HybridContactConfig::default());
         let mut target = start.position;
         let mut last_stamp = start.monotonic_stamp_ns;
 
@@ -640,11 +630,8 @@ impl MatdogRamOnlyCalibrator {
         if target > protocol::MAX_ANGLE_STEP {
             return Err(format!("unsigned GoalPosition out of range: {target}").into());
         }
-        self.write_ram_verified(
-            RamRegister::GoalPosition,
-            target.to_le_bytes().to_vec(),
-        )
-        .await
+        self.write_ram_verified(RamRegister::GoalPosition, target.to_le_bytes().to_vec())
+            .await
     }
 
     async fn set_torque_verified(&mut self, enabled: bool) -> Result<(), DynError> {
@@ -666,11 +653,8 @@ impl MatdogRamOnlyCalibrator {
         self.sync_write_ram_verified(RamRegister::TorqueEnable, &writes)
             .await?;
         for motor_id in MATDOG_MOTOR_IDS {
-            let observation = observation_from_state(
-                &self.current_state(),
-                &self.target_bus_serial,
-                motor_id,
-            )?;
+            let observation =
+                observation_from_state(&self.current_state(), &self.target_bus_serial, motor_id)?;
             if observation.torque_enabled {
                 return Err(format!("M{motor_id} remained torque-enabled after global OFF").into());
             }
@@ -701,13 +685,8 @@ impl MatdogRamOnlyCalibrator {
         };
         self.comm.send_tx(&envelope)?;
         self.wait_for_command_result(&command_id).await?;
-        self.wait_for_register_value(
-            PILOT_MOTOR_ID,
-            register,
-            &value,
-            initial_stamp,
-        )
-        .await
+        self.wait_for_register_value(PILOT_MOTOR_ID, register, &value, initial_stamp)
+            .await
     }
 
     async fn sync_write_ram_verified(
@@ -731,12 +710,8 @@ impl MatdogRamOnlyCalibrator {
         let initial_stamps: Vec<(u8, u64)> = writes
             .iter()
             .map(|(motor_id, _)| {
-                observation_from_state(
-                    &self.current_state(),
-                    &self.target_bus_serial,
-                    *motor_id,
-                )
-                .map(|observation| (*motor_id, observation.monotonic_stamp_ns))
+                observation_from_state(&self.current_state(), &self.target_bus_serial, *motor_id)
+                    .map(|observation| (*motor_id, observation.monotonic_stamp_ns))
             })
             .collect::<Result<_, _>>()?;
         let command_id = self.next_command_id();
@@ -879,11 +854,9 @@ impl MatdogRamOnlyCalibrator {
     ) -> Result<MotorObservation, DynError> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(observation) = observation_from_state(
-                &self.current_state(),
-                &self.target_bus_serial,
-                motor_id,
-            ) {
+            if let Ok(observation) =
+                observation_from_state(&self.current_state(), &self.target_bus_serial, motor_id)
+            {
                 if observation.monotonic_stamp_ns > minimum_stamp {
                     return Ok(observation);
                 }
@@ -1062,10 +1035,7 @@ fn observation_from_state(
         velocity: protocol::get_motor_velocity(bytes),
         current: protocol::get_motor_current(bytes),
         goal_position: protocol::get_motor_goal_position(bytes),
-        torque_limit: u16::from_le_bytes([
-            bytes[torque_limit_addr],
-            bytes[torque_limit_addr + 1],
-        ]),
+        torque_limit: u16::from_le_bytes([bytes[torque_limit_addr], bytes[torque_limit_addr + 1]]),
         torque_enabled: protocol::is_torque_enabled(bytes),
         status: bytes[status_addr],
         has_driver_error: motor.error.is_some(),

@@ -2,7 +2,6 @@
 ///
 /// Calibrates motor physical range by sweeping to limits and detecting stalls.
 /// Handles register boundary conditions by adjusting the offset (midpoint) value.
-
 use crate::port::{MAX_MOTORS_CNT, ST3215_COMMAND_TIMEOUT_MS};
 use crate::protocol::{self};
 use bytes::Bytes;
@@ -90,35 +89,33 @@ pub async fn calibrate(
     }
 
     let stop_flag = match kind {
-        CalibrationKind::Matdog => matdog::auto_calibrate(
-            bus_info.serial_number.clone(),
-            found_motors,
-            comm.clone(),
-        )
-        .await
-        .map_err(|e| protocol::Error::InvalidData {
-            msg: format!("MATDOG auto-calibration failed: {}", e),
-            source_packet: Bytes::new(),
-            reply_packet: Bytes::new(),
-        })?,
-        CalibrationKind::So101 => so101::auto_calibrate(bus_info.serial_number.clone(), comm.clone())
-            .await
-            .map_err(|e| protocol::Error::InvalidData {
-                msg: format!("Auto-calibration failed: {}", e),
-                source_packet: Bytes::new(),
-                reply_packet: Bytes::new(),
-            })?,
-        CalibrationKind::Elrobot => elrobot::auto_calibrate(
-            bus_info.serial_number.clone(),
-            found_motors,
-            comm.clone(),
-        )
-        .await
-        .map_err(|e| protocol::Error::InvalidData {
-            msg: format!("Auto-calibration failed: {}", e),
-            source_packet: Bytes::new(),
-            reply_packet: Bytes::new(),
-        })?,
+        CalibrationKind::Matdog => {
+            matdog::auto_calibrate(bus_info.serial_number.clone(), found_motors, comm.clone())
+                .await
+                .map_err(|e| protocol::Error::InvalidData {
+                    msg: format!("MATDOG auto-calibration failed: {}", e),
+                    source_packet: Bytes::new(),
+                    reply_packet: Bytes::new(),
+                })?
+        }
+        CalibrationKind::So101 => {
+            so101::auto_calibrate(bus_info.serial_number.clone(), comm.clone())
+                .await
+                .map_err(|e| protocol::Error::InvalidData {
+                    msg: format!("Auto-calibration failed: {}", e),
+                    source_packet: Bytes::new(),
+                    reply_packet: Bytes::new(),
+                })?
+        }
+        CalibrationKind::Elrobot => {
+            elrobot::auto_calibrate(bus_info.serial_number.clone(), found_motors, comm.clone())
+                .await
+                .map_err(|e| protocol::Error::InvalidData {
+                    msg: format!("Auto-calibration failed: {}", e),
+                    source_packet: Bytes::new(),
+                    reply_packet: Bytes::new(),
+                })?
+        }
         CalibrationKind::Unsupported => unreachable!("unsupported topology returned above"),
     };
 
@@ -136,7 +133,10 @@ mod tests {
             calibration_kind(&matdog::MATDOG_MOTOR_IDS),
             CalibrationKind::Matdog
         );
-        assert_eq!(calibration_kind(&[1, 2, 3, 4, 5, 6]), CalibrationKind::So101);
+        assert_eq!(
+            calibration_kind(&[1, 2, 3, 4, 5, 6]),
+            CalibrationKind::So101
+        );
         assert_eq!(
             calibration_kind(&[1, 2, 3, 4, 5, 6, 7, 8]),
             CalibrationKind::Elrobot
