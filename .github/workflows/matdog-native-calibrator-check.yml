@@ -19,6 +19,7 @@ on:
       - "protobufs/drivers/st3215/**"
   workflow_dispatch:
 
+# Hardware-independent gate: no Station process and no serial access.
 jobs:
   rust-offline-gate:
     name: Rust tests and Station build
