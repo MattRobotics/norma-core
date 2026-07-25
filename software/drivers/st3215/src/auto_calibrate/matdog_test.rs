@@ -173,18 +173,31 @@ fn hybrid_detector_resets_persistence_after_free_motion() {
     );
     assert_eq!(
         detector.observe(observation(1976, 0, 20, 1960), 1960),
+        ContactState::FreeMotion
+    );
+    assert_eq!(
+        detector.observe(observation(1976, 0, 20, 1960), 1960),
         ContactState::ContactSuspected
     );
 }
 
 #[test]
-fn stall_without_current_rise_becomes_ambiguous() {
+fn stall_without_current_rise_becomes_ambiguous_only_after_motion() {
     let baseline = BaselineStats {
         median_current: 10,
         mad_current: 1,
     };
     let mut detector =
         HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
+
+    assert_eq!(
+        detector.observe(observation(2048, 0, 12, 1968), 1968),
+        ContactState::FreeMotion
+    );
+    assert_eq!(
+        detector.observe(observation(2016, 20, 12, 1968), 1968),
+        ContactState::FreeMotion
+    );
     assert_eq!(
         detector.observe(observation(1984, 0, 12, 1968), 1968),
         ContactState::FreeMotion
@@ -200,6 +213,32 @@ fn stall_without_current_rise_becomes_ambiguous() {
     assert_eq!(
         detector.observe(observation(1984, 0, 12, 1968), 1968),
         ContactState::AmbiguousContact
+    );
+}
+
+#[test]
+fn new_target_stationary_samples_do_not_create_premotion_ambiguity() {
+    let baseline = BaselineStats {
+        median_current: 10,
+        mad_current: 1,
+    };
+    let mut detector = HybridContactDetector::new(2038, baseline, HybridContactConfig::default());
+
+    assert_eq!(
+        detector.observe(observation(2009, 0, 2, 2006), 2006),
+        ContactState::FreeMotion
+    );
+
+    for _ in 0..6 {
+        assert_eq!(
+            detector.observe(observation(2009, 0, 2, 1974), 1974),
+            ContactState::FreeMotion
+        );
+    }
+
+    assert_eq!(
+        detector.observe(observation(1998, 20, 2, 1974), 1974),
+        ContactState::FreeMotion
     );
 }
 

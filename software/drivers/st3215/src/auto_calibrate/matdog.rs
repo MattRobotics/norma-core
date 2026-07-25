@@ -122,6 +122,9 @@ struct HybridContactDetector {
     config: HybridContactConfig,
     confirming_samples: u8,
     ambiguous_samples: u8,
+    active_target: Option<u16>,
+    target_start_position: u16,
+    target_motion_observed: bool,
 }
 
 impl HybridContactDetector {
@@ -133,6 +136,9 @@ impl HybridContactDetector {
             config,
             confirming_samples: 0,
             ambiguous_samples: 0,
+            active_target: None,
+            target_start_position: start_position,
+            target_motion_observed: false,
         }
     }
 
@@ -147,13 +153,31 @@ impl HybridContactDetector {
             return ContactState::HardAbort;
         }
 
+        if self.active_target != Some(commanded_target) {
+            self.active_target = Some(commanded_target);
+            self.target_start_position = observation.position;
+            self.target_motion_observed = false;
+            self.previous_position = observation.position;
+            self.confirming_samples = 0;
+            self.ambiguous_samples = 0;
+            return ContactState::FreeMotion;
+        }
+
         let travel = negative_direction_progress(observation.position, self.start_position);
         let progress = negative_direction_progress(observation.position, self.previous_position);
+        let target_travel =
+            negative_direction_progress(observation.position, self.target_start_position);
         self.previous_position = observation.position;
+
+        let velocity = speed_magnitude(observation.velocity);
+        if target_travel > self.config.max_progress_ticks || velocity > self.config.max_velocity_raw
+        {
+            self.target_motion_observed = true;
+        }
 
         let enough_travel = travel >= self.config.min_travel_ticks;
         let low_progress = progress <= self.config.max_progress_ticks;
-        let low_velocity = speed_magnitude(observation.velocity) <= self.config.max_velocity_raw;
+        let low_velocity = velocity <= self.config.max_velocity_raw;
         let goal_error = circular_distance(observation.position, commanded_target);
         let target_ahead = signed_tick_delta(commanded_target, observation.position) < 0;
         let current_high = observation.current >= self.baseline.contact_threshold();
@@ -172,7 +196,7 @@ impl HybridContactDetector {
             } else {
                 ContactState::ContactSuspected
             }
-        } else if kinematic_stall {
+        } else if kinematic_stall && self.target_motion_observed {
             self.ambiguous_samples = self.ambiguous_samples.saturating_add(1);
             self.confirming_samples = 0;
             if self.ambiguous_samples >= self.config.persistence_samples {
