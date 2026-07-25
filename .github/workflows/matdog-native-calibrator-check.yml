@@ -45,9 +45,12 @@ jobs:
           echo "diagnostic_complete" > payload-diagnostic/status.txt
           exit 0
 
-      - name: Upload payload diagnostic
+      - name: Upload payload diagnostic and raw parts
         uses: actions/upload-artifact@v4
         with:
           name: matdog-payload-diagnostic
-          path: payload-diagnostic/
+          path: |
+            payload-diagnostic/
+            tools/.matdog-v2-payload/
+          include-hidden-files: true
           if-no-files-found: error
