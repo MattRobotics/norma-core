@@ -95,7 +95,7 @@ impl BaselineStats {
 struct HybridContactConfig {
     max_progress_ticks: u16,
     max_velocity_raw: u16,
-    min_goal_error_ticks: u16,
+    target_reached_tolerance_ticks: u16,
     min_travel_ticks: u16,
     persistence_samples: u8,
     hard_current_abort_raw: u16,
@@ -106,7 +106,7 @@ impl Default for HybridContactConfig {
         Self {
             max_progress_ticks: 2,
             max_velocity_raw: 10,
-            min_goal_error_ticks: 4,
+            target_reached_tolerance_ticks: HOME_TOLERANCE_TICKS,
             min_travel_ticks: MINIMUM_CONTACT_TRAVEL_TICKS,
             persistence_samples: 3,
             hard_current_abort_raw: HARD_CURRENT_ABORT_RAW,
@@ -182,11 +182,13 @@ impl HybridContactDetector {
         let target_ahead = signed_tick_delta(commanded_target, observation.position) < 0;
         let current_high = observation.current >= self.baseline.contact_threshold();
 
-        let kinematic_stall = enough_travel
-            && low_progress
-            && low_velocity
-            && goal_error >= self.config.min_goal_error_ticks
-            && target_ahead;
+        if goal_error <= self.config.target_reached_tolerance_ticks {
+            self.confirming_samples = 0;
+            self.ambiguous_samples = 0;
+            return ContactState::FreeMotion;
+        }
+
+        let kinematic_stall = enough_travel && low_progress && low_velocity && target_ahead;
 
         if kinematic_stall && current_high {
             self.confirming_samples = self.confirming_samples.saturating_add(1);
@@ -579,15 +581,28 @@ impl MatdogRamOnlyCalibrator {
                 match detector.observe(observation, target) {
                     ContactState::FreeMotion | ContactState::ContactSuspected => {}
                     ContactState::ContactConfirmed => {
+                        info!(
+                            "MATDOG M12 contact confirmed: step={}, target={}, present={}, error={}, current={}, threshold={}, velocity={}",
+                            step_ticks,
+                            target,
+                            observation.position,
+                            circular_distance(observation.position, target),
+                            observation.current,
+                            baseline.contact_threshold(),
+                            speed_magnitude(observation.velocity)
+                        );
                         self.stop_pressure(observation.position).await?;
                         return Ok(observation.position);
                     }
                     ContactState::AmbiguousContact => {
                         return self
                             .abort_with_global_torque_off(format!(
-                                "M12 ambiguous contact: tick={}, current={}, velocity={}",
+                                "M12 ambiguous contact: target={}, tick={}, error={}, current={}, threshold={}, velocity={}",
+                                target,
                                 observation.position,
+                                circular_distance(observation.position, target),
                                 observation.current,
+                                baseline.contact_threshold(),
                                 speed_magnitude(observation.velocity)
                             ))
                             .await;
@@ -611,7 +626,18 @@ impl MatdogRamOnlyCalibrator {
 
             let observation = last_observation.ok_or("M12 settle window produced no telemetry")?;
             self.ensure_observation_safe(observation, true, Some(target))?;
-            if circular_distance(observation.position, target) > step_ticks.saturating_add(4) {
+            let goal_error = circular_distance(observation.position, target);
+            info!(
+                "MATDOG M12 approach settled: step={}, target={}, present={}, error={}, current={}, threshold={}, velocity={}",
+                step_ticks,
+                target,
+                observation.position,
+                goal_error,
+                observation.current,
+                baseline.contact_threshold(),
+                speed_magnitude(observation.velocity)
+            );
+            if goal_error > step_ticks.saturating_add(4) {
                 self.stop_pressure(observation.position).await?;
                 return Err(format!(
                     "M12 tracking failed without confirmed contact: target={target}, present={}, current={}",

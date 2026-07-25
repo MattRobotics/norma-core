@@ -12,6 +12,10 @@ mod elrobot;
 mod matdog;
 mod so101;
 
+pub(crate) fn matdog_pilot_is_armed() -> bool {
+    matdog::require_explicit_arming().is_ok()
+}
+
 /// Auto-calibration scan ceiling.
 ///
 /// Keep `MAX_MOTORS_CNT` at 8 for the existing SO101/ElRobot calibration

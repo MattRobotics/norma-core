@@ -79,10 +79,16 @@ jobs:
               "MAX_SCAN_MOTOR_ID",
               "for motor_id in 1..=max_motor_id",
           )
+          required_port = (
+              "matdog_armed_command_allowed",
+              "matdog_pilot_is_armed",
+              "Rejecting non-MATDOG-RAM command",
+          )
           port_source = Path("software/drivers/st3215/src/port.rs").read_text()
           found = [token for token in forbidden if token in source]
           found += [token for token in forbidden_port if token in port_source]
           missing = [token for token in required if token not in source]
+          missing += [token for token in required_port if token not in port_source]
           if found or missing:
               if found:
                   print(f"forbidden MATDOG source tokens: {found}")

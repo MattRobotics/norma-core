@@ -243,6 +243,34 @@ fn new_target_stationary_samples_do_not_create_premotion_ambiguity() {
 }
 
 #[test]
+fn settled_target_within_tolerance_is_not_contact_after_motion() {
+    let baseline = BaselineStats {
+        median_current: 0,
+        mad_current: 0,
+    };
+    let mut detector = HybridContactDetector::new(2047, baseline, HybridContactConfig::default());
+
+    assert_eq!(
+        detector.observe(observation(2047, 0, 0, 1943), 1943),
+        ContactState::FreeMotion
+    );
+    assert_eq!(
+        detector.observe(observation(1980, 20, 0, 1943), 1943),
+        ContactState::FreeMotion
+    );
+
+    for _ in 0..6 {
+        assert_eq!(
+            detector.observe(observation(1948, 0, 0, 1943), 1943),
+            ContactState::FreeMotion
+        );
+    }
+
+    assert_eq!(circular_distance(1948, 1943), 5);
+    assert!(5 <= HOME_TOLERANCE_TICKS);
+}
+
+#[test]
 fn servo_status_driver_error_torque_loss_and_hard_current_abort() {
     let baseline = BaselineStats {
         median_current: 10,

@@ -35,6 +35,57 @@ pub const MAX_MOTORS_CNT: u8 = 8;
 const LEGACY_MOTOR_IDS: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 const MATDOG_MOTOR_IDS: [u8; 12] = [11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43];
 
+fn matdog_armed_command_allowed(command: &TxEnvelope) -> bool {
+    if command
+        .auto_calibrate
+        .as_ref()
+        .map(|value| value.calibrate)
+        .unwrap_or(false)
+        || command.stop_auto_calibrate.is_some()
+    {
+        return true;
+    }
+
+    if let Some(write) = &command.write {
+        if write.motor_id != 12 {
+            return false;
+        }
+        return [
+            protocol::RamRegister::TorqueEnable,
+            protocol::RamRegister::Acc,
+            protocol::RamRegister::GoalPosition,
+            protocol::RamRegister::GoalSpeed,
+            protocol::RamRegister::TorqueLimit,
+        ]
+        .iter()
+        .any(|register| {
+            write.address == register.address() as u32
+                && write.value.len() == register.size() as usize
+        });
+    }
+
+    if let Some(sync_write) = &command.sync_write {
+        if sync_write.address != protocol::RamRegister::TorqueEnable.address() as u32
+            || sync_write.motors.len() != MATDOG_MOTOR_IDS.len()
+        {
+            return false;
+        }
+
+        let mut ids = HashSet::new();
+        for motor in &sync_write.motors {
+            if !MATDOG_MOTOR_IDS.contains(&(motor.motor_id as u8))
+                || motor.value.as_ref() != [0_u8]
+                || !ids.insert(motor.motor_id as u8)
+            {
+                return false;
+            }
+        }
+        return MATDOG_MOTOR_IDS.iter().all(|id| ids.contains(id));
+    }
+
+    false
+}
+
 pub struct St3215Port {
     port_info: SerialPortInfo,
     bus_info: St3215BusProto,
@@ -680,6 +731,15 @@ impl St3215Port {
         bus_info: &St3215BusProto,
         meta: &St3215PortMeta,
     ) -> Result<bool, protocol::Error> {
+        if crate::auto_calibrate::matdog_pilot_is_armed() && !matdog_armed_command_allowed(command)
+        {
+            warn!(
+                "Rejecting non-MATDOG-RAM command while native MATDOG pilot arming is active: command_id={:02X?}",
+                command.command_id
+            );
+            return Ok(false);
+        }
+
         // Handle different command types
         if let Some(write_cmd) = &command.write {
             // Handle write command
@@ -1521,6 +1581,81 @@ mod topology_discovery_tests {
     #[test]
     fn exact_matdog_disables_background_discovery() {
         assert!(discovery_candidates(&set(&MATDOG_MOTOR_IDS)).is_empty());
+    }
+
+    #[test]
+    fn matdog_runtime_gate_rejects_reset_and_eeprom_paths() {
+        let reset_calibration = TxEnvelope {
+            reset_calibration: Some(crate::st3215_proto::ResetCalibrationCommand { reset: true }),
+            ..Default::default()
+        };
+        assert!(!matdog_armed_command_allowed(&reset_calibration));
+
+        let eeprom_write = TxEnvelope {
+            write: Some(crate::st3215_proto::St3215WriteCommand {
+                motor_id: 12,
+                address: 0,
+                value: Bytes::from_static(&[1]),
+            }),
+            ..Default::default()
+        };
+        assert!(!matdog_armed_command_allowed(&eeprom_write));
+
+        let reg_write = TxEnvelope {
+            reg_write: Some(crate::st3215_proto::St3215RegWriteCommand {
+                motor_id: 12,
+                address: 0,
+                value: Bytes::from_static(&[1]),
+            }),
+            ..Default::default()
+        };
+        assert!(!matdog_armed_command_allowed(&reg_write));
+    }
+
+    #[test]
+    fn matdog_runtime_gate_allows_only_pilot_ram_and_global_torque_off() {
+        let auto_calibrate = TxEnvelope {
+            auto_calibrate: Some(crate::st3215_proto::AutoCalibrateCommand { calibrate: true }),
+            ..Default::default()
+        };
+        assert!(matdog_armed_command_allowed(&auto_calibrate));
+
+        let goal_position = TxEnvelope {
+            write: Some(crate::st3215_proto::St3215WriteCommand {
+                motor_id: 12,
+                address: protocol::RamRegister::GoalPosition.address() as u32,
+                value: Bytes::copy_from_slice(&2048_u16.to_le_bytes()),
+            }),
+            ..Default::default()
+        };
+        assert!(matdog_armed_command_allowed(&goal_position));
+
+        let wrong_motor = TxEnvelope {
+            write: Some(crate::st3215_proto::St3215WriteCommand {
+                motor_id: 11,
+                address: protocol::RamRegister::GoalPosition.address() as u32,
+                value: Bytes::copy_from_slice(&2048_u16.to_le_bytes()),
+            }),
+            ..Default::default()
+        };
+        assert!(!matdog_armed_command_allowed(&wrong_motor));
+
+        let torque_off = TxEnvelope {
+            sync_write: Some(crate::st3215_proto::St3215SyncWriteCommand {
+                address: protocol::RamRegister::TorqueEnable.address() as u32,
+                motors: MATDOG_MOTOR_IDS
+                    .iter()
+                    .map(
+                        |motor_id| crate::st3215_proto::st3215_sync_write_command::MotorWrite {
+                            motor_id: *motor_id as u32,
+                            value: Bytes::from_static(&[0]),
+                        },
+                    )
+                    .collect(),
+            }),
+            ..Default::default()
+        };
+        assert!(matdog_armed_command_allowed(&torque_off));
     }
 }
 
