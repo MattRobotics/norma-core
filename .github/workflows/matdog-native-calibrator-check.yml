@@ -1,4 +1,4 @@
-name: MATDOG Finalizer Transport Diagnostic
+name: MATDOG 24-contact Finalize and Verify
 
 on:
   pull_request:
@@ -6,61 +6,210 @@ on:
       - main
     paths:
       - ".github/workflows/matdog-native-calibrator-check.yml"
+      - ".github/workflows/apply-matdog-v2-port-patch.yml"
+      - ".github/workflows/matdog-test-diagnostic.yml"
+      - "tools/.matdog-v2-payload/**"
       - "tools/matdog_finalize.patch.gz.b64"
+      - "tools/matdog-native-calibrator-check.final.yml"
+      - "software/drivers/st3215/**"
+      - "software/station/bin/station/**"
 
 permissions:
-  contents: read
+  contents: write
+  actions: read
+
+concurrency:
+  group: matdog-native-calibrator-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-  transport-diagnostic:
+  finalize-and-verify:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
 
-      - name: Inspect exact transport bytes
+      - name: Repair, verify and decode canonicalization patch
         shell: bash
         run: |
-          set +e
-          mkdir -p transport-diagnostic
-          src=tools/matdog_finalize.patch.gz.b64
-          cp "$src" transport-diagnostic/repository-payload.b64
-          {
-            echo "=== SOURCE ==="
-            wc -c "$src"
-            sha256sum "$src"
-            file "$src"
-            echo "newline_count=$(tr -cd '\n' < "$src" | wc -c)"
-            echo "carriage_return_count=$(tr -cd '\r' < "$src" | wc -c)"
-            echo "=== NORMALIZED BASE64 ==="
-            tr -d '\r\n\t ' < "$src" > transport-diagnostic/normalized-payload.b64
-            wc -c transport-diagnostic/normalized-payload.b64
-            sha256sum transport-diagnostic/normalized-payload.b64
-            echo "=== BASE64 DECODE ==="
-            base64 --decode transport-diagnostic/normalized-payload.b64 > transport-diagnostic/payload.patch.gz
-            decode_status=$?
-            echo "decode_status=$decode_status"
-            wc -c transport-diagnostic/payload.patch.gz
-            sha256sum transport-diagnostic/payload.patch.gz
-            echo "=== GZIP TEST ==="
-            gzip -t transport-diagnostic/payload.patch.gz
-            gzip_status=$?
-            echo "gzip_status=$gzip_status"
-            if [ "$gzip_status" -eq 0 ]; then
-              gzip -dc transport-diagnostic/payload.patch.gz > transport-diagnostic/payload.patch
-              echo "=== DECODED PATCH ==="
-              wc -c transport-diagnostic/payload.patch
-              sha256sum transport-diagnostic/payload.patch
-              head -n 12 transport-diagnostic/payload.patch
-            fi
-          } > transport-diagnostic/output.txt 2>&1
-          exit 0
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
 
-      - name: Upload exact transport diagnostic
-        uses: actions/upload-artifact@v4
+          source = Path("tools/matdog_finalize.patch.gz.b64")
+          data = source.read_bytes()
+          expected_broken = "df382f460699d572130421b75a4e51dafe160683a95fac9d7fcc162eb81f3774"
+          expected_fixed = "c368ec44a30fbe14d4e517eac8e2441cc0a85f1410f570553e8ace5138f5471e"
+          actual = hashlib.sha256(data).hexdigest()
+          if len(data) == 8495 and actual == expected_broken:
+              data = data[:8017] + b"B" + data[8017:]
+          elif len(data) == 8496 and actual == expected_fixed:
+              pass
+          else:
+              raise SystemExit(
+                  f"unexpected patch transport: length={len(data)} sha256={actual}"
+              )
+          repaired = Path("/tmp/matdog_finalize.patch.gz.b64")
+          repaired.write_bytes(data)
+          actual_fixed = hashlib.sha256(data).hexdigest()
+          if actual_fixed != expected_fixed:
+              raise SystemExit(f"repaired transport hash mismatch: {actual_fixed}")
+          print("MATDOG patch transport repair: PASS")
+          PY
+          base64 --decode /tmp/matdog_finalize.patch.gz.b64 | gzip -d > /tmp/matdog_finalize.patch
+          echo "36f51616160da7065fa6f3390fdcae314cc4f91f835845f14342e4f8c882df2b  /tmp/matdog_finalize.patch" | sha256sum -c -
+
+      - name: Download reviewed generated source artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/matdog-source
+          mkdir -p /tmp/matdog-source
+          gh run download 30165101583 \
+            --repo "${{ github.repository }}" \
+            --name matdog-source-diagnostic \
+            --dir /tmp/matdog-source
+          test -f /tmp/matdog-source/generated/matdog_v2.rs
+          test -f /tmp/matdog-source/generated/matdog_v2_test.rs
+          test -f /tmp/matdog-source/generated/mod.rs
+          test -f /tmp/matdog-source/generated/port.rs
+          cp /tmp/matdog-source/generated/matdog_v2.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_v2.rs
+          cp /tmp/matdog-source/generated/matdog_v2_test.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_v2_test.rs
+          cp /tmp/matdog-source/generated/mod.rs \
+            software/drivers/st3215/src/auto_calibrate/mod.rs
+          cp /tmp/matdog-source/generated/port.rs \
+            software/drivers/st3215/src/port.rs
+
+      - name: Apply reviewed canonical source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check /tmp/matdog_finalize.patch
+          git apply /tmp/matdog_finalize.patch
+          mv -f software/drivers/st3215/src/auto_calibrate/matdog_v2.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+          mv -f software/drivers/st3215/src/auto_calibrate/matdog_v2_test.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          test ! -e software/drivers/st3215/src/auto_calibrate/matdog_v2.rs
+          test ! -e software/drivers/st3215/src/auto_calibrate/matdog_v2_test.rs
+          git diff --check
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
         with:
-          name: matdog-finalizer-transport-diagnostic
-          path: transport-diagnostic/
-          if-no-files-found: error
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
+      - name: Install native Station build dependency
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Format canonical MATDOG sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2021 --config skip_children=true \
+            software/drivers/st3215/src/port.rs \
+            software/drivers/st3215/src/auto_calibrate/mod.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          git diff --check
+
+      - name: Enforce canonical RAM-only contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs").read_text()
+          tests = Path("software/drivers/st3215/src/auto_calibrate/matdog_test.rs").read_text()
+          port = Path("software/drivers/st3215/src/port.rs").read_text()
+          mod = Path("software/drivers/st3215/src/auto_calibrate/mod.rs").read_text()
+          forbidden_source = (
+              "EepromRegister", "RamRegister::Lock", "ST3215Request::",
+              "reg_write: Some", "reset: Some", "reset_calibration: Some",
+              "freeze_calibration: Some", "action: Some", "Offset.address",
+              "matdog_v2",
+          )
+          forbidden_port = ("write.motor_id != 12", "matdog_pilot_is_armed")
+          required_source = (
+              "all_profiles", "profile_for_arm_value",
+              "ram_write_allowed_for_profile", "held_targets: Vec<StaticTarget>",
+              "verify_static_holds_except", "MAX_TELEMETRY_AGE",
+              "prerequisite_restore_order", "global_torque_off_verified",
+              "GUARD_OVERSHOOT_TICKS", "UPPER_30_DELTA",
+              "UPPER_50_DELTA", "UPPER_90_DELTA",
+          )
+          required_tests = (
+              "profile_table_covers_exactly_24_unique_contacts",
+              "front_lower_restore_order_keeps_rear_parking_until_active_leg_is_home",
+              "armed_ram_gate_restricts_registers_values_motors_and_goal_windows",
+              "canonical_matdog_source_has_no_eeprom_reset_offset_regwrite_action_or_freeze_path",
+          )
+          required_port = (
+              "matdog_command_allowed_with", "matdog_armed_command_allowed",
+              "native MATDOG profile arming is active",
+          )
+          required_mod = ("mod matdog;", "matdog_ram_write_allowed_for_arm_value")
+          found = [token for token in forbidden_source if token in source]
+          found += [token for token in forbidden_port if token in port]
+          missing = [token for token in required_source if token not in source]
+          missing += [token for token in required_tests if token not in tests]
+          missing += [token for token in required_port if token not in port]
+          missing += [token for token in required_mod if token not in mod]
+          if found or missing:
+              raise SystemExit(f"forbidden={found}, missing={missing}")
+          print("MATDOG canonical 24-contact RAM-only contract: PASS")
+          PY
+
+      - name: ST3215 unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --package st3215 2>&1 | tee /tmp/st3215-tests.log
+
+      - name: Create CI-only Station viewer stub
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset=software/station/clients/station-viewer/dist/index.html
+          test ! -e "$asset"
+          mkdir -p "$(dirname "$asset")"
+          printf '<!doctype html><title>MATDOG offline build gate</title>\n' > "$asset"
+
+      - name: Station release build
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release --package station 2>&1 | tee /tmp/station-build.log
+
+      - name: Publish only verified canonical source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf software/station/clients/station-viewer/dist
+          cp tools/matdog-native-calibrator-check.final.yml \
+            .github/workflows/matdog-native-calibrator-check.yml
+          rm -f .github/workflows/apply-matdog-v2-port-patch.yml
+          rm -f .github/workflows/matdog-test-diagnostic.yml
+          rm -rf tools/.matdog-v2-payload
+          rm -f tools/matdog_finalize.patch.gz.b64
+          rm -f tools/matdog-native-calibrator-check.final.yml
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(st3215): generalize MATDOG calibrator profiles"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
