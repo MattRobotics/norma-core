@@ -1,0 +1,55 @@
+name: MATDOG Finalize V2
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/matdog-finalize-v2.yml"
+      - "tools/matdog_finalize_and_verify.sh"
+      - "tools/matdog_post_finalize.py"
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: matdog-finalize-v2-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  finalize:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
+      - name: Install Station native build dependency
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Run complete MATDOG finalization macro
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/matdog_finalize_and_verify.sh
+
+      - name: Upload complete verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matdog-finalize-v2-logs
+          path: ${{ runner.temp }}/matdog-ci-output/
+          if-no-files-found: warn
