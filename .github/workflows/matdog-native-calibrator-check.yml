@@ -36,7 +36,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "c368ec44a30fbe14d4e517eac8e2441cc0a85f1410f570553e8ace5138f5471e  tools/matdog_finalize.patch.gz.b64" | sha256sum -c -
           base64 --decode tools/matdog_finalize.patch.gz.b64 | gzip -d > /tmp/matdog_finalize.patch
           echo "36f51616160da7065fa6f3390fdcae314cc4f91f835845f14342e4f8c882df2b  /tmp/matdog_finalize.patch" | sha256sum -c -
 
