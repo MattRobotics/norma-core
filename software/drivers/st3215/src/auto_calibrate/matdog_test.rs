@@ -440,3 +440,24 @@ fn matdog_source_has_no_eeprom_reset_offset_regwrite_action_or_freeze_path() {
         assert!(!source.contains(forbidden), "forbidden token: {forbidden}");
     }
 }
+
+#[test]
+fn matdog_requires_exact_explicit_arming_value() {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ENV_LOCK.lock().unwrap();
+    let previous = std::env::var_os(MATDOG_ARM_ENV);
+
+    std::env::remove_var(MATDOG_ARM_ENV);
+    assert!(require_explicit_arming().is_err());
+
+    std::env::set_var(MATDOG_ARM_ENV, "1");
+    assert!(require_explicit_arming().is_err());
+
+    std::env::set_var(MATDOG_ARM_ENV, MATDOG_ARM_VALUE);
+    assert_eq!(require_explicit_arming(), Ok(()));
+
+    match previous {
+        Some(value) => std::env::set_var(MATDOG_ARM_ENV, value),
+        None => std::env::remove_var(MATDOG_ARM_ENV),
+    }
+}

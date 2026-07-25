@@ -19,6 +19,8 @@ use tokio::time::{Duration, Instant};
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 pub const MATDOG_MOTOR_IDS: [u8; 12] = [11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43];
+pub(crate) const MATDOG_ARM_ENV: &str = "MATDOG_NATIVE_CALIBRATOR_ARM";
+pub(crate) const MATDOG_ARM_VALUE: &str = "LF_UPPER_M12_MIN";
 const PILOT_MOTOR_ID: u8 = 12;
 const HOME_TICK: u16 = 2048;
 const M12_URDF_MIN_TICK: u16 = 1451;
@@ -244,6 +246,18 @@ fn global_torque_off_writes() -> Vec<(u8, Vec<u8>)> {
         .collect()
 }
 
+pub(crate) fn require_explicit_arming() -> Result<(), String> {
+    match std::env::var(MATDOG_ARM_ENV) {
+        Ok(value) if value == MATDOG_ARM_VALUE => Ok(()),
+        Ok(value) => Err(format!(
+            "MATDOG native calibrator is not armed: expected {MATDOG_ARM_ENV}={MATDOG_ARM_VALUE}, got {value:?}"
+        )),
+        Err(_) => Err(format!(
+            "MATDOG native calibrator is not armed: set {MATDOG_ARM_ENV}={MATDOG_ARM_VALUE} explicitly"
+        )),
+    }
+}
+
 pub fn is_exact_matdog_motor_set(found: &[u8]) -> bool {
     if found.len() != MATDOG_MOTOR_IDS.len() {
         return false;
@@ -264,6 +278,8 @@ pub async fn auto_calibrate(
         )
         .into());
     }
+    require_explicit_arming()
+        .map_err(|message| -> Box<dyn std::error::Error> { message.into() })?;
 
     let (inference_tx, inference_rx) = watch::channel(InferenceState::default());
     let inference_queue_id = comm.normfs.resolve("st3215/inference");
@@ -492,6 +508,16 @@ impl MatdogRamOnlyCalibrator {
         Ok(baseline)
     }
 
+    async fn abort_with_global_torque_off<T>(&mut self, message: String) -> Result<T, DynError> {
+        match self.global_torque_off_verified().await {
+            Ok(()) => Err(message.into()),
+            Err(cleanup_err) => Err(format!(
+                "{message}; immediate verified global torque-OFF also failed: {cleanup_err}"
+            )
+            .into()),
+        }
+    }
+
     async fn approach_min(
         &mut self,
         step_ticks: u16,
@@ -533,28 +559,28 @@ impl MatdogRamOnlyCalibrator {
                         return Ok(observation.position);
                     }
                     ContactState::AmbiguousContact => {
-                        self.stop_pressure(observation.position).await?;
-                        return Err(format!(
-                            "M12 ambiguous contact: tick={}, current={}, velocity={}",
-                            observation.position,
-                            observation.current,
-                            speed_magnitude(observation.velocity)
-                        )
-                        .into());
+                        return self
+                            .abort_with_global_torque_off(format!(
+                                "M12 ambiguous contact: tick={}, current={}, velocity={}",
+                                observation.position,
+                                observation.current,
+                                speed_magnitude(observation.velocity)
+                            ))
+                            .await;
                     }
                     ContactState::HardAbort => {
-                        self.stop_pressure(observation.position).await?;
-                        return Err(format!(
-                            "M12 hard abort: tick={}, goal={}, current={}, torque_enabled={}, torque_limit={}, status=0x{:02X}, driver_error={}",
-                            observation.position,
-                            observation.goal_position,
-                            observation.current,
-                            observation.torque_enabled,
-                            observation.torque_limit,
-                            observation.status,
-                            observation.has_driver_error
-                        )
-                        .into());
+                        return self
+                            .abort_with_global_torque_off(format!(
+                                "M12 hard abort: tick={}, goal={}, current={}, torque_enabled={}, torque_limit={}, status=0x{:02X}, driver_error={}",
+                                observation.position,
+                                observation.goal_position,
+                                observation.current,
+                                observation.torque_enabled,
+                                observation.torque_limit,
+                                observation.status,
+                                observation.has_driver_error
+                            ))
+                            .await;
                     }
                 }
             }

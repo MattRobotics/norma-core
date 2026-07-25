@@ -16,7 +16,9 @@ mod so101;
 ///
 /// Keep `MAX_MOTORS_CNT` at 8 for the existing SO101/ElRobot calibration
 /// presets, while scanning the sparse MATDOG ID map through M43.
-const AUTO_CALIBRATE_MAX_MOTOR_ID: u8 = 43;
+const AUTO_CALIBRATE_SUPPORTED_IDS: [u8; 20] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CalibrationKind {
@@ -56,7 +58,7 @@ pub async fn calibrate(
     );
 
     let mut found_motors = Vec::new();
-    for motor_id in 1..=AUTO_CALIBRATE_MAX_MOTOR_ID {
+    for motor_id in AUTO_CALIBRATE_SUPPORTED_IDS {
         let ping_req = protocol::ST3215Request::Ping { motor: motor_id };
         if ping_req
             .async_readwrite(port, ST3215_COMMAND_TIMEOUT_MS)
@@ -77,6 +79,13 @@ pub async fn calibrate(
     let kind = calibration_kind(&found_motors);
     if kind == CalibrationKind::Unsupported {
         return Ok(None);
+    }
+    if kind == CalibrationKind::Matdog {
+        matdog::require_explicit_arming().map_err(|message| protocol::Error::InvalidData {
+            msg: message,
+            source_packet: Bytes::new(),
+            reply_packet: Bytes::new(),
+        })?;
     }
 
     let comm = meta.get_communicator().clone();
@@ -150,8 +159,11 @@ mod tests {
             CalibrationKind::Unsupported
         );
         assert_eq!(
-            AUTO_CALIBRATE_MAX_MOTOR_ID,
+            *AUTO_CALIBRATE_SUPPORTED_IDS.last().unwrap(),
             *matdog::MATDOG_MOTOR_IDS.last().unwrap()
         );
+        assert!(!AUTO_CALIBRATE_SUPPORTED_IDS.contains(&9));
+        assert!(!AUTO_CALIBRATE_SUPPORTED_IDS.contains(&20));
+        assert!(!AUTO_CALIBRATE_SUPPORTED_IDS.contains(&40));
     }
 }

@@ -70,9 +70,18 @@ jobs:
               "RamRegister::PresentCurrent",
               "global_torque_off_verified",
               "M12_MIN_GUARD_TICK",
+              "MATDOG_NATIVE_CALIBRATOR_ARM",
+              "LF_UPPER_M12_MIN",
+              "abort_with_global_torque_off",
           )
 
+          forbidden_port = (
+              "MAX_SCAN_MOTOR_ID",
+              "for motor_id in 1..=max_motor_id",
+          )
+          port_source = Path("software/drivers/st3215/src/port.rs").read_text()
           found = [token for token in forbidden if token in source]
+          found += [token for token in forbidden_port if token in port_source]
           missing = [token for token in required if token not in source]
           if found or missing:
               if found:
@@ -96,6 +105,7 @@ jobs:
         shell: bash
         run: |
           rustfmt --edition 2021 --check --config skip_children=true \
+            software/drivers/st3215/src/port.rs \
             software/drivers/st3215/src/auto_calibrate/mod.rs \
             software/drivers/st3215/src/auto_calibrate/matdog.rs \
             software/drivers/st3215/src/auto_calibrate/matdog_test.rs
@@ -106,6 +116,7 @@ jobs:
         run: |
           set -euo pipefail
           files=(
+            software/drivers/st3215/src/port.rs
             software/drivers/st3215/src/auto_calibrate/mod.rs
             software/drivers/st3215/src/auto_calibrate/matdog.rs
             software/drivers/st3215/src/auto_calibrate/matdog_test.rs
