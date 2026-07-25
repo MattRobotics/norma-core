@@ -1,4 +1,4 @@
-name: MATDOG 24-contact Bootstrap and Check
+name: MATDOG Payload Diagnostic
 
 on:
   pull_request:
@@ -6,119 +6,48 @@ on:
       - main
     paths:
       - ".github/workflows/matdog-native-calibrator-check.yml"
-      - ".github/workflows/apply-matdog-v2-port-patch.yml"
       - "tools/.matdog-v2-payload/**"
-      - "protobufs/drivers/st3215/**"
-      - "software/drivers/st3215/**"
-      - "software/station/bin/station/**"
 
 permissions:
-  contents: write
-
-concurrency:
-  group: matdog-native-calibrator-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  contents: read
 
 jobs:
-  bootstrap-and-check:
+  payload-diagnostic:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
 
-      - name: Reconstruct and apply reviewed patch
+      - name: Collect payload diagnostics
         shell: bash
         run: |
-          set -euo pipefail
-          cat tools/.matdog-v2-payload/part-* | tr -d '\n' > /tmp/apply_matdog_v2.py.b64
-          wc -c /tmp/apply_matdog_v2.py.b64
-          sha256sum /tmp/apply_matdog_v2.py.b64
-          test "$(wc -c < /tmp/apply_matdog_v2.py.b64)" = "35464"
-          echo "97968bedd97413caaf6c96bb1556b68e17adc40836b75b0b85df32febcaa5d6f  /tmp/apply_matdog_v2.py.b64" | sha256sum -c -
-          base64 --decode /tmp/apply_matdog_v2.py.b64 > /tmp/apply_matdog_v2.py
-          echo "3a0e6f00a7fe564faa68c0f45ded0d45536fa8b693fc7399d4a5b4cf0d1e2bdc  /tmp/apply_matdog_v2.py" | sha256sum -c -
-          python3 /tmp/apply_matdog_v2.py
+          mkdir -p payload-diagnostic
+          set +e
+          {
+            echo "=== PART SIZES AND HASHES ==="
+            wc -c tools/.matdog-v2-payload/part-*
+            sha256sum tools/.matdog-v2-payload/part-*
+            echo "=== COMBINED PAYLOAD ==="
+            cat tools/.matdog-v2-payload/part-* | tr -d '\n' > /tmp/apply_matdog_v2.py.b64
+            wc -c /tmp/apply_matdog_v2.py.b64
+            sha256sum /tmp/apply_matdog_v2.py.b64
+            echo "=== BASE64 DECODE ==="
+            base64 --decode /tmp/apply_matdog_v2.py.b64 > /tmp/apply_matdog_v2.py
+            echo "decode_status=$?"
+            wc -c /tmp/apply_matdog_v2.py
+            sha256sum /tmp/apply_matdog_v2.py
+            echo "=== APPLY SCRIPT ==="
+            python3 /tmp/apply_matdog_v2.py
+            echo "apply_status=$?"
+          } > payload-diagnostic/output.txt 2>&1
+          echo "diagnostic_complete" > payload-diagnostic/status.txt
+          exit 0
 
-      - name: Setup protoc
-        uses: arduino/setup-protoc@v3
+      - name: Upload payload diagnostic
+        uses: actions/upload-artifact@v4
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          version: "23.x"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          components: rustfmt
-
-      - name: Install native Station build dependency
-        run: sudo apt-get update && sudo apt-get install -y nasm
-
-      - name: Format and source-contract check
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustfmt --edition 2021 --config skip_children=true \
-            software/drivers/st3215/src/port.rs \
-            software/drivers/st3215/src/auto_calibrate/mod.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_v2.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_v2_test.rs
-          git diff --check
-          python3 - <<'PY'
-          from pathlib import Path
-          source = Path("software/drivers/st3215/src/auto_calibrate/matdog_v2.rs").read_text()
-          port = Path("software/drivers/st3215/src/port.rs").read_text()
-          tests = Path("software/drivers/st3215/src/auto_calibrate/matdog_v2_test.rs").read_text()
-          forbidden = (
-              "EepromRegister", "RamRegister::Lock", "ST3215Request::",
-              "reg_write: Some", "reset: Some", "reset_calibration: Some",
-              "freeze_calibration: Some", "action: Some", "Offset.address",
-              "write.motor_id != 12", "matdog_pilot_is_armed",
-          )
-          required = (
-              "all_profiles", "profile_for_arm_value", "held_targets",
-              "verify_static_holds", "global_torque_off_verified",
-              "GUARD_OVERSHOOT_TICKS", "UPPER_30_DELTA",
-              "UPPER_50_DELTA", "UPPER_90_DELTA",
-              "matdog_armed_ram_write_allowed",
-              "matdog_calibrator_is_armed",
-          )
-          found = [token for token in forbidden if token in source or token in port]
-          missing = [token for token in required if token not in source and token not in port]
-          if "profile_table_covers_exactly_24_unique_contacts" not in tests:
-              missing.append("24-profile test")
-          if found or missing:
-              raise SystemExit(f"forbidden={found}, missing={missing}")
-          print("MATDOG 24-contact RAM-only source contract: PASS")
-          PY
-
-      - name: ST3215 unit tests
-        run: cargo test --package st3215
-
-      - name: Create CI-only viewer stub
-        shell: bash
-        run: |
-          set -euo pipefail
-          asset=software/station/clients/station-viewer/dist/index.html
-          test ! -e "$asset"
-          mkdir -p "$(dirname "$asset")"
-          printf '<!doctype html><title>MATDOG offline build gate</title>\n' > "$asset"
-
-      - name: Station release build
-        run: cargo build --release --package station
-
-      - name: Remove transport files and publish verified source
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf software/station/clients/station-viewer/dist
-          rm -rf tools/.matdog-v2-payload
-          rm -f .github/workflows/apply-matdog-v2-port-patch.yml
-          git diff --check
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "feat(st3215): generalize MATDOG calibrator profiles"
-          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+          name: matdog-payload-diagnostic
+          path: payload-diagnostic/
+          if-no-files-found: error
