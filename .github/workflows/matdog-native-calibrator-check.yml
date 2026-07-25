@@ -33,7 +33,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat tools/.matdog-v2-payload/part-* | tr -d '\n' | base64 --decode > /tmp/apply_matdog_v2.py
+          cat tools/.matdog-v2-payload/part-* | tr -d '\n' > /tmp/apply_matdog_v2.py.b64
+          wc -c /tmp/apply_matdog_v2.py.b64
+          sha256sum /tmp/apply_matdog_v2.py.b64
+          test "$(wc -c < /tmp/apply_matdog_v2.py.b64)" = "35464"
+          echo "97968bedd97413caaf6c96bb1556b68e17adc40836b75b0b85df32febcaa5d6f  /tmp/apply_matdog_v2.py.b64" | sha256sum -c -
+          base64 --decode /tmp/apply_matdog_v2.py.b64 > /tmp/apply_matdog_v2.py
+          echo "3a0e6f00a7fe564faa68c0f45ded0d45536fa8b693fc7399d4a5b4cf0d1e2bdc  /tmp/apply_matdog_v2.py" | sha256sum -c -
           python3 /tmp/apply_matdog_v2.py
 
       - name: Setup protoc
