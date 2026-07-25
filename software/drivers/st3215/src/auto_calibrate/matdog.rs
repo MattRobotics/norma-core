@@ -52,7 +52,6 @@ enum ContactState {
     FreeMotion,
     ContactSuspected,
     ContactConfirmed,
-    AmbiguousContact,
     HardAbort,
 }
 
@@ -127,7 +126,6 @@ struct HybridContactDetector {
     baseline: BaselineStats,
     config: HybridContactConfig,
     confirming_samples: u8,
-    ambiguous_samples: u8,
     active_target: Option<u16>,
     target_samples_seen: u8,
 }
@@ -140,7 +138,6 @@ impl HybridContactDetector {
             baseline,
             config,
             confirming_samples: 0,
-            ambiguous_samples: 0,
             active_target: None,
             target_samples_seen: 0,
         }
@@ -162,7 +159,6 @@ impl HybridContactDetector {
             self.target_samples_seen = 0;
             self.previous_position = observation.position;
             self.confirming_samples = 0;
-            self.ambiguous_samples = 0;
             return ContactState::FreeMotion;
         }
 
@@ -182,7 +178,6 @@ impl HybridContactDetector {
 
         if goal_error <= self.config.target_reached_tolerance_ticks {
             self.confirming_samples = 0;
-            self.ambiguous_samples = 0;
             return ContactState::FreeMotion;
         }
 
@@ -193,7 +188,6 @@ impl HybridContactDetector {
         // but is not required to declare the mechanical stop.
         if self.target_samples_seen <= TARGET_STARTUP_SAMPLES {
             self.confirming_samples = 0;
-            self.ambiguous_samples = 0;
             return ContactState::FreeMotion;
         }
 
@@ -201,7 +195,6 @@ impl HybridContactDetector {
 
         if kinematic_stall {
             self.confirming_samples = self.confirming_samples.saturating_add(1);
-            self.ambiguous_samples = 0;
             if self.confirming_samples >= self.config.persistence_samples {
                 ContactState::ContactConfirmed
             } else {
@@ -209,7 +202,6 @@ impl HybridContactDetector {
             }
         } else {
             self.confirming_samples = 0;
-            self.ambiguous_samples = 0;
             ContactState::FreeMotion
         }
     }
@@ -599,19 +591,6 @@ impl MatdogRamOnlyCalibrator {
                         );
                         self.stop_pressure(observation.position).await?;
                         return Ok(observation.position);
-                    }
-                    ContactState::AmbiguousContact => {
-                        return self
-                            .abort_with_global_torque_off(format!(
-                                "M12 ambiguous contact: target={}, tick={}, error={}, current={}, threshold={}, velocity={}",
-                                target,
-                                observation.position,
-                                circular_distance(observation.position, target),
-                                observation.current,
-                                baseline.contact_threshold(),
-                                speed_magnitude(observation.velocity)
-                            ))
-                            .await;
                     }
                     ContactState::HardAbort => {
                         return self
