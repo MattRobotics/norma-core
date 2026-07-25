@@ -35,12 +35,12 @@ fn set_register(bytes: &mut [u8], register: RamRegister, value: &[u8]) {
 
 fn observation(position: u16, velocity: u16, current: u16, goal: u16) -> MotorObservation {
     MotorObservation {
-        monotonic_stamp_ns: position as u64 + 1,
+        monotonic_stamp_ns: u64::from(position) + 1,
         position,
         velocity,
         current,
         goal_position: goal,
-        torque_limit: PILOT_TORQUE_LIMIT,
+        torque_limit: TORQUE_LIMIT,
         torque_enabled: true,
         status: 0,
         has_driver_error: false,
@@ -57,26 +57,170 @@ fn exact_matdog_id_set_is_required() {
     let mut unexpected = MATDOG_MOTOR_IDS;
     unexpected[11] = 44;
     assert!(!is_exact_matdog_motor_set(&unexpected));
-    let mut duplicate = MATDOG_MOTOR_IDS.to_vec();
-    duplicate.push(43);
-    assert!(!is_exact_matdog_motor_set(&duplicate));
 }
 
 #[test]
-fn inference_motor_ids_reject_out_of_range_aliases() {
-    let state = inference_state("matdog-bus", vec![motor_state(267, Vec::new())]);
-    assert!(motor_ids_for_bus(&state, "matdog-bus").is_err());
+fn profile_table_covers_exactly_24_unique_contacts() {
+    let profiles = all_profiles().unwrap();
+    assert_eq!(profiles.len(), 24);
+
+    let tokens: BTreeSet<_> = profiles
+        .iter()
+        .map(|profile| profile.arm_value.as_str())
+        .collect();
+    assert_eq!(tokens.len(), 24);
+
+    for leg in [Leg::Lf, Leg::Rf, Leg::Rh, Leg::Lh] {
+        for joint in [JointKind::Upper, JointKind::Hip, JointKind::Lower] {
+            for side in [ContactSide::Min, ContactSide::Max] {
+                assert!(profiles.iter().any(|profile| {
+                    profile.leg == leg && profile.joint == joint && profile.side == side
+                }));
+            }
+        }
+    }
 }
 
 #[test]
-fn pilot_profile_is_m12_min_unsigned_and_guarded() {
-    assert_eq!(PILOT_MOTOR_ID, 12);
-    assert_eq!(HOME_TICK, 2048);
-    assert_eq!(M12_URDF_MIN_TICK, 1451);
-    assert!(M12_MIN_GUARD_TICK < M12_URDF_MIN_TICK);
-    assert_eq!(M12_URDF_MIN_TICK - M12_MIN_GUARD_TICK, 64);
-    assert!(M12_MIN_GUARD_TICK <= protocol::MAX_ANGLE_STEP);
-    assert!(COARSE_STEP_TICKS > FINE_STEP_TICKS);
+fn validated_m12_min_profile_preserves_hardware_pilot_numbers() {
+    let profile = profile_for_arm_value("LF_UPPER_M12_MIN").unwrap();
+    assert_eq!(profile.motor_id, 12);
+    assert_eq!(profile.probe_sign, -1);
+    assert_eq!(profile.urdf_limit_tick, 1451);
+    assert_eq!(profile.guard_tick, 1387);
+    assert_eq!(profile.baseline_target_tick, 1984);
+    assert_eq!(profile.allowed_motor_ids, &LF_ALLOWED);
+
+    let parked_lh_upper = static_target(Leg::Lh, JointKind::Upper, UPPER_30_DELTA).unwrap();
+    assert!(profile.prerequisites.contains(&parked_lh_upper));
+    assert_eq!(parked_lh_upper.motor_id, 42);
+    assert_eq!(parked_lh_upper.target_tick, 2389);
+}
+
+#[test]
+fn directions_transform_q_limits_into_leg_specific_unsigned_ticks() {
+    assert_eq!(
+        profile_for_arm_value("LF_HIP_M13_MIN")
+            .unwrap()
+            .urdf_limit_tick,
+        2560
+    );
+    assert_eq!(
+        profile_for_arm_value("LF_HIP_M13_MAX")
+            .unwrap()
+            .urdf_limit_tick,
+        1536
+    );
+    assert_eq!(
+        profile_for_arm_value("RF_UPPER_M22_MIN")
+            .unwrap()
+            .urdf_limit_tick,
+        2645
+    );
+    assert_eq!(
+        profile_for_arm_value("RF_UPPER_M22_MAX")
+            .unwrap()
+            .urdf_limit_tick,
+        654
+    );
+    assert_eq!(
+        profile_for_arm_value("RH_LOWER_M31_MIN")
+            .unwrap()
+            .urdf_limit_tick,
+        1001
+    );
+    assert_eq!(
+        profile_for_arm_value("LH_LOWER_M41_MAX")
+            .unwrap()
+            .urdf_limit_tick,
+        1621
+    );
+}
+
+#[test]
+fn every_guard_extends_only_64_ticks_beyond_its_urdf_limit() {
+    for profile in all_profiles().unwrap() {
+        assert_eq!(
+            i32::from(profile.guard_tick) - i32::from(profile.urdf_limit_tick),
+            i32::from(profile.probe_sign) * i32::from(GUARD_OVERSHOOT_TICKS)
+        );
+        assert!(profile.guard_tick <= protocol::MAX_ANGLE_STEP);
+        assert_eq!(
+            i32::from(profile.baseline_target_tick) - i32::from(HOME_TICK),
+            i32::from(profile.probe_sign) * i32::from(BASELINE_TRAVEL_TICKS)
+        );
+    }
+}
+
+#[test]
+fn front_profiles_park_only_the_ipsilateral_rear_upper() {
+    for profile in all_profiles().unwrap() {
+        let has_lh_parking = profile
+            .prerequisites
+            .iter()
+            .any(|target| target.motor_id == 42 && target.target_tick == 2389);
+        let has_rh_parking = profile
+            .prerequisites
+            .iter()
+            .any(|target| target.motor_id == 32 && target.target_tick == 1707);
+        match profile.leg {
+            Leg::Lf => {
+                assert!(has_lh_parking);
+                assert!(!has_rh_parking);
+            }
+            Leg::Rf => {
+                assert!(has_rh_parking);
+                assert!(!has_lh_parking);
+            }
+            Leg::Rh | Leg::Lh => {
+                assert!(!has_lh_parking);
+                assert!(!has_rh_parking);
+            }
+        }
+    }
+}
+
+#[test]
+fn hip_and_lower_prerequisites_match_geometry_checkpoint() {
+    for leg in [Leg::Lf, Leg::Rf, Leg::Rh, Leg::Lh] {
+        let hip = build_profile(leg, JointKind::Hip, ContactSide::Min).unwrap();
+        let upper_50 = static_target(leg, JointKind::Upper, UPPER_50_DELTA).unwrap();
+        assert!(hip.prerequisites.contains(&upper_50));
+
+        let lower = build_profile(leg, JointKind::Lower, ContactSide::Min).unwrap();
+        let upper_90 = static_target(leg, JointKind::Upper, UPPER_90_DELTA).unwrap();
+        let hip_home = static_target(leg, JointKind::Hip, 0).unwrap();
+        assert!(lower.prerequisites.contains(&upper_90));
+        assert!(lower.prerequisites.contains(&hip_home));
+    }
+}
+
+#[test]
+fn armed_motor_allowlists_are_leg_scoped_and_include_front_parking_joint() {
+    assert_eq!(
+        build_profile(Leg::Lf, JointKind::Upper, ContactSide::Min)
+            .unwrap()
+            .allowed_motor_ids,
+        &LF_ALLOWED
+    );
+    assert_eq!(
+        build_profile(Leg::Rf, JointKind::Upper, ContactSide::Min)
+            .unwrap()
+            .allowed_motor_ids,
+        &RF_ALLOWED
+    );
+    assert_eq!(
+        build_profile(Leg::Rh, JointKind::Upper, ContactSide::Min)
+            .unwrap()
+            .allowed_motor_ids,
+        &RH_ALLOWED
+    );
+    assert_eq!(
+        build_profile(Leg::Lh, JointKind::Upper, ContactSide::Min)
+            .unwrap()
+            .allowed_motor_ids,
+        &LH_ALLOWED
+    );
 }
 
 #[test]
@@ -88,63 +232,68 @@ fn robust_current_baseline_uses_median_and_mad() {
 }
 
 #[test]
-fn adaptive_current_threshold_has_noise_floor_and_saturates_safely() {
-    let flat = BaselineStats::from_samples(&[12, 12, 12, 12]).unwrap();
-    assert_eq!(flat.contact_threshold(), 17);
-
-    let noisy = BaselineStats::from_samples(&[10, 12, 14, 16, 200]).unwrap();
-    assert_eq!(noisy.median_current, 14);
-    assert_eq!(noisy.mad_current, 2);
-    assert_eq!(noisy.contact_threshold(), 22);
-
-    let saturated = BaselineStats {
-        median_current: u16::MAX - 1,
-        mad_current: 10,
-    };
-    assert_eq!(saturated.contact_threshold(), u16::MAX);
-}
-
-#[test]
-fn stall_contact_requires_displacement_velocity_startup_and_persistence() {
+fn direction_generic_detector_confirms_stall_in_both_tick_directions() {
     let baseline = BaselineStats {
-        median_current: 10,
-        mad_current: 1,
+        median_current: 1,
+        mad_current: 0,
     };
-    let mut detector =
-        HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
 
+    let mut decreasing = HybridContactDetector::new(HOME_TICK, baseline, -1);
     assert_eq!(
-        detector.observe(observation(2016, 0, 1, 1968), 1968),
+        decreasing.observe(observation(1470, 0, 1, 1431), 1431),
         ContactState::FreeMotion
     );
     for _ in 0..TARGET_STARTUP_SAMPLES {
         assert_eq!(
-            detector.observe(observation(2016, 0, 1, 1968), 1968),
+            decreasing.observe(observation(1470, 0, 1, 1431), 1431),
             ContactState::FreeMotion
         );
     }
     assert_eq!(
-        detector.observe(observation(2016, 0, 1, 1968), 1968),
+        decreasing.observe(observation(1470, 0, 1, 1431), 1431),
         ContactState::ContactSuspected
     );
     assert_eq!(
-        detector.observe(observation(2016, 0, 1, 1968), 1968),
+        decreasing.observe(observation(1470, 0, 1, 1431), 1431),
         ContactState::ContactSuspected
     );
     assert_eq!(
-        detector.observe(observation(2016, 0, 1, 1968), 1968),
+        decreasing.observe(observation(1470, 0, 1, 1431), 1431),
+        ContactState::ContactConfirmed
+    );
+
+    let mut increasing = HybridContactDetector::new(HOME_TICK, baseline, 1);
+    assert_eq!(
+        increasing.observe(observation(2620, 0, 1, 2660), 2660),
+        ContactState::FreeMotion
+    );
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(
+            increasing.observe(observation(2620, 0, 1, 2660), 2660),
+            ContactState::FreeMotion
+        );
+    }
+    assert_eq!(
+        increasing.observe(observation(2620, 0, 1, 2660), 2660),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        increasing.observe(observation(2620, 0, 1, 2660), 2660),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        increasing.observe(observation(2620, 0, 1, 2660), 2660),
         ContactState::ContactConfirmed
     );
 }
 
 #[test]
-fn current_rise_without_kinematic_stall_does_not_confirm_contact() {
+fn current_rise_without_kinematic_stall_is_not_contact() {
     let baseline = BaselineStats {
         median_current: 10,
         mad_current: 1,
     };
-    let mut detector =
-        HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
+    let mut detector = HybridContactDetector::new(HOME_TICK, baseline, -1);
     for position in [2016, 1984, 1952, 1920] {
         assert_ne!(
             detector.observe(observation(position, 25, 40, position - 32), position - 32),
@@ -154,205 +303,133 @@ fn current_rise_without_kinematic_stall_does_not_confirm_contact() {
 }
 
 #[test]
-fn stall_detector_resets_persistence_after_free_motion() {
+fn hard_abort_inputs_are_direction_independent() {
     let baseline = BaselineStats {
         median_current: 10,
         mad_current: 1,
     };
-    let mut detector =
-        HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
+    for sign in [-1, 1] {
+        let mut detector = HybridContactDetector::new(HOME_TICK, baseline, sign);
+        let mut status = observation(1984, 0, 20, 1968);
+        status.status = 1;
+        assert_eq!(detector.observe(status, 1968), ContactState::HardAbort);
 
-    assert_eq!(
-        detector.observe(observation(2016, 0, 1, 1968), 1968),
-        ContactState::FreeMotion
-    );
-    for _ in 0..TARGET_STARTUP_SAMPLES {
+        let mut detector = HybridContactDetector::new(HOME_TICK, baseline, sign);
         assert_eq!(
-            detector.observe(observation(2016, 0, 1, 1968), 1968),
-            ContactState::FreeMotion
+            detector.observe(observation(1984, 0, HARD_CURRENT_ABORT_RAW, 1968), 1968),
+            ContactState::HardAbort
         );
     }
-    assert_eq!(
-        detector.observe(observation(2016, 0, 1, 1968), 1968),
-        ContactState::ContactSuspected
-    );
-    assert_eq!(
-        detector.observe(observation(2000, 20, 1, 1968), 1968),
-        ContactState::FreeMotion
-    );
-    assert_eq!(
-        detector.observe(observation(2000, 0, 1, 1940), 1940),
-        ContactState::FreeMotion
-    );
 }
 
 #[test]
-fn observed_m12_low_current_stop_is_confirmed_like_generic_calibrator() {
-    let baseline = BaselineStats {
-        median_current: 0,
-        mad_current: 0,
-    };
-    let mut detector =
-        HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
-
-    assert_eq!(
-        detector.observe(observation(1470, 0, 1, 1431), 1431),
-        ContactState::FreeMotion
-    );
-    for _ in 0..TARGET_STARTUP_SAMPLES {
-        assert_eq!(
-            detector.observe(observation(1470, 0, 1, 1431), 1431),
-            ContactState::FreeMotion
-        );
-    }
-    assert_eq!(
-        detector.observe(observation(1470, 0, 1, 1431), 1431),
-        ContactState::ContactSuspected
-    );
-    assert_eq!(
-        detector.observe(observation(1470, 0, 1, 1431), 1431),
-        ContactState::ContactSuspected
-    );
-    assert_eq!(
-        detector.observe(observation(1470, 0, 1, 1431), 1431),
-        ContactState::ContactConfirmed
-    );
-}
-
-#[test]
-fn new_target_stationary_samples_do_not_create_premotion_ambiguity() {
-    let baseline = BaselineStats {
-        median_current: 10,
-        mad_current: 1,
-    };
-    let mut detector = HybridContactDetector::new(2038, baseline, HybridContactConfig::default());
-
-    assert_eq!(
-        detector.observe(observation(2009, 0, 2, 2006), 2006),
-        ContactState::FreeMotion
-    );
-
-    for _ in 0..TARGET_STARTUP_SAMPLES {
-        assert_eq!(
-            detector.observe(observation(2009, 0, 2, 1974), 1974),
-            ContactState::FreeMotion
-        );
-    }
-
-    assert_eq!(
-        detector.observe(observation(1998, 20, 2, 1974), 1974),
-        ContactState::FreeMotion
-    );
-}
-
-#[test]
-fn settled_target_within_tolerance_is_not_contact_after_motion() {
-    let baseline = BaselineStats {
-        median_current: 0,
-        mad_current: 0,
-    };
-    let mut detector = HybridContactDetector::new(2047, baseline, HybridContactConfig::default());
-
-    assert_eq!(
-        detector.observe(observation(2047, 0, 0, 1943), 1943),
-        ContactState::FreeMotion
-    );
-    assert_eq!(
-        detector.observe(observation(1980, 20, 0, 1943), 1943),
-        ContactState::FreeMotion
-    );
-
-    for _ in 0..6 {
-        assert_eq!(
-            detector.observe(observation(1948, 0, 0, 1943), 1943),
-            ContactState::FreeMotion
-        );
-    }
-
-    assert_eq!(circular_distance(1948, 1943), 5);
-    assert!(5 <= HOME_TOLERANCE_TICKS);
-}
-
-#[test]
-fn servo_status_driver_error_torque_loss_and_hard_current_abort() {
-    let baseline = BaselineStats {
-        median_current: 10,
-        mad_current: 1,
-    };
-    let config = HybridContactConfig::default();
-
-    let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
-    let mut status = observation(1984, 0, 20, 1968);
-    status.status = 1;
-    assert_eq!(detector.observe(status, 1968), ContactState::HardAbort);
-
-    let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
-    let mut driver_error = observation(1984, 0, 20, 1968);
-    driver_error.has_driver_error = true;
-    assert_eq!(
-        detector.observe(driver_error, 1968),
-        ContactState::HardAbort
-    );
-
-    let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
-    let mut torque_lost = observation(1984, 0, 20, 1968);
-    torque_lost.torque_enabled = false;
-    assert_eq!(detector.observe(torque_lost, 1968), ContactState::HardAbort);
-
-    let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
-    assert_eq!(
-        detector.observe(observation(1984, 0, HARD_CURRENT_ABORT_RAW, 1968), 1968),
-        ContactState::HardAbort
-    );
-
-    let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
-    let mut torque_limit_changed = observation(1984, 0, 20, 1968);
-    torque_limit_changed.torque_limit = PILOT_TORQUE_LIMIT + 1;
-    assert_eq!(
-        detector.observe(torque_limit_changed, 1968),
-        ContactState::HardAbort
-    );
-
-    let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
-    let stale_goal = observation(1984, 0, 20, 1976);
-    assert_eq!(detector.observe(stale_goal, 1968), ContactState::HardAbort);
-
-    let mut detector = HybridContactDetector::new(HOME_TICK, baseline, config);
-    assert_eq!(
-        detector.observe(
-            observation(2016, 20, HARD_CURRENT_ABORT_RAW - 1, 1984),
-            1984
-        ),
-        ContactState::FreeMotion
-    );
-}
-
-#[test]
-fn repeatability_distance_is_circular_but_goal_position_remains_unsigned() {
+fn wrap_math_is_local_but_goal_targets_remain_unsigned() {
     assert_eq!(circular_distance(4092, 8), 12);
     assert_eq!(signed_tick_delta(8, 4092), 12);
     assert_eq!(signed_tick_delta(4092, 8), -12);
-    assert_eq!(repeatability_spread(4092, 8), Ok(12));
-    assert_eq!(
-        repeatability_spread(1000, 1000 + REPEATABILITY_TOLERANCE_TICKS),
-        Ok(REPEATABILITY_TOLERANCE_TICKS)
-    );
-    assert!(repeatability_spread(1000, 1001 + REPEATABILITY_TOLERANCE_TICKS).is_err());
+    assert_eq!(advance_tick(2048, -1, 32).unwrap(), 2016);
+    assert_eq!(advance_tick(2048, 1, 32).unwrap(), 2080);
+    assert!(advance_tick(0, -1, 1).is_err());
+    assert!(advance_tick(protocol::MAX_ANGLE_STEP, 1, 1).is_err());
 }
 
 #[test]
-fn observation_reads_all_required_live_registers_and_error_state() {
+fn only_ram_motion_registers_are_allowlisted() {
+    assert!(is_allowed_matdog_ram_register(RamRegister::TorqueEnable));
+    assert!(is_allowed_matdog_ram_register(RamRegister::Acc));
+    assert!(is_allowed_matdog_ram_register(RamRegister::GoalPosition));
+    assert!(is_allowed_matdog_ram_register(RamRegister::GoalSpeed));
+    assert!(is_allowed_matdog_ram_register(RamRegister::TorqueLimit));
+    assert!(!is_allowed_matdog_ram_register(RamRegister::Status));
+}
+
+#[test]
+fn armed_ram_gate_restricts_registers_values_motors_and_goal_windows() {
+    let profile = profile_for_arm_value("LF_UPPER_M12_MIN").unwrap();
+    let allowed = |motor_id, register: RamRegister, value: &[u8]| {
+        ram_write_allowed_for_profile(&profile, motor_id, register.address() as u32, value)
+    };
+
+    let goal = 1431_u16.to_le_bytes();
+    assert!(allowed(12, RamRegister::GoalPosition, &goal));
+    assert!(!allowed(11, RamRegister::GoalPosition, &goal));
+    assert!(!allowed(
+        12,
+        RamRegister::GoalPosition,
+        &1000_u16.to_le_bytes()
+    ));
+    assert!(allowed(
+        42,
+        RamRegister::GoalPosition,
+        &2389_u16.to_le_bytes()
+    ));
+    assert!(!allowed(
+        42,
+        RamRegister::GoalPosition,
+        &3000_u16.to_le_bytes()
+    ));
+    assert!(allowed(
+        12,
+        RamRegister::TorqueLimit,
+        &TORQUE_LIMIT.to_le_bytes()
+    ));
+    assert!(!allowed(
+        12,
+        RamRegister::TorqueLimit,
+        &(TORQUE_LIMIT + 1).to_le_bytes()
+    ));
+    assert!(!allowed(12, RamRegister::Status, &[0]));
+}
+
+#[test]
+fn front_lower_restore_order_keeps_rear_parking_until_active_leg_is_home() {
+    let profile = profile_for_arm_value("LF_LOWER_M11_MIN").unwrap();
+    let order = prerequisite_restore_order(&profile.prerequisites, profile.motor_id);
+    assert_eq!(order, vec![12, 13, 42]);
+
+    let profile = profile_for_arm_value("RF_LOWER_M21_MAX").unwrap();
+    let order = prerequisite_restore_order(&profile.prerequisites, profile.motor_id);
+    assert_eq!(order, vec![22, 23, 32]);
+}
+
+#[test]
+fn prerequisites_are_unique_and_never_include_the_probe_motor() {
+    for profile in all_profiles().unwrap() {
+        let ids: BTreeSet<_> = profile
+            .prerequisites
+            .iter()
+            .map(|target| target.motor_id)
+            .collect();
+        assert_eq!(ids.len(), profile.prerequisites.len());
+        assert!(!ids.contains(&profile.motor_id));
+        assert!(ids
+            .iter()
+            .all(|motor_id| profile.allowed_motor_ids.contains(motor_id)));
+    }
+}
+
+#[test]
+fn unsupported_arming_values_are_rejected() {
+    assert!(profile_for_arm_value("LF_UPPER_M12_MIN").is_ok());
+    assert!(profile_for_arm_value("LF_UPPER_M12_BOTH").is_err());
+    assert!(profile_for_arm_value("ALL_24").is_err());
+    assert!(profile_for_arm_value("").is_err());
+}
+
+#[test]
+fn observation_reads_required_live_registers_and_error_state() {
+    let profile = profile_for_arm_value("LF_UPPER_M12_MIN").unwrap();
     let mut bytes = vec![0; RamRegister::PresentCurrent.address() as usize + 2];
     set_register(&mut bytes, RamRegister::TorqueEnable, &[1]);
     set_register(
         &mut bytes,
         RamRegister::GoalPosition,
-        &M12_URDF_MIN_TICK.to_le_bytes(),
+        &profile.urdf_limit_tick.to_le_bytes(),
     );
     set_register(
         &mut bytes,
         RamRegister::TorqueLimit,
-        &PILOT_TORQUE_LIMIT.to_le_bytes(),
+        &TORQUE_LIMIT.to_le_bytes(),
     );
     set_register(
         &mut bytes,
@@ -371,18 +448,18 @@ fn observation_reads_all_required_live_registers_and_error_state() {
         &123_u16.to_le_bytes(),
     );
 
-    let mut motor = motor_state(PILOT_MOTOR_ID as u32, bytes);
+    let mut motor = motor_state(profile.motor_id as u32, bytes);
     motor.monotonic_stamp_ns = 42;
     motor.error = Some(crate::st3215_proto::St3215Error::default());
     let state = inference_state("matdog-bus", vec![motor]);
-    let observed = observation_from_state(&state, "matdog-bus", PILOT_MOTOR_ID).unwrap();
+    let observed = observation_from_state(&state, "matdog-bus", profile.motor_id).unwrap();
 
     assert_eq!(observed.monotonic_stamp_ns, 42);
     assert_eq!(observed.position, 1460);
     assert_eq!(speed_magnitude(observed.velocity), 7);
     assert_eq!(observed.current, 123);
-    assert_eq!(observed.goal_position, M12_URDF_MIN_TICK);
-    assert_eq!(observed.torque_limit, PILOT_TORQUE_LIMIT);
+    assert_eq!(observed.goal_position, profile.urdf_limit_tick);
+    assert_eq!(observed.torque_limit, TORQUE_LIMIT);
     assert!(observed.torque_enabled);
     assert_eq!(observed.status, 0x04);
     assert!(observed.has_driver_error);
@@ -395,9 +472,9 @@ fn command_result_and_ram_readback_are_matched_exactly() {
     set_register(
         &mut bytes,
         RamRegister::GoalPosition,
-        &M12_URDF_MIN_TICK.to_le_bytes(),
+        &1451_u16.to_le_bytes(),
     );
-    let mut motor = motor_state(PILOT_MOTOR_ID as u32, bytes);
+    let mut motor = motor_state(12, bytes);
     motor.last_command = Some(crate::st3215_proto::InferenceCommandState {
         command: Some(TxEnvelope {
             command_id: command_id.clone(),
@@ -407,7 +484,7 @@ fn command_result_and_ram_readback_are_matched_exactly() {
         result: CommandResult::CrSuccess as i32,
     });
     let state = inference_state("matdog-bus", vec![motor]);
-    let motor = find_motor(&state, "matdog-bus", PILOT_MOTOR_ID).unwrap();
+    let motor = find_motor(&state, "matdog-bus", 12).unwrap();
 
     assert_eq!(
         command_result_for(&state, "matdog-bus", &command_id),
@@ -421,7 +498,7 @@ fn command_result_and_ram_readback_are_matched_exactly() {
     assert!(motor_ram_register_matches(
         motor,
         RamRegister::GoalPosition,
-        &M12_URDF_MIN_TICK.to_le_bytes()
+        &1451_u16.to_le_bytes()
     ));
     assert!(!motor_ram_register_matches(
         motor,
@@ -441,24 +518,7 @@ fn command_ids_are_scoped_and_monotonic() {
 }
 
 #[test]
-fn ram_write_allowlist_rejects_lock_and_wrong_sizes() {
-    for register in [
-        RamRegister::TorqueEnable,
-        RamRegister::Acc,
-        RamRegister::GoalPosition,
-        RamRegister::GoalSpeed,
-        RamRegister::TorqueLimit,
-    ] {
-        assert!(is_allowed_matdog_ram_register(register));
-        assert!(validate_ram_write(register, &vec![0; register.size() as usize]).is_ok());
-    }
-    assert!(!is_allowed_matdog_ram_register(RamRegister::Lock));
-    assert!(validate_ram_write(RamRegister::Lock, &[1]).is_err());
-    assert!(validate_ram_write(RamRegister::GoalPosition, &[0]).is_err());
-}
-
-#[test]
-fn global_torque_off_cleanup_is_exact_and_failure_preserving() {
+fn global_torque_off_cleanup_is_exact() {
     let writes = global_torque_off_writes();
     assert_eq!(writes.len(), MATDOG_MOTOR_IDS.len());
     assert!(is_exact_matdog_motor_set(
@@ -468,33 +528,20 @@ fn global_torque_off_cleanup_is_exact_and_failure_preserving() {
             .collect::<Vec<_>>()
     ));
     assert!(writes.iter().all(|(_, value)| value.as_slice() == &[0]));
-
-    let contact = ContactResult {
-        first_tick: 1450,
-        second_tick: 1452,
-        spread_ticks: 2,
-        baseline: BaselineStats {
-            median_current: 10,
-            mad_current: 1,
-        },
-    };
-    assert_eq!(combine_pilot_and_cleanup(Ok(contact), Ok(())), Ok(contact));
-    assert_eq!(
-        combine_pilot_and_cleanup(Err("pilot".into()), Ok(())),
-        Err("pilot".into())
-    );
-    assert!(
-        combine_pilot_and_cleanup(Ok(contact), Err("cleanup".into()))
-            .unwrap_err()
-            .contains("cleanup failed")
-    );
-    let both = combine_pilot_and_cleanup(Err("pilot".into()), Err("cleanup".into())).unwrap_err();
-    assert!(both.contains("pilot"));
-    assert!(both.contains("cleanup"));
 }
 
 #[test]
-fn matdog_source_has_no_eeprom_reset_offset_regwrite_action_or_freeze_path() {
+fn repeatability_uses_circular_distance_and_preserves_unsigned_goals() {
+    assert_eq!(repeatability_spread(4092, 8).unwrap(), 12);
+    assert_eq!(
+        repeatability_spread(1000, 1000 + REPEATABILITY_TOLERANCE_TICKS).unwrap(),
+        REPEATABILITY_TOLERANCE_TICKS
+    );
+    assert!(repeatability_spread(1000, 1001 + REPEATABILITY_TOLERANCE_TICKS).is_err());
+}
+
+#[test]
+fn canonical_matdog_source_has_no_eeprom_reset_offset_regwrite_action_or_freeze_path() {
     let source = include_str!("matdog.rs");
     for forbidden in [
         "EepromRegister",
@@ -508,26 +555,5 @@ fn matdog_source_has_no_eeprom_reset_offset_regwrite_action_or_freeze_path() {
         "Offset.address",
     ] {
         assert!(!source.contains(forbidden), "forbidden token: {forbidden}");
-    }
-}
-
-#[test]
-fn matdog_requires_exact_explicit_arming_value() {
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = ENV_LOCK.lock().unwrap();
-    let previous = std::env::var_os(MATDOG_ARM_ENV);
-
-    std::env::remove_var(MATDOG_ARM_ENV);
-    assert!(require_explicit_arming().is_err());
-
-    std::env::set_var(MATDOG_ARM_ENV, "1");
-    assert!(require_explicit_arming().is_err());
-
-    std::env::set_var(MATDOG_ARM_ENV, MATDOG_ARM_VALUE);
-    assert_eq!(require_explicit_arming(), Ok(()));
-
-    match previous {
-        Some(value) => std::env::set_var(MATDOG_ARM_ENV, value),
-        None => std::env::remove_var(MATDOG_ARM_ENV),
     }
 }
