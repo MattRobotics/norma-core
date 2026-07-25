@@ -74,6 +74,7 @@ fn pilot_profile_is_m12_min_unsigned_and_guarded() {
     assert_eq!(HOME_TICK, 2048);
     assert_eq!(M12_URDF_MIN_TICK, 1451);
     assert!(M12_MIN_GUARD_TICK < M12_URDF_MIN_TICK);
+    assert_eq!(M12_URDF_MIN_TICK - M12_MIN_GUARD_TICK, 64);
     assert!(M12_MIN_GUARD_TICK <= protocol::MAX_ANGLE_STEP);
     assert!(COARSE_STEP_TICKS > FINE_STEP_TICKS);
 }
@@ -104,7 +105,7 @@ fn adaptive_current_threshold_has_noise_floor_and_saturates_safely() {
 }
 
 #[test]
-fn hybrid_contact_requires_position_velocity_current_and_persistence() {
+fn stall_contact_requires_displacement_velocity_startup_and_persistence() {
     let baseline = BaselineStats {
         median_current: 10,
         mad_current: 1,
@@ -113,23 +114,25 @@ fn hybrid_contact_requires_position_velocity_current_and_persistence() {
         HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
 
     assert_eq!(
-        detector.observe(observation(2016, 20, 12, 1984), 1984),
+        detector.observe(observation(2016, 0, 1, 1968), 1968),
         ContactState::FreeMotion
     );
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(
+            detector.observe(observation(2016, 0, 1, 1968), 1968),
+            ContactState::FreeMotion
+        );
+    }
     assert_eq!(
-        detector.observe(observation(1984, 0, 20, 1968), 1968),
-        ContactState::FreeMotion
-    );
-    assert_eq!(
-        detector.observe(observation(1984, 0, 20, 1968), 1968),
+        detector.observe(observation(2016, 0, 1, 1968), 1968),
         ContactState::ContactSuspected
     );
     assert_eq!(
-        detector.observe(observation(1984, 0, 20, 1968), 1968),
+        detector.observe(observation(2016, 0, 1, 1968), 1968),
         ContactState::ContactSuspected
     );
     assert_eq!(
-        detector.observe(observation(1984, 0, 20, 1968), 1968),
+        detector.observe(observation(2016, 0, 1, 1968), 1968),
         ContactState::ContactConfirmed
     );
 }
@@ -151,7 +154,7 @@ fn current_rise_without_kinematic_stall_does_not_confirm_contact() {
 }
 
 #[test]
-fn hybrid_detector_resets_persistence_after_free_motion() {
+fn stall_detector_resets_persistence_after_free_motion() {
     let baseline = BaselineStats {
         median_current: 10,
         mad_current: 1,
@@ -160,59 +163,59 @@ fn hybrid_detector_resets_persistence_after_free_motion() {
         HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
 
     assert_eq!(
-        detector.observe(observation(1984, 0, 20, 1968), 1968),
+        detector.observe(observation(2016, 0, 1, 1968), 1968),
         ContactState::FreeMotion
     );
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(
+            detector.observe(observation(2016, 0, 1, 1968), 1968),
+            ContactState::FreeMotion
+        );
+    }
     assert_eq!(
-        detector.observe(observation(1984, 0, 20, 1968), 1968),
+        detector.observe(observation(2016, 0, 1, 1968), 1968),
         ContactState::ContactSuspected
     );
     assert_eq!(
-        detector.observe(observation(1976, 20, 20, 1968), 1968),
+        detector.observe(observation(2000, 20, 1, 1968), 1968),
         ContactState::FreeMotion
     );
     assert_eq!(
-        detector.observe(observation(1976, 0, 20, 1960), 1960),
+        detector.observe(observation(2000, 0, 1, 1940), 1940),
         ContactState::FreeMotion
-    );
-    assert_eq!(
-        detector.observe(observation(1976, 0, 20, 1960), 1960),
-        ContactState::ContactSuspected
     );
 }
 
 #[test]
-fn stall_without_current_rise_becomes_ambiguous_only_after_motion() {
+fn observed_m12_low_current_stop_is_confirmed_like_generic_calibrator() {
     let baseline = BaselineStats {
-        median_current: 10,
-        mad_current: 1,
+        median_current: 0,
+        mad_current: 0,
     };
     let mut detector =
         HybridContactDetector::new(HOME_TICK, baseline, HybridContactConfig::default());
 
     assert_eq!(
-        detector.observe(observation(2048, 0, 12, 1968), 1968),
+        detector.observe(observation(1470, 0, 1, 1431), 1431),
         ContactState::FreeMotion
     );
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(
+            detector.observe(observation(1470, 0, 1, 1431), 1431),
+            ContactState::FreeMotion
+        );
+    }
     assert_eq!(
-        detector.observe(observation(2016, 20, 12, 1968), 1968),
-        ContactState::FreeMotion
-    );
-    assert_eq!(
-        detector.observe(observation(1984, 0, 12, 1968), 1968),
-        ContactState::FreeMotion
-    );
-    assert_eq!(
-        detector.observe(observation(1984, 0, 12, 1968), 1968),
+        detector.observe(observation(1470, 0, 1, 1431), 1431),
         ContactState::ContactSuspected
     );
     assert_eq!(
-        detector.observe(observation(1984, 0, 12, 1968), 1968),
+        detector.observe(observation(1470, 0, 1, 1431), 1431),
         ContactState::ContactSuspected
     );
     assert_eq!(
-        detector.observe(observation(1984, 0, 12, 1968), 1968),
-        ContactState::AmbiguousContact
+        detector.observe(observation(1470, 0, 1, 1431), 1431),
+        ContactState::ContactConfirmed
     );
 }
 
@@ -229,7 +232,7 @@ fn new_target_stationary_samples_do_not_create_premotion_ambiguity() {
         ContactState::FreeMotion
     );
 
-    for _ in 0..6 {
+    for _ in 0..TARGET_STARTUP_SAMPLES {
         assert_eq!(
             detector.observe(observation(2009, 0, 2, 1974), 1974),
             ContactState::FreeMotion

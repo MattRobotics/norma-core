@@ -73,6 +73,8 @@ jobs:
               "MATDOG_NATIVE_CALIBRATOR_ARM",
               "LF_UPPER_M12_MIN",
               "abort_with_global_torque_off",
+              "TARGET_STARTUP_SAMPLES",
+              "CONTACT_SETTLE_WINDOW",
           )
 
           forbidden_port = (

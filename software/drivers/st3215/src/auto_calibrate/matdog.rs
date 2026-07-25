@@ -24,7 +24,11 @@ pub(crate) const MATDOG_ARM_VALUE: &str = "LF_UPPER_M12_MIN";
 const PILOT_MOTOR_ID: u8 = 12;
 const HOME_TICK: u16 = 2048;
 const M12_URDF_MIN_TICK: u16 = 1451;
-const M12_MIN_GUARD_TICK: u16 = 1434;
+// Permit a bounded commanded overshoot beyond the model limit so a
+// mechanical stop can produce a measurable persistent target error.
+// The generic ElRobot/SO101 calibrator commands much farther; MATDOG keeps
+// the overshoot restricted to 64 ticks and remains RAM-only.
+const M12_MIN_GUARD_TICK: u16 = 1387;
 const BASELINE_TARGET_TICK: u16 = 1984;
 const PILOT_TORQUE_LIMIT: u16 = 400;
 const PILOT_SPEED: u16 = 80;
@@ -36,6 +40,8 @@ const HOME_TOLERANCE_TICKS: u16 = 10;
 const REPEATABILITY_TOLERANCE_TICKS: u16 = 16;
 const BASELINE_MIN_SAMPLES: usize = 6;
 const MINIMUM_CONTACT_TRAVEL_TICKS: u16 = 24;
+const TARGET_STARTUP_SAMPLES: u8 = 4;
+const CONTACT_SETTLE_WINDOW: Duration = Duration::from_millis(1500);
 const HARD_CURRENT_ABORT_RAW: u16 = 200;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const TELEMETRY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -123,8 +129,7 @@ struct HybridContactDetector {
     confirming_samples: u8,
     ambiguous_samples: u8,
     active_target: Option<u16>,
-    target_start_position: u16,
-    target_motion_observed: bool,
+    target_samples_seen: u8,
 }
 
 impl HybridContactDetector {
@@ -137,8 +142,7 @@ impl HybridContactDetector {
             confirming_samples: 0,
             ambiguous_samples: 0,
             active_target: None,
-            target_start_position: start_position,
-            target_motion_observed: false,
+            target_samples_seen: 0,
         }
     }
 
@@ -155,32 +159,26 @@ impl HybridContactDetector {
 
         if self.active_target != Some(commanded_target) {
             self.active_target = Some(commanded_target);
-            self.target_start_position = observation.position;
-            self.target_motion_observed = false;
+            self.target_samples_seen = 0;
             self.previous_position = observation.position;
             self.confirming_samples = 0;
             self.ambiguous_samples = 0;
             return ContactState::FreeMotion;
         }
 
+        self.target_samples_seen = self.target_samples_seen.saturating_add(1);
+
         let travel = negative_direction_progress(observation.position, self.start_position);
         let progress = negative_direction_progress(observation.position, self.previous_position);
-        let target_travel =
-            negative_direction_progress(observation.position, self.target_start_position);
         self.previous_position = observation.position;
 
         let velocity = speed_magnitude(observation.velocity);
-        if target_travel > self.config.max_progress_ticks || velocity > self.config.max_velocity_raw
-        {
-            self.target_motion_observed = true;
-        }
-
         let enough_travel = travel >= self.config.min_travel_ticks;
         let low_progress = progress <= self.config.max_progress_ticks;
         let low_velocity = velocity <= self.config.max_velocity_raw;
         let goal_error = circular_distance(observation.position, commanded_target);
         let target_ahead = signed_tick_delta(commanded_target, observation.position) < 0;
-        let current_high = observation.current >= self.baseline.contact_threshold();
+        let _current_supports_contact = observation.current >= self.baseline.contact_threshold();
 
         if goal_error <= self.config.target_reached_tolerance_ticks {
             self.confirming_samples = 0;
@@ -188,21 +186,24 @@ impl HybridContactDetector {
             return ContactState::FreeMotion;
         }
 
+        // Match the proven generic ST3215 calibrator semantics: skip initial
+        // telemetry after each new target, then classify a persistent
+        // position/velocity stall after real overall displacement. Current is
+        // retained as diagnostic telemetry and for the absolute hard-abort,
+        // but is not required to declare the mechanical stop.
+        if self.target_samples_seen <= TARGET_STARTUP_SAMPLES {
+            self.confirming_samples = 0;
+            self.ambiguous_samples = 0;
+            return ContactState::FreeMotion;
+        }
+
         let kinematic_stall = enough_travel && low_progress && low_velocity && target_ahead;
 
-        if kinematic_stall && current_high {
+        if kinematic_stall {
             self.confirming_samples = self.confirming_samples.saturating_add(1);
             self.ambiguous_samples = 0;
             if self.confirming_samples >= self.config.persistence_samples {
                 ContactState::ContactConfirmed
-            } else {
-                ContactState::ContactSuspected
-            }
-        } else if kinematic_stall && self.target_motion_observed {
-            self.ambiguous_samples = self.ambiguous_samples.saturating_add(1);
-            self.confirming_samples = 0;
-            if self.ambiguous_samples >= self.config.persistence_samples {
-                ContactState::AmbiguousContact
             } else {
                 ContactState::ContactSuspected
             }
@@ -568,7 +569,7 @@ impl MatdogRamOnlyCalibrator {
 
             self.set_goal_verified(next_target).await?;
             target = next_target;
-            let settle_deadline = Instant::now() + Duration::from_millis(700);
+            let settle_deadline = Instant::now() + CONTACT_SETTLE_WINDOW;
             let mut last_observation = None;
 
             while Instant::now() < settle_deadline {
@@ -577,6 +578,11 @@ impl MatdogRamOnlyCalibrator {
                     .await?;
                 last_stamp = observation.monotonic_stamp_ns;
                 last_observation = Some(observation);
+                self.ensure_observation_safe(observation, true, Some(target))?;
+
+                if circular_distance(observation.position, target) <= HOME_TOLERANCE_TICKS {
+                    break;
+                }
 
                 match detector.observe(observation, target) {
                     ContactState::FreeMotion | ContactState::ContactSuspected => {}
