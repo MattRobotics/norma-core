@@ -8,6 +8,7 @@ on:
       - ".github/workflows/matdog-native-calibrator-check.yml"
       - ".github/workflows/apply-matdog-v2-port-patch.yml"
       - ".github/workflows/matdog-test-diagnostic.yml"
+      - ".github/workflows/matdog-final-test-diagnostic.yml"
       - "tools/.matdog-v2-payload/**"
       - "tools/matdog_finalize.patch.gz.b64"
       - "tools/matdog-native-calibrator-check.final.yml"
@@ -94,6 +95,58 @@ jobs:
           set -euo pipefail
           git apply --check /tmp/matdog_finalize.patch
           git apply /tmp/matdog_finalize.patch
+          python3 - <<'PY'
+          from pathlib import Path
+
+          port = Path("software/drivers/st3215/src/port.rs")
+          text = port.read_text()
+          old = '''        let wrong_motor = TxEnvelope {
+              write: Some(crate::st3215_proto::St3215WriteCommand {
+                  motor_id: 11,
+                  address: protocol::RamRegister::GoalPosition.address() as u32,
+                  value: Bytes::copy_from_slice(&2048_u16.to_le_bytes()),
+              }),
+              ..Default::default()
+          };
+          assert!(!allowed(&wrong_motor));
+          '''
+          new = '''        let prerequisite_home = TxEnvelope {
+              write: Some(crate::st3215_proto::St3215WriteCommand {
+                  motor_id: 11,
+                  address: protocol::RamRegister::GoalPosition.address() as u32,
+                  value: Bytes::copy_from_slice(&2048_u16.to_le_bytes()),
+              }),
+              ..Default::default()
+          };
+          assert!(allowed(&prerequisite_home));
+
+          let wrong_motor = TxEnvelope {
+              write: Some(crate::st3215_proto::St3215WriteCommand {
+                  motor_id: 21,
+                  address: protocol::RamRegister::GoalPosition.address() as u32,
+                  value: Bytes::copy_from_slice(&2048_u16.to_le_bytes()),
+              }),
+              ..Default::default()
+          };
+          assert!(!allowed(&wrong_motor));
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("unexpected port gate test source")
+          port.write_text(text.replace(old, new))
+
+          module = Path("software/drivers/st3215/src/auto_calibrate/mod.rs")
+          text = module.read_text()
+          unused = '''pub(crate) fn matdog_armed_motor_ids() -> Option<&'static [u8]> {
+              matdog::active_profile()
+                  .ok()
+                  .map(|profile| profile.allowed_motor_ids)
+          }
+
+          '''
+          if text.count(unused) != 1:
+              raise SystemExit("unexpected unused helper source")
+          module.write_text(text.replace(unused, ""))
+          PY
           mv -f software/drivers/st3215/src/auto_calibrate/matdog_v2.rs \
             software/drivers/st3215/src/auto_calibrate/matdog.rs
           mv -f software/drivers/st3215/src/auto_calibrate/matdog_v2_test.rs \
@@ -143,7 +196,10 @@ jobs:
               "freeze_calibration: Some", "action: Some", "Offset.address",
               "matdog_v2",
           )
-          forbidden_port = ("write.motor_id != 12", "matdog_pilot_is_armed")
+          forbidden_port = (
+              "write.motor_id != 12", "matdog_pilot_is_armed",
+              "matdog_armed_motor_ids",
+          )
           required_source = (
               "all_profiles", "profile_for_arm_value",
               "ram_write_allowed_for_profile", "held_targets: Vec<StaticTarget>",
@@ -160,11 +216,11 @@ jobs:
           )
           required_port = (
               "matdog_command_allowed_with", "matdog_armed_command_allowed",
-              "native MATDOG profile arming is active",
+              "native MATDOG profile arming is active", "prerequisite_home",
           )
           required_mod = ("mod matdog;", "matdog_ram_write_allowed_for_arm_value")
           found = [token for token in forbidden_source if token in source]
-          found += [token for token in forbidden_port if token in port]
+          found += [token for token in forbidden_port if token in port or token in mod]
           missing = [token for token in required_source if token not in source]
           missing += [token for token in required_tests if token not in tests]
           missing += [token for token in required_port if token not in port]
@@ -204,6 +260,7 @@ jobs:
             .github/workflows/matdog-native-calibrator-check.yml
           rm -f .github/workflows/apply-matdog-v2-port-patch.yml
           rm -f .github/workflows/matdog-test-diagnostic.yml
+          rm -f .github/workflows/matdog-final-test-diagnostic.yml
           rm -rf tools/.matdog-v2-payload
           rm -f tools/matdog_finalize.patch.gz.b64
           rm -f tools/matdog-native-calibrator-check.final.yml
