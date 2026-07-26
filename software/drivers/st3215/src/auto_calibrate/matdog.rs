@@ -1,8 +1,10 @@
-//! MATDOG-specific, RAM-only ST3215 mechanical end-stop calibrator.
+//! MATDOG-specific, data-driven, RAM-only ST3215 mechanical end-stop calibrator.
 //!
-//! The first hardware scope is deliberately restricted to LF_UPPER / M12 /
-//! URDF MIN. This module never resets a servo, never unlocks or writes EEPROM,
-//! never changes Position Offset, and never freezes calibration arcs.
+//! One explicitly armed MIN/MAX contact profile is executed per run.  The
+//! active probing joint is the only joint whose target advances during contact
+//! search.  Prerequisite joints are moved sequentially to geometry-validated
+//! static poses, monitored for drift, and restored before the mandatory global
+//! torque-OFF cleanup.
 
 use crate::protocol::{self, RamRegister};
 use crate::st3215_proto::{CommandResult, InferenceState, TxEnvelope};
@@ -20,23 +22,18 @@ type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 pub const MATDOG_MOTOR_IDS: [u8; 12] = [11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43];
 pub(crate) const MATDOG_ARM_ENV: &str = "MATDOG_NATIVE_CALIBRATOR_ARM";
-pub(crate) const MATDOG_ARM_VALUE: &str = "LF_UPPER_M12_MIN";
-const PILOT_MOTOR_ID: u8 = 12;
+
 const HOME_TICK: u16 = 2048;
-const M12_URDF_MIN_TICK: u16 = 1451;
-// Permit a bounded commanded overshoot beyond the model limit so a
-// mechanical stop can produce a measurable persistent target error.
-// The generic ElRobot/SO101 calibrator commands much farther; MATDOG keeps
-// the overshoot restricted to 64 ticks and remains RAM-only.
-const M12_MIN_GUARD_TICK: u16 = 1387;
-const BASELINE_TARGET_TICK: u16 = 1984;
-const PILOT_TORQUE_LIMIT: u16 = 400;
-const PILOT_SPEED: u16 = 80;
-const PILOT_ACCELERATION: u8 = 4;
+const TICKS_PER_REVOLUTION: i32 = 4096;
+const GUARD_OVERSHOOT_TICKS: u16 = 64;
+const BASELINE_TRAVEL_TICKS: u16 = 64;
+const TORQUE_LIMIT: u16 = 400;
+const GOAL_SPEED: u16 = 80;
+const ACCELERATION: u8 = 4;
 const COARSE_STEP_TICKS: u16 = 32;
 const FINE_STEP_TICKS: u16 = 8;
 const BACKOFF_TICKS: u16 = 96;
-const HOME_TOLERANCE_TICKS: u16 = 10;
+const STATIC_TOLERANCE_TICKS: u16 = 10;
 const REPEATABILITY_TOLERANCE_TICKS: u16 = 16;
 const BASELINE_MIN_SAMPLES: usize = 6;
 const MINIMUM_CONTACT_TRAVEL_TICKS: u16 = 24;
@@ -45,7 +42,468 @@ const CONTACT_SETTLE_WINDOW: Duration = Duration::from_millis(1500);
 const HARD_CURRENT_ABORT_RAW: u16 = 200;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const TELEMETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_TELEMETRY_AGE: Duration = Duration::from_secs(3);
 const MOTION_TIMEOUT: Duration = Duration::from_secs(12);
+
+const LF_ALLOWED: [u8; 4] = [11, 12, 13, 42];
+const RF_ALLOWED: [u8; 4] = [21, 22, 23, 32];
+const RH_ALLOWED: [u8; 3] = [31, 32, 33];
+const LH_ALLOWED: [u8; 3] = [41, 42, 43];
+
+const HIP_MIN_DELTA: i16 = -512;
+const HIP_MAX_DELTA: i16 = 512;
+const UPPER_MIN_DELTA: i16 = -597;
+const UPPER_MAX_DELTA: i16 = 1394;
+const LOWER_MIN_DELTA: i16 = -1047;
+const LOWER_MAX_DELTA: i16 = 427;
+const UPPER_30_DELTA: i16 = 341;
+const UPPER_50_DELTA: i16 = 569;
+const UPPER_90_DELTA: i16 = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Leg {
+    Lf,
+    Rf,
+    Rh,
+    Lh,
+}
+
+impl Leg {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Lf => "LF",
+            Self::Rf => "RF",
+            Self::Rh => "RH",
+            Self::Lh => "LH",
+        }
+    }
+
+    const fn allowed_motor_ids(self) -> &'static [u8] {
+        match self {
+            Self::Lf => &LF_ALLOWED,
+            Self::Rf => &RF_ALLOWED,
+            Self::Rh => &RH_ALLOWED,
+            Self::Lh => &LH_ALLOWED,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JointKind {
+    Hip,
+    Upper,
+    Lower,
+}
+
+impl JointKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Hip => "HIP",
+            Self::Upper => "UPPER",
+            Self::Lower => "LOWER",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContactSide {
+    Min,
+    Max,
+}
+
+impl ContactSide {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Min => "MIN",
+            Self::Max => "MAX",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JointSpec {
+    leg: Leg,
+    kind: JointKind,
+    name: &'static str,
+    motor_id: u8,
+    direction: i8,
+    min_delta: i16,
+    max_delta: i16,
+}
+
+impl JointSpec {
+    const fn limit_delta(self, side: ContactSide) -> i16 {
+        match side {
+            ContactSide::Min => self.min_delta,
+            ContactSide::Max => self.max_delta,
+        }
+    }
+
+    fn tick_for_delta(self, q_delta: i16) -> Result<u16, String> {
+        let tick = i32::from(HOME_TICK) + i32::from(self.direction) * i32::from(q_delta);
+        u16::try_from(tick)
+            .ok()
+            .filter(|value| *value <= protocol::MAX_ANGLE_STEP)
+            .ok_or_else(|| {
+                format!(
+                    "{} target is outside unsigned ST3215 range: {tick}",
+                    self.name
+                )
+            })
+    }
+}
+
+const JOINT_SPECS: [JointSpec; 12] = [
+    JointSpec {
+        leg: Leg::Lf,
+        kind: JointKind::Hip,
+        name: "lf_hip_joint",
+        motor_id: 13,
+        direction: -1,
+        min_delta: HIP_MIN_DELTA,
+        max_delta: HIP_MAX_DELTA,
+    },
+    JointSpec {
+        leg: Leg::Lf,
+        kind: JointKind::Upper,
+        name: "lf_upper_leg_joint",
+        motor_id: 12,
+        direction: 1,
+        min_delta: UPPER_MIN_DELTA,
+        max_delta: UPPER_MAX_DELTA,
+    },
+    JointSpec {
+        leg: Leg::Lf,
+        kind: JointKind::Lower,
+        name: "lf_lower_leg_joint",
+        motor_id: 11,
+        direction: -1,
+        min_delta: LOWER_MIN_DELTA,
+        max_delta: LOWER_MAX_DELTA,
+    },
+    JointSpec {
+        leg: Leg::Rf,
+        kind: JointKind::Hip,
+        name: "rf_hip_joint",
+        motor_id: 23,
+        direction: -1,
+        min_delta: HIP_MIN_DELTA,
+        max_delta: HIP_MAX_DELTA,
+    },
+    JointSpec {
+        leg: Leg::Rf,
+        kind: JointKind::Upper,
+        name: "rf_upper_leg_joint",
+        motor_id: 22,
+        direction: -1,
+        min_delta: UPPER_MIN_DELTA,
+        max_delta: UPPER_MAX_DELTA,
+    },
+    JointSpec {
+        leg: Leg::Rf,
+        kind: JointKind::Lower,
+        name: "rf_lower_leg_joint",
+        motor_id: 21,
+        direction: 1,
+        min_delta: LOWER_MIN_DELTA,
+        max_delta: LOWER_MAX_DELTA,
+    },
+    JointSpec {
+        leg: Leg::Rh,
+        kind: JointKind::Hip,
+        name: "rh_hip_joint",
+        motor_id: 33,
+        direction: 1,
+        min_delta: HIP_MIN_DELTA,
+        max_delta: HIP_MAX_DELTA,
+    },
+    JointSpec {
+        leg: Leg::Rh,
+        kind: JointKind::Upper,
+        name: "rh_upper_leg_joint",
+        motor_id: 32,
+        direction: -1,
+        min_delta: UPPER_MIN_DELTA,
+        max_delta: UPPER_MAX_DELTA,
+    },
+    JointSpec {
+        leg: Leg::Rh,
+        kind: JointKind::Lower,
+        name: "rh_lower_leg_joint",
+        motor_id: 31,
+        direction: 1,
+        min_delta: LOWER_MIN_DELTA,
+        max_delta: LOWER_MAX_DELTA,
+    },
+    JointSpec {
+        leg: Leg::Lh,
+        kind: JointKind::Hip,
+        name: "lh_hip_joint",
+        motor_id: 43,
+        direction: 1,
+        min_delta: HIP_MIN_DELTA,
+        max_delta: HIP_MAX_DELTA,
+    },
+    JointSpec {
+        leg: Leg::Lh,
+        kind: JointKind::Upper,
+        name: "lh_upper_leg_joint",
+        motor_id: 42,
+        direction: 1,
+        min_delta: UPPER_MIN_DELTA,
+        max_delta: UPPER_MAX_DELTA,
+    },
+    JointSpec {
+        leg: Leg::Lh,
+        kind: JointKind::Lower,
+        name: "lh_lower_leg_joint",
+        motor_id: 41,
+        direction: -1,
+        min_delta: LOWER_MIN_DELTA,
+        max_delta: LOWER_MAX_DELTA,
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaticTarget {
+    motor_id: u8,
+    target_tick: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContactProfile {
+    pub(crate) arm_value: String,
+    pub(crate) label: String,
+    pub(crate) leg: Leg,
+    pub(crate) joint: JointKind,
+    pub(crate) side: ContactSide,
+    pub(crate) joint_name: &'static str,
+    pub(crate) motor_id: u8,
+    pub(crate) probe_sign: i8,
+    pub(crate) urdf_limit_tick: u16,
+    pub(crate) guard_tick: u16,
+    pub(crate) baseline_target_tick: u16,
+    pub(crate) allowed_motor_ids: &'static [u8],
+    prerequisites: Vec<StaticTarget>,
+}
+
+fn spec_for(leg: Leg, kind: JointKind) -> &'static JointSpec {
+    JOINT_SPECS
+        .iter()
+        .find(|spec| spec.leg == leg && spec.kind == kind)
+        .expect("complete MATDOG joint table")
+}
+
+fn static_target(leg: Leg, kind: JointKind, q_delta: i16) -> Result<StaticTarget, String> {
+    let spec = spec_for(leg, kind);
+    Ok(StaticTarget {
+        motor_id: spec.motor_id,
+        target_tick: spec.tick_for_delta(q_delta)?,
+    })
+}
+
+fn prerequisites_for(leg: Leg, kind: JointKind) -> Result<Vec<StaticTarget>, String> {
+    let mut targets = Vec::new();
+    match leg {
+        Leg::Lf => targets.push(static_target(Leg::Lh, JointKind::Upper, UPPER_30_DELTA)?),
+        Leg::Rf => targets.push(static_target(Leg::Rh, JointKind::Upper, UPPER_30_DELTA)?),
+        Leg::Rh | Leg::Lh => {}
+    }
+
+    match kind {
+        JointKind::Upper => {
+            targets.push(static_target(leg, JointKind::Hip, 0)?);
+            targets.push(static_target(leg, JointKind::Lower, 0)?);
+        }
+        JointKind::Hip => {
+            targets.push(static_target(leg, JointKind::Upper, UPPER_50_DELTA)?);
+            targets.push(static_target(leg, JointKind::Lower, 0)?);
+        }
+        JointKind::Lower => {
+            targets.push(static_target(leg, JointKind::Hip, 0)?);
+            targets.push(static_target(leg, JointKind::Upper, UPPER_90_DELTA)?);
+        }
+    }
+    Ok(targets)
+}
+
+#[cfg(test)]
+fn prerequisite_restore_order(prerequisites: &[StaticTarget], probing_motor_id: u8) -> Vec<u8> {
+    prerequisites
+        .iter()
+        .filter(|target| target.motor_id != probing_motor_id)
+        .rev()
+        .map(|target| target.motor_id)
+        .collect()
+}
+
+fn build_profile(leg: Leg, joint: JointKind, side: ContactSide) -> Result<ContactProfile, String> {
+    let spec = *spec_for(leg, joint);
+    let urdf_limit_tick = spec.tick_for_delta(spec.limit_delta(side))?;
+    let q_sign = match side {
+        ContactSide::Min => -1,
+        ContactSide::Max => 1,
+    };
+    let probe_sign = spec.direction * q_sign;
+    let guard =
+        i32::from(urdf_limit_tick) + i32::from(probe_sign) * i32::from(GUARD_OVERSHOOT_TICKS);
+    let baseline = i32::from(HOME_TICK) + i32::from(probe_sign) * i32::from(BASELINE_TRAVEL_TICKS);
+    let guard_tick = u16::try_from(guard)
+        .ok()
+        .filter(|value| *value <= protocol::MAX_ANGLE_STEP)
+        .ok_or_else(|| {
+            format!(
+                "{} {} guard leaves unsigned range: {guard}",
+                spec.name,
+                side.label()
+            )
+        })?;
+    let baseline_target_tick = u16::try_from(baseline)
+        .ok()
+        .filter(|value| *value <= protocol::MAX_ANGLE_STEP)
+        .ok_or_else(|| format!("{} baseline leaves unsigned range: {baseline}", spec.name))?;
+
+    let arm_value = format!(
+        "{}_{}_M{}_{}",
+        leg.label(),
+        joint.label(),
+        spec.motor_id,
+        side.label()
+    );
+    Ok(ContactProfile {
+        label: arm_value.clone(),
+        arm_value,
+        leg,
+        joint,
+        side,
+        joint_name: spec.name,
+        motor_id: spec.motor_id,
+        probe_sign,
+        urdf_limit_tick,
+        guard_tick,
+        baseline_target_tick,
+        allowed_motor_ids: leg.allowed_motor_ids(),
+        prerequisites: prerequisites_for(leg, joint)?,
+    })
+}
+
+pub(crate) fn all_profiles() -> Result<Vec<ContactProfile>, String> {
+    let mut profiles = Vec::with_capacity(24);
+    for leg in [Leg::Lf, Leg::Rf, Leg::Rh, Leg::Lh] {
+        for joint in [JointKind::Upper, JointKind::Hip, JointKind::Lower] {
+            for side in [ContactSide::Min, ContactSide::Max] {
+                profiles.push(build_profile(leg, joint, side)?);
+            }
+        }
+    }
+    Ok(profiles)
+}
+
+pub(crate) fn profile_for_arm_value(value: &str) -> Result<ContactProfile, String> {
+    all_profiles()?
+        .into_iter()
+        .find(|profile| profile.arm_value == value)
+        .ok_or_else(|| {
+            let supported = all_profiles()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|profile| profile.arm_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("unsupported {MATDOG_ARM_ENV}={value:?}; expected one of: {supported}")
+        })
+}
+
+pub(crate) fn active_profile() -> Result<ContactProfile, String> {
+    match std::env::var(MATDOG_ARM_ENV) {
+        Ok(value) => profile_for_arm_value(&value),
+        Err(_) => Err(format!(
+            "MATDOG calibrator is not armed: set {MATDOG_ARM_ENV} explicitly"
+        )),
+    }
+}
+
+pub(crate) fn armed_ram_write_allowed(motor_id: u8, address: u32, value: &[u8]) -> bool {
+    let Ok(profile) = active_profile() else {
+        return false;
+    };
+    ram_write_allowed_for_profile(&profile, motor_id, address, value)
+}
+
+pub(crate) fn ram_write_allowed_for_profile(
+    profile: &ContactProfile,
+    motor_id: u8,
+    address: u32,
+    value: &[u8],
+) -> bool {
+    if !profile.allowed_motor_ids.contains(&motor_id) {
+        return false;
+    }
+
+    let register = [
+        RamRegister::TorqueEnable,
+        RamRegister::Acc,
+        RamRegister::GoalPosition,
+        RamRegister::GoalSpeed,
+        RamRegister::TorqueLimit,
+    ]
+    .into_iter()
+    .find(|register| {
+        register.address() as u32 == address && register.size() as usize == value.len()
+    });
+
+    match register {
+        Some(RamRegister::TorqueEnable) => matches!(value, [0] | [1]),
+        Some(RamRegister::Acc) => value == [ACCELERATION],
+        Some(RamRegister::GoalSpeed) => value == GOAL_SPEED.to_le_bytes(),
+        Some(RamRegister::TorqueLimit) => value == TORQUE_LIMIT.to_le_bytes(),
+        Some(RamRegister::GoalPosition) => {
+            let target = u16::from_le_bytes([value[0], value[1]]);
+            armed_goal_target_allowed(profile, motor_id, target)
+        }
+        _ => false,
+    }
+}
+
+fn armed_goal_target_allowed(profile: &ContactProfile, motor_id: u8, target: u16) -> bool {
+    if motor_id == profile.motor_id {
+        let low = profile
+            .guard_tick
+            .min(HOME_TICK)
+            .saturating_sub(STATIC_TOLERANCE_TICKS);
+        let high = profile
+            .guard_tick
+            .max(HOME_TICK)
+            .saturating_add(STATIC_TOLERANCE_TICKS);
+        return (low..=high.min(protocol::MAX_ANGLE_STEP)).contains(&target);
+    }
+
+    let Some(prerequisite) = profile
+        .prerequisites
+        .iter()
+        .find(|prerequisite| prerequisite.motor_id == motor_id)
+    else {
+        return false;
+    };
+    let low = prerequisite
+        .target_tick
+        .min(HOME_TICK)
+        .saturating_sub(STATIC_TOLERANCE_TICKS);
+    let high = prerequisite
+        .target_tick
+        .max(HOME_TICK)
+        .saturating_add(STATIC_TOLERANCE_TICKS)
+        .min(protocol::MAX_ANGLE_STEP);
+    (low..=high).contains(&target)
+}
+
+pub fn is_exact_matdog_motor_set(found: &[u8]) -> bool {
+    if found.len() != MATDOG_MOTOR_IDS.len() {
+        return false;
+    }
+    let found: BTreeSet<u8> = found.iter().copied().collect();
+    found == MATDOG_MOTOR_IDS.into_iter().collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContactState {
@@ -111,7 +569,7 @@ impl Default for HybridContactConfig {
         Self {
             max_progress_ticks: 2,
             max_velocity_raw: 10,
-            target_reached_tolerance_ticks: HOME_TOLERANCE_TICKS,
+            target_reached_tolerance_ticks: STATIC_TOLERANCE_TICKS,
             min_travel_ticks: MINIMUM_CONTACT_TRAVEL_TICKS,
             persistence_samples: 3,
             hard_current_abort_raw: HARD_CURRENT_ABORT_RAW,
@@ -125,18 +583,20 @@ struct HybridContactDetector {
     previous_position: u16,
     baseline: BaselineStats,
     config: HybridContactConfig,
+    probe_sign: i8,
     confirming_samples: u8,
     active_target: Option<u16>,
     target_samples_seen: u8,
 }
 
 impl HybridContactDetector {
-    fn new(start_position: u16, baseline: BaselineStats, config: HybridContactConfig) -> Self {
+    fn new(start_position: u16, baseline: BaselineStats, probe_sign: i8) -> Self {
         Self {
             start_position,
             previous_position: start_position,
             baseline,
-            config,
+            config: HybridContactConfig::default(),
+            probe_sign,
             confirming_samples: 0,
             active_target: None,
             target_samples_seen: 0,
@@ -147,7 +607,7 @@ impl HybridContactDetector {
         if observation.has_driver_error
             || observation.status != 0
             || !observation.torque_enabled
-            || observation.torque_limit != PILOT_TORQUE_LIMIT
+            || observation.torque_limit != TORQUE_LIMIT
             || observation.goal_position != commanded_target
             || observation.current >= self.config.hard_current_abort_raw
         {
@@ -161,39 +621,35 @@ impl HybridContactDetector {
             self.confirming_samples = 0;
             return ContactState::FreeMotion;
         }
-
         self.target_samples_seen = self.target_samples_seen.saturating_add(1);
 
-        let travel = negative_direction_progress(observation.position, self.start_position);
-        let progress = negative_direction_progress(observation.position, self.previous_position);
+        let travel =
+            directional_progress(observation.position, self.start_position, self.probe_sign);
+        let progress = directional_progress(
+            observation.position,
+            self.previous_position,
+            self.probe_sign,
+        );
         self.previous_position = observation.position;
-
-        let velocity = speed_magnitude(observation.velocity);
-        let enough_travel = travel >= self.config.min_travel_ticks;
+        let low_velocity = speed_magnitude(observation.velocity) <= self.config.max_velocity_raw;
         let low_progress = progress <= self.config.max_progress_ticks;
-        let low_velocity = velocity <= self.config.max_velocity_raw;
+        let enough_travel = travel >= self.config.min_travel_ticks;
         let goal_error = circular_distance(observation.position, commanded_target);
-        let target_ahead = signed_tick_delta(commanded_target, observation.position) < 0;
+        let target_ahead = i32::from(signed_tick_delta(commanded_target, observation.position))
+            * i32::from(self.probe_sign)
+            > 0;
         let _current_supports_contact = observation.current >= self.baseline.contact_threshold();
 
         if goal_error <= self.config.target_reached_tolerance_ticks {
             self.confirming_samples = 0;
             return ContactState::FreeMotion;
         }
-
-        // Match the proven generic ST3215 calibrator semantics: skip initial
-        // telemetry after each new target, then classify a persistent
-        // position/velocity stall after real overall displacement. Current is
-        // retained as diagnostic telemetry and for the absolute hard-abort,
-        // but is not required to declare the mechanical stop.
         if self.target_samples_seen <= TARGET_STARTUP_SAMPLES {
             self.confirming_samples = 0;
             return ContactState::FreeMotion;
         }
 
-        let kinematic_stall = enough_travel && low_progress && low_velocity && target_ahead;
-
-        if kinematic_stall {
+        if enough_travel && low_progress && low_velocity && target_ahead {
             self.confirming_samples = self.confirming_samples.saturating_add(1);
             if self.confirming_samples >= self.config.persistence_samples {
                 ContactState::ContactConfirmed
@@ -213,22 +669,6 @@ struct ContactResult {
     second_tick: u16,
     spread_ticks: u16,
     baseline: BaselineStats,
-}
-
-fn combine_pilot_and_cleanup(
-    pilot: Result<ContactResult, String>,
-    cleanup: Result<(), String>,
-) -> Result<ContactResult, String> {
-    match (pilot, cleanup) {
-        (Ok(contact), Ok(())) => Ok(contact),
-        (Err(pilot_err), Ok(())) => Err(pilot_err),
-        (Ok(_), Err(cleanup_err)) => Err(format!(
-            "MATDOG pilot completed but torque-OFF cleanup failed: {cleanup_err}"
-        )),
-        (Err(pilot_err), Err(cleanup_err)) => Err(format!(
-            "{pilot_err}; torque-OFF cleanup also failed: {cleanup_err}"
-        )),
-    }
 }
 
 fn is_allowed_matdog_ram_register(register: RamRegister) -> bool {
@@ -265,26 +705,6 @@ fn global_torque_off_writes() -> Vec<(u8, Vec<u8>)> {
         .collect()
 }
 
-pub(crate) fn require_explicit_arming() -> Result<(), String> {
-    match std::env::var(MATDOG_ARM_ENV) {
-        Ok(value) if value == MATDOG_ARM_VALUE => Ok(()),
-        Ok(value) => Err(format!(
-            "MATDOG native calibrator is not armed: expected {MATDOG_ARM_ENV}={MATDOG_ARM_VALUE}, got {value:?}"
-        )),
-        Err(_) => Err(format!(
-            "MATDOG native calibrator is not armed: set {MATDOG_ARM_ENV}={MATDOG_ARM_VALUE} explicitly"
-        )),
-    }
-}
-
-pub fn is_exact_matdog_motor_set(found: &[u8]) -> bool {
-    if found.len() != MATDOG_MOTOR_IDS.len() {
-        return false;
-    }
-    let found: BTreeSet<u8> = found.iter().copied().collect();
-    found == MATDOG_MOTOR_IDS.into_iter().collect()
-}
-
 pub async fn auto_calibrate(
     target_bus_serial: String,
     found_motors: Vec<u8>,
@@ -297,8 +717,8 @@ pub async fn auto_calibrate(
         )
         .into());
     }
-    require_explicit_arming()
-        .map_err(|message| -> Box<dyn std::error::Error> { message.into() })?;
+    let profile =
+        active_profile().map_err(|message| -> Box<dyn std::error::Error> { message.into() })?;
 
     let (inference_tx, inference_rx) = watch::channel(InferenceState::default());
     let inference_queue_id = comm.normfs.resolve("st3215/inference");
@@ -326,7 +746,8 @@ pub async fn auto_calibrate(
     let comm_for_cleanup = comm.clone();
 
     tokio::spawn(async move {
-        if let Err(err) = run_native_m12_min_pilot(
+        if let Err(err) = run_profile(
+            profile,
             serial_for_task,
             found_motors,
             comm,
@@ -335,7 +756,7 @@ pub async fn auto_calibrate(
         )
         .await
         {
-            error!("MATDOG native M12 MIN pilot failed: {err}");
+            error!("MATDOG native profile failed: {err}");
         }
         comm_for_cleanup.clear_calibration_stop(&serial_for_cleanup);
     });
@@ -343,7 +764,8 @@ pub async fn auto_calibrate(
     Ok(stop_flag)
 }
 
-async fn run_native_m12_min_pilot(
+async fn run_profile(
+    profile: ContactProfile,
     target_bus_serial: String,
     found_motors: Vec<u8>,
     comm: Arc<ST3215BusCommunicator>,
@@ -351,36 +773,34 @@ async fn run_native_m12_min_pilot(
     stop_requested: Arc<AtomicBool>,
 ) -> Result<(), DynError> {
     if !is_exact_matdog_motor_set(&found_motors) {
-        return Err("MATDOG exact motor set changed before pilot start".into());
+        return Err("MATDOG exact motor set changed before profile start".into());
     }
 
     let mut calibrator = MatdogRamOnlyCalibrator::new(
+        profile,
         target_bus_serial.clone(),
         comm.clone(),
         inference_rx,
         stop_requested,
     );
-    calibrator.total_steps = 11;
-    comm.update_calibration_progress(
-        &target_bus_serial,
+    calibrator.total_steps = 13;
+    calibrator.publish_progress(
         0,
-        calibrator.total_steps,
-        "MATDOG native M12 MIN preflight",
+        "MATDOG native profile preflight",
         CalibrationStatus::InProgress,
         None,
     );
 
-    let result = calibrator.run_pilot().await.map_err(|err| err.to_string());
-    // This is the single final cleanup point for both success and every error path.
+    let result = calibrator.run().await.map_err(|err| err.to_string());
     let cleanup = calibrator
         .global_torque_off_verified()
         .await
         .map_err(|err| err.to_string());
-
-    match combine_pilot_and_cleanup(result, cleanup) {
-        Ok(contact) => {
+    match (result, cleanup) {
+        (Ok(contact), Ok(())) => {
             info!(
-                "MATDOG M12 MIN complete: first={}, second={}, spread={}, baseline_median={}, baseline_mad={}",
+                "MATDOG {} complete: first={}, second={}, spread={}, baseline_median={}, baseline_mad={}",
+                calibrator.profile.label,
                 contact.first_tick,
                 contact.second_tick,
                 contact.spread_ticks,
@@ -390,7 +810,18 @@ async fn run_native_m12_min_pilot(
             calibrator.mark_done();
             Ok(())
         }
-        Err(message) => {
+        (Err(run_err), Ok(())) => {
+            calibrator.mark_failed(&run_err);
+            Err(run_err.into())
+        }
+        (Ok(_), Err(cleanup_err)) => {
+            let message =
+                format!("MATDOG profile completed but torque-OFF cleanup failed: {cleanup_err}");
+            calibrator.mark_failed(&message);
+            Err(message.into())
+        }
+        (Err(run_err), Err(cleanup_err)) => {
+            let message = format!("{run_err}; torque-OFF cleanup also failed: {cleanup_err}");
             calibrator.mark_failed(&message);
             Err(message.into())
         }
@@ -398,6 +829,7 @@ async fn run_native_m12_min_pilot(
 }
 
 struct MatdogRamOnlyCalibrator {
+    profile: ContactProfile,
     target_bus_serial: String,
     comm: Arc<ST3215BusCommunicator>,
     inference_rx: watch::Receiver<InferenceState>,
@@ -406,16 +838,19 @@ struct MatdogRamOnlyCalibrator {
     command_counter: u64,
     current_step: u32,
     total_steps: u32,
+    held_targets: Vec<StaticTarget>,
 }
 
 impl MatdogRamOnlyCalibrator {
     fn new(
+        profile: ContactProfile,
         target_bus_serial: String,
         comm: Arc<ST3215BusCommunicator>,
         inference_rx: watch::Receiver<InferenceState>,
         stop_requested: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            profile,
             target_bus_serial,
             comm,
             inference_rx,
@@ -424,53 +859,51 @@ impl MatdogRamOnlyCalibrator {
             command_counter: 0,
             current_step: 0,
             total_steps: 0,
+            held_targets: Vec::new(),
         }
     }
 
-    async fn run_pilot(&mut self) -> Result<ContactResult, DynError> {
+    async fn run(&mut self) -> Result<ContactResult, DynError> {
         self.next_phase("Verify exact MATDOG ID set")?;
         self.wait_for_exact_motor_set().await?;
 
         self.next_phase("Verified global torque OFF")?;
         self.global_torque_off_verified().await?;
 
-        self.next_phase("Prime and configure M12 RAM only")?;
-        let initial = self.latest_observation(PILOT_MOTOR_ID)?;
-        self.ensure_observation_safe(initial, false, None)?;
-        self.set_goal_verified(initial.position).await?;
-        self.write_ram_verified(
-            RamRegister::TorqueLimit,
-            PILOT_TORQUE_LIMIT.to_le_bytes().to_vec(),
-        )
-        .await?;
-        self.write_ram_verified(RamRegister::Acc, vec![PILOT_ACCELERATION])
-            .await?;
-        self.write_ram_verified(RamRegister::GoalSpeed, PILOT_SPEED.to_le_bytes().to_vec())
-            .await?;
-        self.set_torque_verified(true).await?;
+        self.next_phase("Verify all joints near digital home")?;
+        self.verify_all_near_home().await?;
 
-        self.next_phase("Return M12 to home 2048")?;
-        self.move_to(HOME_TICK, HOME_TOLERANCE_TICKS).await?;
+        self.next_phase("Apply geometry prerequisites one joint at a time")?;
+        self.apply_prerequisites().await?;
 
-        self.next_phase("Acquire M12 moving-current baseline")?;
+        self.next_phase("Prime and configure probing joint RAM only")?;
+        self.prepare_motor(self.profile.motor_id).await?;
+        self.move_motor_to(self.profile.motor_id, HOME_TICK, STATIC_TOLERANCE_TICKS)
+            .await?;
+
+        self.next_phase("Acquire moving-current baseline")?;
         let baseline = self.acquire_moving_current_baseline().await?;
 
-        self.next_phase("Coarse hybrid approach to M12 MIN")?;
-        let first_tick = self.approach_min(COARSE_STEP_TICKS, baseline).await?;
+        self.next_phase("Coarse approach")?;
+        let first_tick = self.approach(COARSE_STEP_TICKS, baseline).await?;
 
         self.next_phase("Backoff and verify recovery")?;
         self.backoff_and_verify(first_tick, baseline).await?;
 
-        self.next_phase("Fine hybrid repeat approach to M12 MIN")?;
-        let second_tick = self.approach_min(FINE_STEP_TICKS, baseline).await?;
+        self.next_phase("Fine repeat approach")?;
+        let second_tick = self.approach(FINE_STEP_TICKS, baseline).await?;
 
         self.next_phase("Verify repeatability")?;
-        let spread_ticks = repeatability_spread(first_tick, second_tick)
-            .map_err(|message| -> DynError { message.into() })?;
+        let spread_ticks = repeatability_spread(first_tick, second_tick)?;
 
-        self.next_phase("Return M12 home")?;
-        self.stop_pressure(second_tick).await?;
-        self.move_to(HOME_TICK, HOME_TOLERANCE_TICKS).await?;
+        self.next_phase("Return probing joint home")?;
+        self.stop_pressure(self.profile.motor_id, second_tick)
+            .await?;
+        self.move_motor_to(self.profile.motor_id, HOME_TICK, STATIC_TOLERANCE_TICKS)
+            .await?;
+
+        self.next_phase("Restore prerequisite joints one at a time")?;
+        self.restore_prerequisites().await?;
 
         self.next_phase("Final verified global torque OFF")?;
 
@@ -482,36 +915,124 @@ impl MatdogRamOnlyCalibrator {
         })
     }
 
+    async fn verify_all_near_home(&mut self) -> Result<(), DynError> {
+        for motor_id in MATDOG_MOTOR_IDS {
+            let observation = self.latest_observation(motor_id)?;
+            self.ensure_observation_fresh(motor_id, observation)?;
+            if observation.torque_enabled {
+                return Err(format!(
+                    "M{motor_id} unexpectedly torque-enabled during home preflight"
+                )
+                .into());
+            }
+            if observation.has_driver_error || observation.status != 0 {
+                return Err(format!("M{motor_id} unhealthy during home preflight").into());
+            }
+            if circular_distance(observation.position, HOME_TICK) > STATIC_TOLERANCE_TICKS {
+                return Err(format!(
+                    "M{motor_id} is not at digital home: present={}, expected={}, tolerance={}",
+                    observation.position, HOME_TICK, STATIC_TOLERANCE_TICKS
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_prerequisites(&mut self) -> Result<(), DynError> {
+        for target in self.profile.prerequisites.clone() {
+            if target.motor_id == self.profile.motor_id {
+                continue;
+            }
+            self.prepare_motor(target.motor_id).await?;
+            self.move_motor_to(target.motor_id, target.target_tick, STATIC_TOLERANCE_TICKS)
+                .await?;
+            if self
+                .held_targets
+                .iter()
+                .any(|held| held.motor_id == target.motor_id)
+            {
+                return Err(
+                    format!("duplicate prerequisite target for M{}", target.motor_id).into(),
+                );
+            }
+            self.held_targets.push(target);
+            self.verify_static_holds().await?;
+        }
+        Ok(())
+    }
+
+    async fn restore_prerequisites(&mut self) -> Result<(), DynError> {
+        while let Some(target) = self.held_targets.pop() {
+            self.move_motor_to(target.motor_id, HOME_TICK, STATIC_TOLERANCE_TICKS)
+                .await?;
+            self.set_motor_torque_verified(target.motor_id, false)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn prepare_motor(&mut self, motor_id: u8) -> Result<(), DynError> {
+        if !self.profile.allowed_motor_ids.contains(&motor_id) {
+            return Err(format!("M{motor_id} is outside armed profile motor allowlist").into());
+        }
+        let initial = self.latest_observation(motor_id)?;
+        self.ensure_observation_safe(motor_id, initial, false, None)?;
+        self.set_motor_goal_verified(motor_id, initial.position)
+            .await?;
+        self.write_motor_ram_verified(
+            motor_id,
+            RamRegister::TorqueLimit,
+            TORQUE_LIMIT.to_le_bytes().to_vec(),
+        )
+        .await?;
+        self.write_motor_ram_verified(motor_id, RamRegister::Acc, vec![ACCELERATION])
+            .await?;
+        self.write_motor_ram_verified(
+            motor_id,
+            RamRegister::GoalSpeed,
+            GOAL_SPEED.to_le_bytes().to_vec(),
+        )
+        .await?;
+        self.set_motor_torque_verified(motor_id, true).await
+    }
+
     async fn acquire_moving_current_baseline(&mut self) -> Result<BaselineStats, DynError> {
-        let initial = self.latest_observation(PILOT_MOTOR_ID)?;
+        let motor_id = self.profile.motor_id;
+        let initial = self.latest_observation(motor_id)?;
         let mut samples = Vec::new();
         let mut last_stamp = initial.monotonic_stamp_ns;
         let mut previous_position = initial.position;
-        self.set_goal_verified(BASELINE_TARGET_TICK).await?;
+        self.set_motor_goal_verified(motor_id, self.profile.baseline_target_tick)
+            .await?;
         let deadline = Instant::now() + MOTION_TIMEOUT;
 
         while Instant::now() < deadline {
             self.check_stop()?;
             let observation = self
-                .wait_for_observation_after(last_stamp, TELEMETRY_TIMEOUT)
+                .wait_for_motor_observation_after(motor_id, last_stamp, TELEMETRY_TIMEOUT)
                 .await?;
             last_stamp = observation.monotonic_stamp_ns;
-            self.ensure_observation_safe(observation, true, Some(BASELINE_TARGET_TICK))?;
-
+            self.ensure_observation_safe(
+                motor_id,
+                observation,
+                true,
+                Some(self.profile.baseline_target_tick),
+            )?;
+            self.verify_static_holds().await?;
             if circular_distance(observation.position, previous_position) > 0
                 || speed_magnitude(observation.velocity) > 0
             {
                 samples.push(observation.current);
             }
             previous_position = observation.position;
-
-            if circular_distance(observation.position, BASELINE_TARGET_TICK) <= HOME_TOLERANCE_TICKS
+            if circular_distance(observation.position, self.profile.baseline_target_tick)
+                <= STATIC_TOLERANCE_TICKS
                 && samples.len() >= BASELINE_MIN_SAMPLES
             {
                 break;
             }
         }
-
         if samples.len() < BASELINE_MIN_SAMPLES {
             return Err(format!(
                 "insufficient moving baseline samples: {} < {}",
@@ -520,11 +1041,133 @@ impl MatdogRamOnlyCalibrator {
             )
             .into());
         }
-
         let baseline = BaselineStats::from_samples(&samples)
             .map_err(|message| -> DynError { message.into() })?;
-        self.move_to(HOME_TICK, HOME_TOLERANCE_TICKS).await?;
+        self.move_motor_to(motor_id, HOME_TICK, STATIC_TOLERANCE_TICKS)
+            .await?;
         Ok(baseline)
+    }
+
+    async fn approach(
+        &mut self,
+        step_ticks: u16,
+        baseline: BaselineStats,
+    ) -> Result<u16, DynError> {
+        let motor_id = self.profile.motor_id;
+        let start = self.latest_observation(motor_id)?;
+        self.ensure_observation_safe(motor_id, start, true, None)?;
+        let mut detector =
+            HybridContactDetector::new(start.position, baseline, self.profile.probe_sign);
+        let mut target = start.position;
+        let mut last_stamp = start.monotonic_stamp_ns;
+
+        loop {
+            self.check_stop()?;
+            let next_target = advance_tick(target, self.profile.probe_sign, step_ticks)?;
+            if passed_guard(
+                next_target,
+                self.profile.guard_tick,
+                self.profile.probe_sign,
+            ) {
+                return Err(format!(
+                    "{} travel guard reached without contact: next={}, URDF={}, guard={}",
+                    self.profile.label,
+                    next_target,
+                    self.profile.urdf_limit_tick,
+                    self.profile.guard_tick
+                )
+                .into());
+            }
+            self.set_motor_goal_verified(motor_id, next_target).await?;
+            target = next_target;
+            let settle_deadline = Instant::now() + CONTACT_SETTLE_WINDOW;
+            let mut last_observation = None;
+
+            while Instant::now() < settle_deadline {
+                let observation = self
+                    .wait_for_motor_observation_after(motor_id, last_stamp, TELEMETRY_TIMEOUT)
+                    .await?;
+                last_stamp = observation.monotonic_stamp_ns;
+                last_observation = Some(observation);
+                self.ensure_observation_safe(motor_id, observation, true, Some(target))?;
+                self.verify_static_holds().await?;
+                if circular_distance(observation.position, target) <= STATIC_TOLERANCE_TICKS {
+                    break;
+                }
+                match detector.observe(observation, target) {
+                    ContactState::FreeMotion | ContactState::ContactSuspected => {}
+                    ContactState::ContactConfirmed => {
+                        info!(
+                            "MATDOG {} contact: step={}, target={}, present={}, error={}, current={}, threshold={}, velocity={}",
+                            self.profile.label,
+                            step_ticks,
+                            target,
+                            observation.position,
+                            circular_distance(observation.position, target),
+                            observation.current,
+                            baseline.contact_threshold(),
+                            speed_magnitude(observation.velocity)
+                        );
+                        self.stop_pressure(motor_id, observation.position).await?;
+                        return Ok(observation.position);
+                    }
+                    ContactState::HardAbort => {
+                        return self.abort_with_global_torque_off(format!(
+                            "{} hard abort: tick={}, goal={}, current={}, torque_enabled={}, torque_limit={}, status=0x{:02X}, driver_error={}",
+                            self.profile.label,
+                            observation.position,
+                            observation.goal_position,
+                            observation.current,
+                            observation.torque_enabled,
+                            observation.torque_limit,
+                            observation.status,
+                            observation.has_driver_error
+                        )).await;
+                    }
+                }
+            }
+
+            let observation =
+                last_observation.ok_or("contact settle window produced no telemetry")?;
+            self.ensure_observation_safe(motor_id, observation, true, Some(target))?;
+            let goal_error = circular_distance(observation.position, target);
+            if goal_error > step_ticks.saturating_add(4) {
+                self.stop_pressure(motor_id, observation.position).await?;
+                return Err(format!(
+                    "{} tracking failed without confirmed contact: target={}, present={}, current={}",
+                    self.profile.label, target, observation.position, observation.current
+                )
+                .into());
+            }
+        }
+    }
+
+    async fn backoff_and_verify(
+        &mut self,
+        contact_tick: u16,
+        baseline: BaselineStats,
+    ) -> Result<(), DynError> {
+        let target = advance_tick(contact_tick, -self.profile.probe_sign, BACKOFF_TICKS)?;
+        if crossed_home(target, self.profile.probe_sign) {
+            return Err(format!("{} backoff crosses home: {target}", self.profile.label).into());
+        }
+        let recovered = self
+            .move_motor_to(
+                self.profile.motor_id,
+                target,
+                STATIC_TOLERANCE_TICKS.saturating_add(2),
+            )
+            .await?;
+        if recovered.current > baseline.contact_threshold() {
+            return Err(format!(
+                "{} current did not recover after backoff: {} > {}",
+                self.profile.label,
+                recovered.current,
+                baseline.contact_threshold()
+            )
+            .into());
+        }
+        Ok(())
     }
 
     async fn abort_with_global_torque_off<T>(&mut self, message: String) -> Result<T, DynError> {
@@ -537,171 +1180,120 @@ impl MatdogRamOnlyCalibrator {
         }
     }
 
-    async fn approach_min(
+    async fn stop_pressure(&mut self, motor_id: u8, present_position: u16) -> Result<(), DynError> {
+        self.set_motor_goal_verified(motor_id, present_position)
+            .await
+    }
+
+    async fn move_motor_to(
         &mut self,
-        step_ticks: u16,
-        baseline: BaselineStats,
-    ) -> Result<u16, DynError> {
-        let start = self.latest_observation(PILOT_MOTOR_ID)?;
-        self.ensure_observation_safe(start, true, None)?;
-        let mut detector =
-            HybridContactDetector::new(start.position, baseline, HybridContactConfig::default());
-        let mut target = start.position;
-        let mut last_stamp = start.monotonic_stamp_ns;
-
-        loop {
-            self.check_stop()?;
-            let next_target = target.saturating_sub(step_ticks);
-            if next_target < M12_MIN_GUARD_TICK {
-                return Err(format!(
-                    "M12 travel guard reached without contact: next={next_target}, URDF_MIN={M12_URDF_MIN_TICK}, guard={M12_MIN_GUARD_TICK}"
-                )
-                .into());
-            }
-
-            self.set_goal_verified(next_target).await?;
-            target = next_target;
-            let settle_deadline = Instant::now() + CONTACT_SETTLE_WINDOW;
-            let mut last_observation = None;
-
-            while Instant::now() < settle_deadline {
-                let observation = self
-                    .wait_for_observation_after(last_stamp, TELEMETRY_TIMEOUT)
-                    .await?;
-                last_stamp = observation.monotonic_stamp_ns;
-                last_observation = Some(observation);
-                self.ensure_observation_safe(observation, true, Some(target))?;
-
-                if circular_distance(observation.position, target) <= HOME_TOLERANCE_TICKS {
-                    break;
-                }
-
-                match detector.observe(observation, target) {
-                    ContactState::FreeMotion | ContactState::ContactSuspected => {}
-                    ContactState::ContactConfirmed => {
-                        info!(
-                            "MATDOG M12 contact confirmed: step={}, target={}, present={}, error={}, current={}, threshold={}, velocity={}",
-                            step_ticks,
-                            target,
-                            observation.position,
-                            circular_distance(observation.position, target),
-                            observation.current,
-                            baseline.contact_threshold(),
-                            speed_magnitude(observation.velocity)
-                        );
-                        self.stop_pressure(observation.position).await?;
-                        return Ok(observation.position);
-                    }
-                    ContactState::HardAbort => {
-                        return self
-                            .abort_with_global_torque_off(format!(
-                                "M12 hard abort: tick={}, goal={}, current={}, torque_enabled={}, torque_limit={}, status=0x{:02X}, driver_error={}",
-                                observation.position,
-                                observation.goal_position,
-                                observation.current,
-                                observation.torque_enabled,
-                                observation.torque_limit,
-                                observation.status,
-                                observation.has_driver_error
-                            ))
-                            .await;
-                    }
-                }
-            }
-
-            let observation = last_observation.ok_or("M12 settle window produced no telemetry")?;
-            self.ensure_observation_safe(observation, true, Some(target))?;
-            let goal_error = circular_distance(observation.position, target);
-            info!(
-                "MATDOG M12 approach settled: step={}, target={}, present={}, error={}, current={}, threshold={}, velocity={}",
-                step_ticks,
-                target,
-                observation.position,
-                goal_error,
-                observation.current,
-                baseline.contact_threshold(),
-                speed_magnitude(observation.velocity)
-            );
-            if goal_error > step_ticks.saturating_add(4) {
-                self.stop_pressure(observation.position).await?;
-                return Err(format!(
-                    "M12 tracking failed without confirmed contact: target={target}, present={}, current={}",
-                    observation.position, observation.current
-                )
-                .into());
-            }
-        }
-    }
-
-    async fn backoff_and_verify(
-        &mut self,
-        contact_tick: u16,
-        baseline: BaselineStats,
-    ) -> Result<(), DynError> {
-        let target = contact_tick
-            .checked_add(BACKOFF_TICKS)
-            .ok_or("M12 backoff overflow")?;
-        if target > HOME_TICK {
-            return Err(format!("M12 backoff crosses home: {target}").into());
-        }
-        let recovered = self
-            .move_to(target, HOME_TOLERANCE_TICKS.saturating_add(2))
-            .await?;
-        if recovered.current > baseline.contact_threshold() {
-            return Err(format!(
-                "M12 current did not recover after backoff: {} > {}",
-                recovered.current,
-                baseline.contact_threshold()
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    async fn stop_pressure(&mut self, present_position: u16) -> Result<(), DynError> {
-        self.set_goal_verified(present_position).await
-    }
-
-    async fn move_to(&mut self, target: u16, tolerance: u16) -> Result<MotorObservation, DynError> {
-        self.set_goal_verified(target).await?;
-        let mut last_stamp = self.latest_observation(PILOT_MOTOR_ID)?.monotonic_stamp_ns;
+        motor_id: u8,
+        target: u16,
+        tolerance: u16,
+    ) -> Result<MotorObservation, DynError> {
+        self.set_motor_goal_verified(motor_id, target).await?;
+        let mut last_stamp = self.latest_observation(motor_id)?.monotonic_stamp_ns;
         let deadline = Instant::now() + MOTION_TIMEOUT;
-
         while Instant::now() < deadline {
             self.check_stop()?;
             let observation = self
-                .wait_for_observation_after(last_stamp, TELEMETRY_TIMEOUT)
+                .wait_for_motor_observation_after(motor_id, last_stamp, TELEMETRY_TIMEOUT)
                 .await?;
             last_stamp = observation.monotonic_stamp_ns;
-            self.ensure_observation_safe(observation, true, Some(target))?;
+            self.ensure_observation_safe(motor_id, observation, true, Some(target))?;
+            self.verify_static_holds_except(motor_id).await?;
             if circular_distance(observation.position, target) <= tolerance {
                 return Ok(observation);
             }
         }
-        let last = self.latest_observation(PILOT_MOTOR_ID)?;
+        let last = self.latest_observation(motor_id)?;
         Err(format!(
-            "M12 target timeout: target={target}, present={}, error={}",
+            "M{motor_id} target timeout: target={target}, present={}, error={}",
             last.position,
             circular_distance(last.position, target)
         )
         .into())
     }
 
-    async fn set_goal_verified(&mut self, target: u16) -> Result<(), DynError> {
+    async fn verify_static_holds(&self) -> Result<(), DynError> {
+        self.verify_static_holds_except(0).await
+    }
+
+    async fn verify_static_holds_except(&self, ignored_motor: u8) -> Result<(), DynError> {
+        for motor_id in MATDOG_MOTOR_IDS {
+            if motor_id == ignored_motor {
+                continue;
+            }
+
+            let observation = self.latest_observation(motor_id)?;
+            self.ensure_observation_fresh(motor_id, observation)?;
+
+            if let Some(target) = self
+                .held_targets
+                .iter()
+                .find(|target| target.motor_id == motor_id)
+            {
+                self.ensure_observation_safe(
+                    motor_id,
+                    observation,
+                    true,
+                    Some(target.target_tick),
+                )?;
+                if circular_distance(observation.position, target.target_tick)
+                    > STATIC_TOLERANCE_TICKS
+                {
+                    return Err(format!(
+                        "static prerequisite M{motor_id} drifted: target={}, present={}, tolerance={}",
+                        target.target_tick,
+                        observation.position,
+                        STATIC_TOLERANCE_TICKS
+                    )
+                    .into());
+                }
+            } else {
+                if observation.torque_enabled {
+                    return Err(
+                        format!("non-active M{motor_id} unexpectedly torque-enabled").into(),
+                    );
+                }
+                if observation.has_driver_error || observation.status != 0 {
+                    return Err(format!("non-active M{motor_id} became unhealthy").into());
+                }
+                if circular_distance(observation.position, HOME_TICK) > STATIC_TOLERANCE_TICKS {
+                    return Err(format!(
+                        "non-active M{motor_id} left home: present={}, expected={}, tolerance={}",
+                        observation.position, HOME_TICK, STATIC_TOLERANCE_TICKS
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_motor_goal_verified(&mut self, motor_id: u8, target: u16) -> Result<(), DynError> {
         if target > protocol::MAX_ANGLE_STEP {
             return Err(format!("unsigned GoalPosition out of range: {target}").into());
         }
-        self.write_ram_verified(RamRegister::GoalPosition, target.to_le_bytes().to_vec())
-            .await
+        self.write_motor_ram_verified(
+            motor_id,
+            RamRegister::GoalPosition,
+            target.to_le_bytes().to_vec(),
+        )
+        .await
     }
 
-    async fn set_torque_verified(&mut self, enabled: bool) -> Result<(), DynError> {
-        self.write_ram_verified(RamRegister::TorqueEnable, vec![u8::from(enabled)])
+    async fn set_motor_torque_verified(
+        &mut self,
+        motor_id: u8,
+        enabled: bool,
+    ) -> Result<(), DynError> {
+        self.write_motor_ram_verified(motor_id, RamRegister::TorqueEnable, vec![u8::from(enabled)])
             .await?;
-        let observation = self.latest_observation(PILOT_MOTOR_ID)?;
+        let observation = self.latest_observation(motor_id)?;
         if observation.torque_enabled != enabled {
             return Err(format!(
-                "M12 torque readback mismatch: expected={enabled}, observed={}",
+                "M{motor_id} torque readback mismatch: expected={enabled}, observed={}",
                 observation.torque_enabled
             )
             .into());
@@ -720,16 +1312,21 @@ impl MatdogRamOnlyCalibrator {
                 return Err(format!("M{motor_id} remained torque-enabled after global OFF").into());
             }
         }
+        self.held_targets.clear();
         Ok(())
     }
 
-    async fn write_ram_verified(
+    async fn write_motor_ram_verified(
         &mut self,
+        motor_id: u8,
         register: RamRegister,
         value: Vec<u8>,
     ) -> Result<(), DynError> {
         validate_ram_write(register, &value)?;
-        let initial_stamp = self.latest_observation(PILOT_MOTOR_ID)?.monotonic_stamp_ns;
+        if !self.profile.allowed_motor_ids.contains(&motor_id) {
+            return Err(format!("M{motor_id} is outside armed profile motor allowlist").into());
+        }
+        let initial_stamp = self.latest_observation(motor_id)?.monotonic_stamp_ns;
         let command_id = self.next_command_id();
         let envelope = TxEnvelope {
             monotonic_stamp_ns: systime::get_monotonic_stamp_ns(),
@@ -738,7 +1335,7 @@ impl MatdogRamOnlyCalibrator {
             target_bus_serial: self.target_bus_serial.clone(),
             command_id: command_id.clone(),
             write: Some(crate::st3215_proto::St3215WriteCommand {
-                motor_id: PILOT_MOTOR_ID as u32,
+                motor_id: motor_id as u32,
                 address: register.address() as u32,
                 value: value.clone().into(),
             }),
@@ -746,7 +1343,7 @@ impl MatdogRamOnlyCalibrator {
         };
         self.comm.send_tx(&envelope)?;
         self.wait_for_command_result(&command_id).await?;
-        self.wait_for_register_value(PILOT_MOTOR_ID, register, &value, initial_stamp)
+        self.wait_for_register_value(motor_id, register, &value, initial_stamp)
             .await
     }
 
@@ -761,18 +1358,15 @@ impl MatdogRamOnlyCalibrator {
         let mut unique_motor_ids = BTreeSet::new();
         for (motor_id, value) in writes {
             validate_ram_write(register, value)?;
-            if !MATDOG_MOTOR_IDS.contains(motor_id) {
-                return Err(format!("non-MATDOG sync-write motor ID: {motor_id}").into());
-            }
-            if !unique_motor_ids.insert(*motor_id) {
-                return Err(format!("duplicate MATDOG sync-write motor ID: {motor_id}").into());
+            if !MATDOG_MOTOR_IDS.contains(motor_id) || !unique_motor_ids.insert(*motor_id) {
+                return Err(format!("invalid MATDOG sync-write motor ID: {motor_id}").into());
             }
         }
         let initial_stamps: Vec<(u8, u64)> = writes
             .iter()
             .map(|(motor_id, _)| {
                 observation_from_state(&self.current_state(), &self.target_bus_serial, *motor_id)
-                    .map(|observation| (*motor_id, observation.monotonic_stamp_ns))
+                    .map(|obs| (*motor_id, obs.monotonic_stamp_ns))
             })
             .collect::<Result<_, _>>()?;
         let command_id = self.next_command_id();
@@ -798,7 +1392,6 @@ impl MatdogRamOnlyCalibrator {
         };
         self.comm.send_tx(&envelope)?;
         self.wait_for_command_result(&command_id).await?;
-
         for ((motor_id, value), (_, initial_stamp)) in writes.iter().zip(initial_stamps) {
             self.wait_for_register_value(*motor_id, register, value, initial_stamp)
                 .await?;
@@ -815,7 +1408,6 @@ impl MatdogRamOnlyCalibrator {
     ) -> Result<(), DynError> {
         let deadline = Instant::now() + COMMAND_TIMEOUT;
         let mut last_stamp = initial_stamp;
-
         while Instant::now() < deadline {
             let observation = self
                 .wait_for_motor_observation_after(motor_id, last_stamp, TELEMETRY_TIMEOUT)
@@ -842,21 +1434,15 @@ impl MatdogRamOnlyCalibrator {
             if let Some(result) = command_result_for(&state, &self.target_bus_serial, command_id) {
                 match CommandResult::try_from(result) {
                     Ok(CommandResult::CrSuccess) => return Ok(()),
-                    Ok(CommandResult::CrRejected) => {
-                        return Err("ST3215 command rejected".into());
-                    }
+                    Ok(CommandResult::CrRejected) => return Err("ST3215 command rejected".into()),
                     Ok(CommandResult::CrFailed) => return Err("ST3215 command failed".into()),
                     Ok(CommandResult::CrProcessing) => {}
-                    Err(_) => {
-                        return Err(format!("invalid ST3215 command result: {result}").into());
-                    }
+                    Err(_) => return Err(format!("invalid ST3215 command result: {result}").into()),
                 }
             }
             tokio::select! {
                 changed = self.inference_rx.changed() => {
-                    if changed.is_err() {
-                        return Err("ST3215 inference channel closed".into());
-                    }
+                    if changed.is_err() { return Err("ST3215 inference channel closed".into()); }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     return Err("ST3215 command result timeout".into());
@@ -883,9 +1469,7 @@ impl MatdogRamOnlyCalibrator {
             }
             tokio::select! {
                 changed = self.inference_rx.changed() => {
-                    if changed.is_err() {
-                        return Err("ST3215 inference channel closed".into());
-                    }
+                    if changed.is_err() { return Err("ST3215 inference channel closed".into()); }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     return Err("MATDOG exact ID set timeout".into());
@@ -896,15 +1480,6 @@ impl MatdogRamOnlyCalibrator {
 
     fn latest_observation(&self, motor_id: u8) -> Result<MotorObservation, DynError> {
         observation_from_state(&self.current_state(), &self.target_bus_serial, motor_id)
-    }
-
-    async fn wait_for_observation_after(
-        &mut self,
-        minimum_stamp: u64,
-        timeout: Duration,
-    ) -> Result<MotorObservation, DynError> {
-        self.wait_for_motor_observation_after(PILOT_MOTOR_ID, minimum_stamp, timeout)
-            .await
     }
 
     async fn wait_for_motor_observation_after(
@@ -924,9 +1499,7 @@ impl MatdogRamOnlyCalibrator {
             }
             tokio::select! {
                 changed = self.inference_rx.changed() => {
-                    if changed.is_err() {
-                        return Err("ST3215 inference channel closed".into());
-                    }
+                    if changed.is_err() { return Err("ST3215 inference channel closed".into()); }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     return Err(format!("M{motor_id} fresh telemetry timeout").into());
@@ -939,32 +1512,51 @@ impl MatdogRamOnlyCalibrator {
         self.inference_rx.borrow().clone()
     }
 
+    fn ensure_observation_fresh(
+        &self,
+        motor_id: u8,
+        observation: MotorObservation,
+    ) -> Result<(), DynError> {
+        let now = systime::get_monotonic_stamp_ns();
+        let max_age_ns = u64::try_from(MAX_TELEMETRY_AGE.as_nanos()).unwrap_or(u64::MAX);
+        let age_ns = now.saturating_sub(observation.monotonic_stamp_ns);
+        if observation.monotonic_stamp_ns == 0 || age_ns > max_age_ns {
+            return Err(format!(
+                "M{motor_id} telemetry stale: age_ns={age_ns}, max_age_ns={max_age_ns}"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     fn ensure_observation_safe(
         &self,
+        motor_id: u8,
         observation: MotorObservation,
         require_torque: bool,
         expected_goal: Option<u16>,
     ) -> Result<(), DynError> {
+        self.ensure_observation_fresh(motor_id, observation)?;
         if observation.has_driver_error {
-            return Err("M12 driver error present".into());
+            return Err(format!("M{motor_id} driver error present").into());
         }
         if observation.status != 0 {
-            return Err(format!("M12 servo status is 0x{:02X}", observation.status).into());
+            return Err(format!("M{motor_id} servo status is 0x{:02X}", observation.status).into());
         }
         if require_torque && !observation.torque_enabled {
-            return Err("M12 torque unexpectedly disabled".into());
+            return Err(format!("M{motor_id} torque unexpectedly disabled").into());
         }
-        if require_torque && observation.torque_limit != PILOT_TORQUE_LIMIT {
+        if require_torque && observation.torque_limit != TORQUE_LIMIT {
             return Err(format!(
-                "M12 torque-limit readback changed: expected={}, observed={}",
-                PILOT_TORQUE_LIMIT, observation.torque_limit
+                "M{motor_id} torque-limit changed: expected={}, observed={}",
+                TORQUE_LIMIT, observation.torque_limit
             )
             .into());
         }
         if let Some(expected_goal) = expected_goal {
             if observation.goal_position != expected_goal {
                 return Err(format!(
-                    "M12 goal-position readback changed: expected={expected_goal}, observed={}",
+                    "M{motor_id} goal changed: expected={expected_goal}, observed={}",
                     observation.goal_position
                 )
                 .into());
@@ -972,7 +1564,7 @@ impl MatdogRamOnlyCalibrator {
         }
         if observation.current >= HARD_CURRENT_ABORT_RAW {
             return Err(format!(
-                "M12 hard current abort: {} >= {}",
+                "M{motor_id} hard current abort: {} >= {}",
                 observation.current, HARD_CURRENT_ABORT_RAW
             )
             .into());
@@ -991,10 +1583,8 @@ impl MatdogRamOnlyCalibrator {
     fn next_phase(&mut self, phase: &str) -> Result<(), DynError> {
         self.check_stop()?;
         self.current_step += 1;
-        self.comm.update_calibration_progress(
-            &self.target_bus_serial,
+        self.publish_progress(
             self.current_step,
-            self.total_steps,
             phase,
             CalibrationStatus::InProgress,
             None,
@@ -1002,23 +1592,31 @@ impl MatdogRamOnlyCalibrator {
         Ok(())
     }
 
-    fn mark_done(&self) {
+    fn publish_progress(
+        &self,
+        current: u32,
+        phase: &str,
+        status: CalibrationStatus,
+        error: Option<&str>,
+    ) {
         self.comm.update_calibration_progress(
             &self.target_bus_serial,
+            current,
             self.total_steps,
-            self.total_steps,
-            "MATDOG M12 MIN completed",
-            CalibrationStatus::Done,
-            None,
+            &format!("{}: {phase}", self.profile.label),
+            status,
+            error,
         );
     }
 
+    fn mark_done(&self) {
+        self.publish_progress(self.total_steps, "completed", CalibrationStatus::Done, None);
+    }
+
     fn mark_failed(&self, message: &str) {
-        self.comm.update_calibration_progress(
-            &self.target_bus_serial,
+        self.publish_progress(
             self.current_step,
-            self.total_steps,
-            "MATDOG M12 MIN failed",
+            "failed",
             CalibrationStatus::Failed,
             Some(message),
         );
@@ -1058,7 +1656,7 @@ fn motor_ids_for_bus(state: &InferenceState, bus_serial: &str) -> Result<Vec<u8>
         .ok_or_else(|| format!("ST3215 bus not found: {bus_serial}"))?;
     bus.motors
         .iter()
-        .map(|motor| -> Result<u8, DynError> {
+        .map(|motor| {
             u8::try_from(motor.id)
                 .map_err(|_| format!("invalid ST3215 motor ID in inference: {}", motor.id).into())
         })
@@ -1111,11 +1709,7 @@ fn command_result_for(state: &InferenceState, bus_serial: &str, command_id: &Byt
     bus.motors.iter().find_map(|motor| {
         let last = motor.last_command.as_ref()?;
         let command = last.command.as_ref()?;
-        if &command.command_id == command_id {
-            Some(last.result)
-        } else {
-            None
-        }
+        (&command.command_id == command_id).then_some(last.result)
     })
 }
 
@@ -1125,14 +1719,15 @@ fn median(values: &[u16]) -> u16 {
     sorted[sorted.len() / 2]
 }
 
-fn repeatability_spread(first_tick: u16, second_tick: u16) -> Result<u16, String> {
-    let spread_ticks = circular_distance(first_tick, second_tick);
-    if spread_ticks > REPEATABILITY_TOLERANCE_TICKS {
+fn repeatability_spread(first_tick: u16, second_tick: u16) -> Result<u16, DynError> {
+    let spread = circular_distance(first_tick, second_tick);
+    if spread > REPEATABILITY_TOLERANCE_TICKS {
         Err(format!(
-            "M12 contact not repeatable: first={first_tick}, second={second_tick}, spread={spread_ticks}"
-        ))
+            "contact not repeatable: first={first_tick}, second={second_tick}, spread={spread}"
+        )
+        .into())
     } else {
-        Ok(spread_ticks)
+        Ok(spread)
     }
 }
 
@@ -1145,16 +1740,40 @@ fn make_command_id(app_start_id: u64, nonce: u64, counter: u64) -> Bytes {
 }
 
 fn signed_tick_delta(value: u16, reference: u16) -> i16 {
-    let delta = (value as i32 - reference as i32 + 2048).rem_euclid(4096) - 2048;
-    delta as i16
+    ((value as i32 - reference as i32 + TICKS_PER_REVOLUTION / 2).rem_euclid(TICKS_PER_REVOLUTION)
+        - TICKS_PER_REVOLUTION / 2) as i16
 }
 
 fn circular_distance(a: u16, b: u16) -> u16 {
     signed_tick_delta(a, b).unsigned_abs()
 }
 
-fn negative_direction_progress(value: u16, reference: u16) -> u16 {
-    (-i32::from(signed_tick_delta(value, reference))).max(0) as u16
+fn directional_progress(value: u16, reference: u16, sign: i8) -> u16 {
+    (i32::from(signed_tick_delta(value, reference)) * i32::from(sign)).max(0) as u16
+}
+
+fn advance_tick(value: u16, sign: i8, amount: u16) -> Result<u16, DynError> {
+    let next = i32::from(value) + i32::from(sign) * i32::from(amount);
+    u16::try_from(next)
+        .ok()
+        .filter(|tick| *tick <= protocol::MAX_ANGLE_STEP)
+        .ok_or_else(|| format!("unsigned GoalPosition out of range: {next}").into())
+}
+
+fn passed_guard(value: u16, guard: u16, sign: i8) -> bool {
+    if sign < 0 {
+        value < guard
+    } else {
+        value > guard
+    }
+}
+
+fn crossed_home(value: u16, probe_sign: i8) -> bool {
+    if probe_sign < 0 {
+        value > HOME_TICK
+    } else {
+        value < HOME_TICK
+    }
 }
 
 fn speed_magnitude(raw: u16) -> u16 {

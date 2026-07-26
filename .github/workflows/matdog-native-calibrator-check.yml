@@ -19,8 +19,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  offline-foundation:
-    name: RAM-only contract, Rust tests, Station build
+  offline-verification:
+    name: 24 profiles, RAM-only contract, Rust tests, Station build
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout reviewed revision
@@ -37,21 +37,29 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Install native Station build dependency
+      - name: Install Station native build dependency
         run: sudo apt-get update && sudo apt-get install -y nasm
 
       - name: Prepare verification logs
         run: mkdir -p ci-output
 
-      - name: Enforce MATDOG RAM-only source contract
+      - name: Enforce canonical 24-contact RAM-only contract
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY' | tee ci-output/ram-only-contract.log
           from pathlib import Path
 
-          source = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs").read_text()
-          forbidden = (
+          source_path = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs")
+          tests_path = Path("software/drivers/st3215/src/auto_calibrate/matdog_test.rs")
+          port_path = Path("software/drivers/st3215/src/port.rs")
+          module_path = Path("software/drivers/st3215/src/auto_calibrate/mod.rs")
+          source = source_path.read_text()
+          tests = tests_path.read_text()
+          port = port_path.read_text()
+          module = module_path.read_text()
+
+          forbidden_source = (
               "EepromRegister",
               "RamRegister::Lock",
               "ST3215Request::",
@@ -61,79 +69,80 @@ jobs:
               "freeze_calibration: Some",
               "action: Some",
               "Offset.address",
-              "reg_write_with_action",
-              "ram_write_with_action",
+              "matdog_v2",
           )
-          required = (
-              "MATDOG_MOTOR_IDS",
-              "is_allowed_matdog_ram_register",
-              "RamRegister::PresentCurrent",
+          forbidden_other = (
+              "write.motor_id != 12",
+              "matdog_pilot_is_armed",
+              "matdog_armed_motor_ids",
+          )
+          required_source = (
+              "all_profiles",
+              "profile_for_arm_value",
+              "ram_write_allowed_for_profile",
+              "held_targets: Vec<StaticTarget>",
+              "verify_static_holds_except",
+              "MAX_TELEMETRY_AGE",
+              "prerequisite_restore_order",
               "global_torque_off_verified",
-              "M12_MIN_GUARD_TICK",
-              "MATDOG_NATIVE_CALIBRATOR_ARM",
-              "LF_UPPER_M12_MIN",
-              "abort_with_global_torque_off",
-              "TARGET_STARTUP_SAMPLES",
-              "CONTACT_SETTLE_WINDOW",
+              "GUARD_OVERSHOOT_TICKS",
+              "UPPER_30_DELTA",
+              "UPPER_50_DELTA",
+              "UPPER_90_DELTA",
           )
-
-          forbidden_port = (
-              "MAX_SCAN_MOTOR_ID",
-              "for motor_id in 1..=max_motor_id",
+          required_tests = (
+              "profile_table_covers_exactly_24_unique_contacts",
+              "front_lower_restore_order_keeps_rear_parking_until_active_leg_is_home",
+              "armed_ram_gate_restricts_registers_values_motors_and_goal_windows",
+              "canonical_matdog_source_has_no_eeprom_reset_offset_regwrite_action_or_freeze_path",
           )
           required_port = (
+              "matdog_command_allowed_with",
               "matdog_armed_command_allowed",
-              "matdog_pilot_is_armed",
-              "Rejecting non-MATDOG-RAM command",
+              "native MATDOG profile arming is active",
           )
-          port_source = Path("software/drivers/st3215/src/port.rs").read_text()
-          found = [token for token in forbidden if token in source]
-          found += [token for token in forbidden_port if token in port_source]
-          missing = [token for token in required if token not in source]
-          missing += [token for token in required_port if token not in port_source]
+          required_module = (
+              "mod matdog;",
+              "matdog_ram_write_allowed_for_arm_value",
+          )
+
+          found = [token for token in forbidden_source if token in source]
+          found += [token for token in forbidden_other if token in port or token in module]
+          missing = [token for token in required_source if token not in source]
+          missing += [token for token in required_tests if token not in tests]
+          missing += [token for token in required_port if token not in port]
+          missing += [token for token in required_module if token not in module]
+
+          stale = [
+              path for path in (
+                  Path("software/drivers/st3215/src/auto_calibrate/matdog_v2.rs"),
+                  Path("software/drivers/st3215/src/auto_calibrate/matdog_v2_test.rs"),
+              )
+              if path.exists()
+          ]
+          if stale:
+              found.extend(str(path) for path in stale)
+
           if found or missing:
               if found:
-                  print(f"forbidden MATDOG source tokens: {found}")
+                  print(f"forbidden or stale MATDOG source: {found}")
               if missing:
                   print(f"missing MATDOG source requirements: {missing}")
               raise SystemExit(1)
 
-          print("MATDOG RAM-only source contract: PASS")
+          print("MATDOG canonical 24-contact RAM-only contract: PASS")
           PY
 
-      - name: Repository-wide Rust format audit
-        continue-on-error: true
+      - name: MATDOG Rust format check
         shell: bash
         run: |
           set -o pipefail
-          cargo fmt --all -- --check 2>&1 | tee ci-output/cargo-fmt.log
-
-      - name: MATDOG changed Rust format check
-        id: matdog_format
-        shell: bash
-        run: |
           rustfmt --edition 2021 --check --config skip_children=true \
             software/drivers/st3215/src/port.rs \
             software/drivers/st3215/src/auto_calibrate/mod.rs \
             software/drivers/st3215/src/auto_calibrate/matdog.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
-
-      - name: Prepare formatted MATDOG diagnostics
-        if: failure() && steps.matdog_format.outcome == 'failure'
-        shell: bash
-        run: |
-          set -euo pipefail
-          files=(
-            software/drivers/st3215/src/port.rs
-            software/drivers/st3215/src/auto_calibrate/mod.rs
-            software/drivers/st3215/src/auto_calibrate/matdog.rs
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
-          )
-          rustfmt --edition 2021 --config skip_children=true "${files[@]}"
-          mkdir -p ci-output/formatted
-          for file in "${files[@]}"; do
-            cp "$file" "ci-output/formatted/$(basename "$file")"
-          done
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            2>&1 | tee ci-output/matdog-rustfmt.log
 
       - name: ST3215 unit tests
         shell: bash
@@ -141,7 +150,7 @@ jobs:
           set -o pipefail
           cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
 
-      - name: Create CI-only minimal Station viewer asset
+      - name: Create CI-only Station viewer stub
         shell: bash
         run: |
           set -euo pipefail
@@ -149,8 +158,7 @@ jobs:
           test ! -e "$asset"
           mkdir -p "$(dirname "$asset")"
           printf '<!doctype html><title>MATDOG offline build gate</title>\n' > "$asset"
-          echo "Created ignored CI-only viewer stub; no product asset is committed." \
-            | tee ci-output/station-viewer-stub.log
+          echo "Created ignored CI-only viewer stub." | tee ci-output/station-viewer-stub.log
 
       - name: Station release build
         shell: bash
@@ -158,7 +166,7 @@ jobs:
           set -o pipefail
           cargo build --release --package station 2>&1 | tee ci-output/station-build.log
 
-      - name: Remove CI-only viewer asset
+      - name: Remove CI-only viewer stub
         if: always()
         run: rm -rf software/station/clients/station-viewer/dist
 
@@ -166,6 +174,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: matdog-native-calibrator-offline-logs
+          name: matdog-native-calibrator-24-contact-offline-logs
           path: ci-output/
           if-no-files-found: error

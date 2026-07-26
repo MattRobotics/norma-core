@@ -12,8 +12,24 @@ mod elrobot;
 mod matdog;
 mod so101;
 
-pub(crate) fn matdog_pilot_is_armed() -> bool {
-    matdog::require_explicit_arming().is_ok()
+pub(crate) fn matdog_calibrator_is_armed() -> bool {
+    matdog::active_profile().is_ok()
+}
+
+pub(crate) fn matdog_armed_ram_write_allowed(motor_id: u8, address: u32, value: &[u8]) -> bool {
+    matdog::armed_ram_write_allowed(motor_id, address, value)
+}
+
+#[cfg(test)]
+pub(crate) fn matdog_ram_write_allowed_for_arm_value(
+    arm_value: &str,
+    motor_id: u8,
+    address: u32,
+    value: &[u8],
+) -> bool {
+    matdog::profile_for_arm_value(arm_value)
+        .map(|profile| matdog::ram_write_allowed_for_profile(&profile, motor_id, address, value))
+        .unwrap_or(false)
 }
 
 /// Auto-calibration scan ceiling.
@@ -85,7 +101,7 @@ pub async fn calibrate(
         return Ok(None);
     }
     if kind == CalibrationKind::Matdog {
-        matdog::require_explicit_arming().map_err(|message| protocol::Error::InvalidData {
+        matdog::active_profile().map_err(|message| protocol::Error::InvalidData {
             msg: message,
             source_packet: Bytes::new(),
             reply_packet: Bytes::new(),
