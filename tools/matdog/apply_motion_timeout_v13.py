@@ -27,26 +27,23 @@ def replace_function(text: str, signature: str, next_signature: str, transform, 
 
 
 def patch_move_function(body: str, label: str) -> str:
-    old = """        let mut last_stamp = self.latest_observation(motor_id)?.monotonic_stamp_ns;
-        let deadline = Instant::now() + MOTION_TIMEOUT;
-"""
-    new = """        let start = self.latest_observation(motor_id)?;
-        let mut last_stamp = start.monotonic_stamp_ns;
-        let distance_ticks = circular_distance(start.position, target);
+    old = "        let deadline = Instant::now() + MOTION_TIMEOUT;\n"
+    new = """        let start_position = self.latest_observation(motor_id)?.position;
+        let distance_ticks = circular_distance(start_position, target);
         let motion_timeout = motion_timeout_for_distance(distance_ticks);
         let deadline = Instant::now() + motion_timeout;
         info!(
             \"MATDOG {} move plan: M{} start={} target={} distance={} timeout_ms={}\",
             self.profile.label,
             motor_id,
-            start.position,
+            start_position,
             target,
             distance_ticks,
             motion_timeout.as_millis()
         );
 """
     if body.count(old) != 1:
-        raise SystemExit(f"{label}: fixed-deadline anchor count={body.count(old)}")
+        raise SystemExit(f"{label}: deadline anchor count={body.count(old)}")
     return body.replace(old, new, 1)
 
 
