@@ -90,7 +90,7 @@ const MOTION_SETTLE_MARGIN: Duration = Duration::from_secs(5);
     source = replace_function(
         source,
         "    async fn move_motor_to(\n",
-        "    async fn verify_profile_holds(\n",
+        "    async fn verify_profile_holds(&self)",
         lambda body: patch_move_function(body, "ordinary move"),
         "ordinary move",
     )
