@@ -59,10 +59,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ci-output ci-tools
-          echo '74bc8b1046d4894a7cf0bb1d4257a52632c7e3f0ae335c5ce24d56ca077e477b  tools/matdog/restart_safe_v11_bundle.part00.b64' | sha256sum -c -
-          echo '0527c88cad4304a04d02b79a67cf821373bcf92de8848c1a1d17017a2313d60b  tools/matdog/restart_safe_v11_bundle.part01.b64' | sha256sum -c -
-          echo 'a3141b7ebbbfab1ce459429998beae26690a2ac48f24bd9d54f326997395aad2  tools/matdog/restart_safe_v11_bundle.part02.b64' | sha256sum -c -
-          echo '8f7715083162359bcd3ea7434fe0b786a74b3c4498d83d6c5a3e3f099bd2aabf  tools/matdog/restart_safe_v11_bundle.part03.b64' | sha256sum -c -
           cat tools/matdog/restart_safe_v11_bundle.part*.b64 | base64 -d > ci-output/restart_safe_v11_bundle.tar.gz
           echo 'dc424847dcc8c7e7ccf39c9b607b3d58d3efa3555996de67a06a2c3441b63118  ci-output/restart_safe_v11_bundle.tar.gz' | sha256sum -c -
           tar -xzf ci-output/restart_safe_v11_bundle.tar.gz -C ci-tools
