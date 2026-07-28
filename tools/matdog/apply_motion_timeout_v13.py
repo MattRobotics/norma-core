@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -31,13 +30,13 @@ def patch_move_function(body: str, label: str) -> str:
     old = """        let mut last_stamp = self.latest_observation(motor_id)?.monotonic_stamp_ns;
         let deadline = Instant::now() + MOTION_TIMEOUT;
 """
-    new = f"""        let start = self.latest_observation(motor_id)?;
+    new = """        let start = self.latest_observation(motor_id)?;
         let mut last_stamp = start.monotonic_stamp_ns;
         let distance_ticks = circular_distance(start.position, target);
         let motion_timeout = motion_timeout_for_distance(distance_ticks);
         let deadline = Instant::now() + motion_timeout;
         info!(
-            \"MATDOG {{}} move plan: M{{}} start={{}} target={{}} distance={{}} timeout_ms={{}}\",
+            \"MATDOG {} move plan: M{} start={} target={} distance={} timeout_ms={}\",
             self.profile.label,
             motor_id,
             start.position,
@@ -48,43 +47,7 @@ def patch_move_function(body: str, label: str) -> str:
 """
     if body.count(old) != 1:
         raise SystemExit(f"{label}: fixed-deadline anchor count={body.count(old)}")
-    body = body.replace(old, new, 1)
-
-    patterns = (
-        (
-            '"M{motor_id} profile-entry timeout: target={target}, present={}, error={}"',
-            '"M{motor_id} profile-entry timeout: target={target}, present={}, error={}, distance={}, timeout_ms={}"',
-        ),
-        (
-            '"M{motor_id} target timeout: target={target}, present={}, error={}"',
-            '"M{motor_id} target timeout: target={target}, present={}, error={}, distance={}, timeout_ms={}"',
-        ),
-    )
-    replaced = False
-    for old_message, new_message in patterns:
-        if old_message in body:
-            body = body.replace(old_message, new_message, 1)
-            replaced = True
-            break
-    if not replaced:
-        raise SystemExit(f"{label}: timeout message was not upgraded")
-
-    arg_pattern = re.compile(
-        r"(?m)^(?P<indent>\s*)circular_distance\(last\.position, target\),?\n(?P<close>\s*)\)"
-    )
-    matches = list(arg_pattern.finditer(body))
-    if len(matches) != 1:
-        raise SystemExit(f"{label}: timeout args anchor count={len(matches)}")
-    match = matches[0]
-    indent = match.group("indent")
-    close = match.group("close")
-    replacement = (
-        f"{indent}circular_distance(last.position, target),\n"
-        f"{indent}distance_ticks,\n"
-        f"{indent}motion_timeout.as_millis()\n"
-        f"{close})"
-    )
-    return body[:match.start()] + replacement + body[match.end():]
+    return body.replace(old, new, 1)
 
 
 def main() -> None:
