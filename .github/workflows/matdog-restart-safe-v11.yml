@@ -1,0 +1,150 @@
+name: MATDOG Restart-Safe V11 Validation
+
+on:
+  push:
+    branches:
+      - matdog/restart-safe-profile-entry-v11
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matdog-restart-safe-v11-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-validation:
+    name: Restart-safe entry, exhaustive tests, Station build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout isolated validation branch
+        uses: actions/checkout@v4
+
+      - name: Verify canonical base ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a HEAD
+          test "$(git diff --name-only 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a...HEAD | sort)" = $'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/restart_safe_v11_bundle.tar.gz.b64'
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
+      - name: Install Station native build dependency
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Decode immutable V11 validation bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-output ci-tools
+          base64 -d tools/matdog/restart_safe_v11_bundle.tar.gz.b64 > ci-output/restart_safe_v11_bundle.tar.gz
+          echo '1db98081ced951efb9ac933d633af70fe57da0ff695f95f69f5746685a5ffc97  ci-output/restart_safe_v11_bundle.tar.gz' | sha256sum -c -
+          tar -xzf ci-output/restart_safe_v11_bundle.tar.gz -C ci-tools
+          python3 -m py_compile ci-tools/apply_restart_safe_v11.py ci-tools/audit_restart_safe_v11.py ci-tools/replay_restart_safe_v11.py
+
+      - name: Apply restart-safe implementation to canonical sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ci-tools/apply_restart_safe_v11.py \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            software/drivers/st3215/src/port.rs
+          python3 ci-tools/audit_restart_safe_v11.py \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            software/drivers/st3215/src/port.rs | tee ci-output/restart-safe-audit.log
+          rustfmt --edition 2021 \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            software/drivers/st3215/src/port.rs
+          git diff --check
+          actual="$(git diff --name-only | grep '^software/' | sort)"
+          expected=$'software/drivers/st3215/src/auto_calibrate/matdog.rs\nsoftware/drivers/st3215/src/auto_calibrate/matdog_test.rs\nsoftware/drivers/st3215/src/port.rs'
+          test "$actual" = "$expected"
+
+      - name: Enforce RAM-only safety contract after patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee ci-output/ram-only-contract.log
+          from pathlib import Path
+          source = Path('software/drivers/st3215/src/auto_calibrate/matdog.rs').read_text()
+          forbidden = (
+              'EepromRegister', 'RamRegister::Lock', 'ST3215Request::',
+              'reg_write: Some', 'reset: Some', 'reset_calibration: Some',
+              'freeze_calibration: Some', 'action: Some', 'Offset.address',
+          )
+          found = [token for token in forbidden if token in source]
+          required = (
+              'Inspect restart-safe profile entry',
+              'restart-safe profile entry refused before motion',
+              'establish_prerequisites_restart_safe',
+              'verify_profile_entry_holds_except',
+              'global_torque_off_verified',
+          )
+          missing = [token for token in required if token not in source]
+          if found or missing:
+              raise SystemExit(f'forbidden={found} missing={missing}')
+          print('RAM-only restart-safe contract: PASS')
+          PY
+
+      - name: Targeted restart-safe regressions
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --package st3215 startup_ -- --nocapture 2>&1 | tee ci-output/startup-regressions.log
+          cargo test --package st3215 profile_entry_order_is_restart_safe_and_probe_lifecycle_is_strict -- --nocapture 2>&1 | tee -a ci-output/startup-regressions.log
+          grep -q 'startup_v10_pose_classifies_m42_as_valid_prerequisite_residue ... ok' ci-output/startup-regressions.log
+          grep -q 'startup_envelopes_match_exhaustive_oracle_for_all_profiles_and_ticks ... ok' ci-output/startup-regressions.log
+          grep -q 'startup_wrong_profile_residue_is_rejected ... ok' ci-output/startup-regressions.log
+
+      - name: Full ST3215 test suite
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --package st3215 2>&1 | tee ci-output/st3215-full-tests.log
+          grep -q '0 failed' ci-output/st3215-full-tests.log
+
+      - name: Deterministic V10 and interrupted-state replay
+        shell: bash
+        run: python3 ci-tools/replay_restart_safe_v11.py | tee ci-output/restart-safe-replay.log
+
+      - name: Create CI-only Station viewer stub
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset=software/station/clients/station-viewer/dist/index.html
+          test ! -e "$asset"
+          mkdir -p "$(dirname "$asset")"
+          printf '<!doctype html><title>MATDOG restart-safe V11 build gate</title>\n' > "$asset"
+
+      - name: Station release build
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release --package station 2>&1 | tee ci-output/station-build.log
+          strings target/release/station | grep -F 'Inspect restart-safe profile entry'
+          strings target/release/station | grep -F 'restart-safe profile entry refused before motion'
+
+      - name: Remove CI-only viewer stub
+        if: always()
+        run: rm -rf software/station/clients/station-viewer/dist
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matdog-restart-safe-v11-offline-evidence
+          path: ci-output/
+          if-no-files-found: error
