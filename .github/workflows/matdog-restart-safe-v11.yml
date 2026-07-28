@@ -77,15 +77,34 @@ jobs:
           tar -xzf ci-output/restart_safe_v11_bundle.tar.gz -C ci-tools
           python3 -m py_compile ci-tools/apply_restart_safe_v11.py ci-tools/audit_restart_safe_v11.py ci-tools/replay_restart_safe_v11.py tools/matdog/apply_motion_timeout_v13.py
 
-      - name: Apply restart-safe and distance-aware implementation
+      - name: Apply restart-safe V11 foundation
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 ci-tools/apply_restart_safe_v11.py \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            software/drivers/st3215/src/port.rs \
+            2>&1 | tee ci-output/apply-v11.log
+
+      - name: Apply distance-aware V13 deadline patch
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 tools/matdog/apply_motion_timeout_v13.py \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            2>&1 | tee ci-output/apply-v13.log
+          grep -q 'motion_timeout_for_distance' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          test "$(grep -c 'let deadline = Instant::now() + motion_timeout;' software/drivers/st3215/src/auto_calibrate/matdog.rs)" = 2
+
+      - name: Audit and format patched sources
         shell: bash
         run: |
           set -euo pipefail
           source=software/drivers/st3215/src/auto_calibrate/matdog.rs
           tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
           port=software/drivers/st3215/src/port.rs
-          python3 ci-tools/apply_restart_safe_v11.py "$source" "$tests" "$port"
-          python3 tools/matdog/apply_motion_timeout_v13.py "$source" "$tests"
           python3 ci-tools/audit_restart_safe_v11.py "$source" "$tests" "$port" | tee ci-output/restart-safe-audit.log
           rustfmt --edition 2021 "$source" "$tests" "$port"
           git diff --check
