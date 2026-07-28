@@ -31,13 +31,13 @@ def patch_move_function(body: str, label: str) -> str:
     old = """        let mut last_stamp = self.latest_observation(motor_id)?.monotonic_stamp_ns;
         let deadline = Instant::now() + MOTION_TIMEOUT;
 """
-    new = """        let start = self.latest_observation(motor_id)?;
+    new = f"""        let start = self.latest_observation(motor_id)?;
         let mut last_stamp = start.monotonic_stamp_ns;
         let distance_ticks = circular_distance(start.position, target);
         let motion_timeout = motion_timeout_for_distance(distance_ticks);
         let deadline = Instant::now() + motion_timeout;
         info!(
-            \"MATDOG {} move plan: M{} start={} target={} distance={} timeout_ms={}\",
+            \"MATDOG {{}} move plan: M{{}} start={{}} target={{}} distance={{}} timeout_ms={{}}\",
             self.profile.label,
             motor_id,
             start.position,
@@ -69,17 +69,22 @@ def patch_move_function(body: str, label: str) -> str:
     if not replaced:
         raise SystemExit(f"{label}: timeout message was not upgraded")
 
-    arg_old = """            circular_distance(last.position, target)
-        )
-"""
-    arg_new = """            circular_distance(last.position, target),
-            distance_ticks,
-            motion_timeout.as_millis()
-        )
-"""
-    if body.count(arg_old) != 1:
-        raise SystemExit(f"{label}: timeout args anchor count={body.count(arg_old)}")
-    return body.replace(arg_old, arg_new, 1)
+    arg_pattern = re.compile(
+        r"(?m)^(?P<indent>\s*)circular_distance\(last\.position, target\),?\n(?P<close>\s*)\)"
+    )
+    matches = list(arg_pattern.finditer(body))
+    if len(matches) != 1:
+        raise SystemExit(f"{label}: timeout args anchor count={len(matches)}")
+    match = matches[0]
+    indent = match.group("indent")
+    close = match.group("close")
+    replacement = (
+        f"{indent}circular_distance(last.position, target),\n"
+        f"{indent}distance_ticks,\n"
+        f"{indent}motion_timeout.as_millis()\n"
+        f"{close})"
+    )
+    return body[:match.start()] + replacement + body[match.end():]
 
 
 def main() -> None:
@@ -94,8 +99,8 @@ def main() -> None:
     constants = """const MOTION_TIMEOUT: Duration = Duration::from_secs(12);
 // Long MAX returns and +90-degree prerequisites can exceed the original fixed
 // 12-second budget at GOAL_SPEED=80. Size the deadline from the commanded
-// distance using a conservative half-speed floor, retaining 12 seconds as the
-// minimum for short movements and telemetry/settling overhead.
+// distance using a conservative half-speed floor, retaining 12 seconds
+// as the minimum for short movements and telemetry/settling overhead.
 const MIN_EXPECTED_MOTION_TICKS_PER_SECOND: u64 = 40;
 const MOTION_SETTLE_MARGIN: Duration = Duration::from_secs(5);
 """
