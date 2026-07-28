@@ -24,15 +24,21 @@ jobs:
     name: Restart-safe entry, exhaustive tests, Station build
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout isolated validation branch
+      - name: Checkout isolated validation branch head
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
 
       - name: Verify canonical base ancestry
         shell: bash
         run: |
           set -euo pipefail
           git merge-base --is-ancestor 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a HEAD
-          test "$(git diff --name-only 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a...HEAD | sort)" = $'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/restart_safe_v11_bundle.tar.gz.b64'
+          actual="$(git diff --name-only 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a...HEAD | sort)"
+          expected=$'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/restart_safe_v11_bundle.tar.gz.b64'
+          printf 'head=%s\nchanged_files:\n%s\n' "$(git rev-parse HEAD)" "$actual"
+          test "$actual" = "$expected"
 
       - name: Setup protoc
         uses: arduino/setup-protoc@v3
