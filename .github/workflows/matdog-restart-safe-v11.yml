@@ -9,7 +9,7 @@ on:
       - main
     paths:
       - ".github/workflows/matdog-restart-safe-v11.yml"
-      - "tools/matdog/restart_safe_v11_bundle.tar.gz.b64"
+      - "tools/matdog/restart_safe_v11_bundle.part*.b64"
   workflow_dispatch:
 
 permissions:
@@ -30,13 +30,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
-      - name: Verify canonical base ancestry
+      - name: Verify canonical base ancestry and scope
         shell: bash
         run: |
           set -euo pipefail
           git merge-base --is-ancestor 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a HEAD
           actual="$(git diff --name-only 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a...HEAD | sort)"
-          expected=$'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/restart_safe_v11_bundle.tar.gz.b64'
+          expected=$'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/restart_safe_v11_bundle.part00.b64\ntools/matdog/restart_safe_v11_bundle.part01.b64\ntools/matdog/restart_safe_v11_bundle.part02.b64\ntools/matdog/restart_safe_v11_bundle.part03.b64'
           printf 'head=%s\nchanged_files:\n%s\n' "$(git rev-parse HEAD)" "$actual"
           test "$actual" = "$expected"
 
@@ -59,7 +59,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ci-output ci-tools
-          base64 -d tools/matdog/restart_safe_v11_bundle.tar.gz.b64 > ci-output/restart_safe_v11_bundle.tar.gz
+          echo '1e04411a8bed3b5b18a9c6fbfc8ecdb4250c2b3ea78fa4531a2fdaeeb96eac56  tools/matdog/restart_safe_v11_bundle.part00.b64' | sha256sum -c -
+          echo '58304b1c85869971f3b7787fe93a8bb9eb719f323ad3dcaf2ea97ae17d64ba36  tools/matdog/restart_safe_v11_bundle.part01.b64' | sha256sum -c -
+          echo 'c60dbd3c50150fea3a0ce6fdba1904cd5bc3458279682a037f3d8da87c185693  tools/matdog/restart_safe_v11_bundle.part02.b64' | sha256sum -c -
+          echo 'a6f36b04959a475e11072d5066a368e7dcf21fcaf862916e0c1158eca21ae6f9  tools/matdog/restart_safe_v11_bundle.part03.b64' | sha256sum -c -
+          cat tools/matdog/restart_safe_v11_bundle.part*.b64 | base64 -d > ci-output/restart_safe_v11_bundle.tar.gz
           echo '1db98081ced951efb9ac933d633af70fe57da0ff695f95f69f5746685a5ffc97  ci-output/restart_safe_v11_bundle.tar.gz' | sha256sum -c -
           tar -xzf ci-output/restart_safe_v11_bundle.tar.gz -C ci-tools
           python3 -m py_compile ci-tools/apply_restart_safe_v11.py ci-tools/audit_restart_safe_v11.py ci-tools/replay_restart_safe_v11.py
