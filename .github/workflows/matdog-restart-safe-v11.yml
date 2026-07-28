@@ -59,12 +59,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ci-output ci-tools
-          echo '1e04411a8bed3b5b18a9c6fbfc8ecdb4250c2b3ea78fa4531a2fdaeeb96eac56  tools/matdog/restart_safe_v11_bundle.part00.b64' | sha256sum -c -
-          echo '58304b1c85869971f3b7787fe93a8bb9eb719f323ad3dcaf2ea97ae17d64ba36  tools/matdog/restart_safe_v11_bundle.part01.b64' | sha256sum -c -
-          echo 'c60dbd3c50150fea3a0ce6fdba1904cd5bc3458279682a037f3d8da87c185693  tools/matdog/restart_safe_v11_bundle.part02.b64' | sha256sum -c -
-          echo 'a6f36b04959a475e11072d5066a368e7dcf21fcaf862916e0c1158eca21ae6f9  tools/matdog/restart_safe_v11_bundle.part03.b64' | sha256sum -c -
+          echo '5c801b763616819fc8f2f700e456b252bfa60a811a925143abce00ded209bb1a  tools/matdog/restart_safe_v11_bundle.part00.b64' | sha256sum -c -
+          echo '91171ea70976c363d78d853fb6bcbfc57c12a3ff122600e01ac7108b57a0b568  tools/matdog/restart_safe_v11_bundle.part01.b64' | sha256sum -c -
+          echo '8156918b1926d8868bf76ecfc5554b7681a56d1729fee99103d566d7294c61de  tools/matdog/restart_safe_v11_bundle.part02.b64' | sha256sum -c -
+          echo '0ba9fab4eda3abff0f390cf9973fd02e99778d77a831c3149f97a16475ae7f13  tools/matdog/restart_safe_v11_bundle.part03.b64' | sha256sum -c -
           cat tools/matdog/restart_safe_v11_bundle.part*.b64 | base64 -d > ci-output/restart_safe_v11_bundle.tar.gz
-          echo '1db98081ced951efb9ac933d633af70fe57da0ff695f95f69f5746685a5ffc97  ci-output/restart_safe_v11_bundle.tar.gz' | sha256sum -c -
+          echo '925205a5ecd4efae829ee0c969b5dedde8064cd827962783311847da45402db0  ci-output/restart_safe_v11_bundle.tar.gz' | sha256sum -c -
           tar -xzf ci-output/restart_safe_v11_bundle.tar.gz -C ci-tools
           python3 -m py_compile ci-tools/apply_restart_safe_v11.py ci-tools/audit_restart_safe_v11.py ci-tools/replay_restart_safe_v11.py
 
