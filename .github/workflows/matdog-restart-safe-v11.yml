@@ -1,4 +1,4 @@
-name: MATDOG Restart-Safe V11 Validation
+name: MATDOG Restart-Safe V13 Validation
 
 on:
   push:
@@ -10,18 +10,19 @@ on:
     paths:
       - ".github/workflows/matdog-restart-safe-v11.yml"
       - "tools/matdog/restart_safe_v11_bundle.part*.b64"
+      - "tools/matdog/apply_motion_timeout_v13.py"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: matdog-restart-safe-v11-${{ github.event.pull_request.number || github.ref }}
+  group: matdog-restart-safe-v13-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   offline-validation:
-    name: Restart-safe entry, exhaustive tests, Station build
+    name: Restart-safe entry, distance-aware motion, Station build
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout isolated validation branch head
@@ -36,7 +37,7 @@ jobs:
           set -euo pipefail
           git merge-base --is-ancestor 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a HEAD
           actual="$(git diff --name-only 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a...HEAD | sort)"
-          expected=$'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/restart_safe_v11_bundle.part00.b64\ntools/matdog/restart_safe_v11_bundle.part01.b64\ntools/matdog/restart_safe_v11_bundle.part02.b64\ntools/matdog/restart_safe_v11_bundle.part03.b64'
+          expected=$'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/apply_motion_timeout_v13.py\ntools/matdog/restart_safe_v11_bundle.part00.b64\ntools/matdog/restart_safe_v11_bundle.part01.b64\ntools/matdog/restart_safe_v11_bundle.part02.b64\ntools/matdog/restart_safe_v11_bundle.part03.b64'
           printf 'head=%s\nchanged_files:\n%s\n' "$(git rev-parse HEAD)" "$actual"
           test "$actual" = "$expected"
 
@@ -74,30 +75,25 @@ jobs:
           cat tools/matdog/restart_safe_v11_bundle.part*.b64 | base64 -d > ci-output/restart_safe_v11_bundle.tar.gz
           echo 'dc424847dcc8c7e7ccf39c9b607b3d58d3efa3555996de67a06a2c3441b63118  ci-output/restart_safe_v11_bundle.tar.gz' | sha256sum -c -
           tar -xzf ci-output/restart_safe_v11_bundle.tar.gz -C ci-tools
-          python3 -m py_compile ci-tools/apply_restart_safe_v11.py ci-tools/audit_restart_safe_v11.py ci-tools/replay_restart_safe_v11.py
+          python3 -m py_compile ci-tools/apply_restart_safe_v11.py ci-tools/audit_restart_safe_v11.py ci-tools/replay_restart_safe_v11.py tools/matdog/apply_motion_timeout_v13.py
 
-      - name: Apply restart-safe implementation to canonical sources
+      - name: Apply restart-safe and distance-aware implementation
         shell: bash
         run: |
           set -euo pipefail
-          python3 ci-tools/apply_restart_safe_v11.py \
-            software/drivers/st3215/src/auto_calibrate/matdog.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
-            software/drivers/st3215/src/port.rs
-          python3 ci-tools/audit_restart_safe_v11.py \
-            software/drivers/st3215/src/auto_calibrate/matdog.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
-            software/drivers/st3215/src/port.rs | tee ci-output/restart-safe-audit.log
-          rustfmt --edition 2021 \
-            software/drivers/st3215/src/auto_calibrate/matdog.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
-            software/drivers/st3215/src/port.rs
+          source=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          port=software/drivers/st3215/src/port.rs
+          python3 ci-tools/apply_restart_safe_v11.py "$source" "$tests" "$port"
+          python3 tools/matdog/apply_motion_timeout_v13.py "$source" "$tests"
+          python3 ci-tools/audit_restart_safe_v11.py "$source" "$tests" "$port" | tee ci-output/restart-safe-audit.log
+          rustfmt --edition 2021 "$source" "$tests" "$port"
           git diff --check
           actual="$(git diff --name-only | grep '^software/' | sort)"
           expected=$'software/drivers/st3215/src/auto_calibrate/matdog.rs\nsoftware/drivers/st3215/src/auto_calibrate/matdog_test.rs\nsoftware/drivers/st3215/src/port.rs'
           test "$actual" = "$expected"
 
-      - name: Enforce RAM-only safety contract after patch
+      - name: Enforce RAM-only and distance-aware contract
         shell: bash
         run: |
           set -euo pipefail
@@ -115,23 +111,28 @@ jobs:
               'restart-safe profile entry refused before motion',
               'establish_prerequisites_restart_safe',
               'verify_profile_entry_holds_except',
+              'motion_timeout_for_distance',
+              'MIN_EXPECTED_MOTION_TICKS_PER_SECOND',
+              'move plan: M{} start={} target={} distance={} timeout_ms={}',
               'global_torque_off_verified',
           )
           missing = [token for token in required if token not in source]
           if found or missing:
               raise SystemExit(f'forbidden={found} missing={missing}')
-          print('RAM-only restart-safe contract: PASS')
+          print('RAM-only restart-safe distance-aware contract: PASS')
           PY
 
-      - name: Targeted restart-safe regressions
+      - name: Targeted restart-safe and timeout regressions
         shell: bash
         run: |
           set -o pipefail
-          cargo test --package st3215 startup_ -- --nocapture 2>&1 | tee ci-output/startup-regressions.log
-          cargo test --package st3215 profile_entry_order_is_restart_safe_and_probe_lifecycle_is_strict -- --nocapture 2>&1 | tee -a ci-output/startup-regressions.log
-          grep -q 'startup_v10_pose_classifies_m42_as_valid_prerequisite_residue ... ok' ci-output/startup-regressions.log
-          grep -q 'startup_envelopes_match_exhaustive_oracle_for_all_profiles_and_ticks ... ok' ci-output/startup-regressions.log
-          grep -q 'startup_wrong_profile_residue_is_rejected ... ok' ci-output/startup-regressions.log
+          cargo test --package st3215 startup_ -- --nocapture 2>&1 | tee ci-output/targeted-regressions.log
+          cargo test --package st3215 profile_entry_order_is_restart_safe_and_probe_lifecycle_is_strict -- --nocapture 2>&1 | tee -a ci-output/targeted-regressions.log
+          cargo test --package st3215 motion_timeout_ -- --nocapture 2>&1 | tee -a ci-output/targeted-regressions.log
+          grep -q 'startup_v10_pose_classifies_m42_as_valid_prerequisite_residue ... ok' ci-output/targeted-regressions.log
+          grep -q 'startup_envelopes_match_exhaustive_oracle_for_all_profiles_and_ticks ... ok' ci-output/targeted-regressions.log
+          grep -q 'motion_timeout_covers_observed_m12_max_return ... ok' ci-output/targeted-regressions.log
+          grep -q 'motion_timeout_keeps_short_moves_fast_and_scales_for_every_profile ... ok' ci-output/targeted-regressions.log
 
       - name: Full ST3215 test suite
         shell: bash
@@ -140,11 +141,11 @@ jobs:
           cargo test --package st3215 2>&1 | tee ci-output/st3215-full-tests.log
           grep -q '0 failed' ci-output/st3215-full-tests.log
           if grep -q '^warning:' ci-output/st3215-full-tests.log; then
-            echo 'Rust warnings detected in clean validation' >&2
+            echo 'Rust warnings detected in V13 validation' >&2
             exit 1
           fi
 
-      - name: Deterministic V10 and interrupted-state replay
+      - name: Deterministic restart-state replay
         shell: bash
         run: python3 ci-tools/replay_restart_safe_v11.py | tee ci-output/restart-safe-replay.log
 
@@ -155,7 +156,7 @@ jobs:
           asset=software/station/clients/station-viewer/dist/index.html
           test ! -e "$asset"
           mkdir -p "$(dirname "$asset")"
-          printf '<!doctype html><title>MATDOG restart-safe V11 build gate</title>\n' > "$asset"
+          printf '<!doctype html><title>MATDOG restart-safe V13 build gate</title>\n' > "$asset"
 
       - name: Station release build
         shell: bash
@@ -163,9 +164,10 @@ jobs:
           set -o pipefail
           cargo build --release --package station 2>&1 | tee ci-output/station-build.log
           strings target/release/station | grep -F 'Inspect restart-safe profile entry'
-          strings target/release/station | grep -F 'restart-safe profile entry refused before motion'
+          strings target/release/station | grep -F 'move plan: M'
+          strings target/release/station | grep -F 'timeout_ms='
           if grep -q '^warning:' ci-output/station-build.log; then
-            echo 'Rust warnings detected in clean Station build' >&2
+            echo 'Rust warnings detected in V13 Station build' >&2
             exit 1
           fi
 
@@ -177,6 +179,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: matdog-restart-safe-v11-clean-offline-evidence
+          name: matdog-restart-safe-v13-distance-aware-evidence
           path: ci-output/
           if-no-files-found: error
