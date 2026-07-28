@@ -59,12 +59,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ci-output ci-tools
-          echo '5c801b763616819fc8f2f700e456b252bfa60a811a925143abce00ded209bb1a  tools/matdog/restart_safe_v11_bundle.part00.b64' | sha256sum -c -
-          echo '91171ea70976c363d78d853fb6bcbfc57c12a3ff122600e01ac7108b57a0b568  tools/matdog/restart_safe_v11_bundle.part01.b64' | sha256sum -c -
-          echo '8156918b1926d8868bf76ecfc5554b7681a56d1729fee99103d566d7294c61de  tools/matdog/restart_safe_v11_bundle.part02.b64' | sha256sum -c -
-          echo '0ba9fab4eda3abff0f390cf9973fd02e99778d77a831c3149f97a16475ae7f13  tools/matdog/restart_safe_v11_bundle.part03.b64' | sha256sum -c -
+          echo '74bc8b1046d4894a7cf0bb1d4257a52632c7e3f0ae335c5ce24d56ca077e477b  tools/matdog/restart_safe_v11_bundle.part00.b64' | sha256sum -c -
+          echo '0527c88cad4304a04d02b79a67cf821373bcf92de8848c1a1d17017a2313d60b  tools/matdog/restart_safe_v11_bundle.part01.b64' | sha256sum -c -
+          echo 'a3141b7ebbbfab1ce459429998beae26690a2ac48f24bd9d54f326997395aad2  tools/matdog/restart_safe_v11_bundle.part02.b64' | sha256sum -c -
+          echo '8f7715083162359bcd3ea7434fe0b786a74b3c4498d83d6c5a3e3f099bd2aabf  tools/matdog/restart_safe_v11_bundle.part03.b64' | sha256sum -c -
           cat tools/matdog/restart_safe_v11_bundle.part*.b64 | base64 -d > ci-output/restart_safe_v11_bundle.tar.gz
-          echo '925205a5ecd4efae829ee0c969b5dedde8064cd827962783311847da45402db0  ci-output/restart_safe_v11_bundle.tar.gz' | sha256sum -c -
+          echo 'dc424847dcc8c7e7ccf39c9b607b3d58d3efa3555996de67a06a2c3441b63118  ci-output/restart_safe_v11_bundle.tar.gz' | sha256sum -c -
           tar -xzf ci-output/restart_safe_v11_bundle.tar.gz -C ci-tools
           python3 -m py_compile ci-tools/apply_restart_safe_v11.py ci-tools/audit_restart_safe_v11.py ci-tools/replay_restart_safe_v11.py
 
@@ -131,6 +131,10 @@ jobs:
           set -o pipefail
           cargo test --package st3215 2>&1 | tee ci-output/st3215-full-tests.log
           grep -q '0 failed' ci-output/st3215-full-tests.log
+          if grep -q '^warning:' ci-output/st3215-full-tests.log; then
+            echo 'Rust warnings detected in clean validation' >&2
+            exit 1
+          fi
 
       - name: Deterministic V10 and interrupted-state replay
         shell: bash
@@ -152,6 +156,10 @@ jobs:
           cargo build --release --package station 2>&1 | tee ci-output/station-build.log
           strings target/release/station | grep -F 'Inspect restart-safe profile entry'
           strings target/release/station | grep -F 'restart-safe profile entry refused before motion'
+          if grep -q '^warning:' ci-output/station-build.log; then
+            echo 'Rust warnings detected in clean Station build' >&2
+            exit 1
+          fi
 
       - name: Remove CI-only viewer stub
         if: always()
@@ -161,6 +169,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: matdog-restart-safe-v11-offline-evidence
+          name: matdog-restart-safe-v11-clean-offline-evidence
           path: ci-output/
           if-no-files-found: error
