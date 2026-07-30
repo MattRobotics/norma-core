@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -42,21 +43,25 @@ def main() -> None:
         "probe-home tolerance constant",
     )
 
-    old_call = (
-        "self.move_motor_to(self.profile.motor_id, HOME_TICK, STATIC_TOLERANCE_TICKS)"
+    probe_home_call = re.compile(
+        r"self\.move_motor_to\(\s*"
+        r"self\.profile\.motor_id,\s*"
+        r"HOME_TICK,\s*"
+        r"STATIC_TOLERANCE_TICKS,?\s*"
+        r"\)"
     )
-    call_count = source.count(old_call)
-    if call_count != 3:
+    matches = list(probe_home_call.finditer(source))
+    if len(matches) != 3:
         raise SystemExit(
-            f"probe-home move call count: expected 3, found {call_count}"
+            f"probe-home move call count: expected 3, found {len(matches)}"
         )
-    source = source.replace(
-        old_call,
+    source = probe_home_call.sub(
         "self.move_motor_to(\n"
         "            self.profile.motor_id,\n"
         "            HOME_TICK,\n"
         "            PROBE_HOME_TOLERANCE_TICKS,\n"
         "        )",
+        source,
     )
 
     test_anchor = """#[test]
