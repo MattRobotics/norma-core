@@ -1,4 +1,4 @@
-name: MATDOG Restart-Safe V13 Validation
+name: MATDOG Restart-Safe V18 Validation
 
 on:
   push:
@@ -11,18 +11,19 @@ on:
       - ".github/workflows/matdog-restart-safe-v11.yml"
       - "tools/matdog/restart_safe_v11_bundle.part*.b64"
       - "tools/matdog/apply_motion_timeout_v13.py"
+      - "tools/matdog/apply_probe_home_tolerance_v18.py"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: matdog-restart-safe-v13-${{ github.event.pull_request.number || github.ref }}
+  group: matdog-restart-safe-v18-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   offline-validation:
-    name: Restart-safe entry, distance-aware motion, Station build
+    name: Restart-safe, distance-aware, probe-home tolerance, Station build
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout isolated validation branch head
@@ -37,7 +38,7 @@ jobs:
           set -euo pipefail
           git merge-base --is-ancestor 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a HEAD
           actual="$(git diff --name-only 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a...HEAD | sort)"
-          expected=$'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/apply_motion_timeout_v13.py\ntools/matdog/restart_safe_v11_bundle.part00.b64\ntools/matdog/restart_safe_v11_bundle.part01.b64\ntools/matdog/restart_safe_v11_bundle.part02.b64\ntools/matdog/restart_safe_v11_bundle.part03.b64'
+          expected=$'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/apply_motion_timeout_v13.py\ntools/matdog/apply_probe_home_tolerance_v18.py\ntools/matdog/restart_safe_v11_bundle.part00.b64\ntools/matdog/restart_safe_v11_bundle.part01.b64\ntools/matdog/restart_safe_v11_bundle.part02.b64\ntools/matdog/restart_safe_v11_bundle.part03.b64'
           printf 'head=%s\nchanged_files:\n%s\n' "$(git rev-parse HEAD)" "$actual"
           test "$actual" = "$expected"
 
@@ -75,7 +76,7 @@ jobs:
           cat tools/matdog/restart_safe_v11_bundle.part*.b64 | base64 -d > ci-output/restart_safe_v11_bundle.tar.gz
           echo 'dc424847dcc8c7e7ccf39c9b607b3d58d3efa3555996de67a06a2c3441b63118  ci-output/restart_safe_v11_bundle.tar.gz' | sha256sum -c -
           tar -xzf ci-output/restart_safe_v11_bundle.tar.gz -C ci-tools
-          python3 -m py_compile ci-tools/apply_restart_safe_v11.py ci-tools/audit_restart_safe_v11.py ci-tools/replay_restart_safe_v11.py tools/matdog/apply_motion_timeout_v13.py
+          python3 -m py_compile ci-tools/apply_restart_safe_v11.py ci-tools/audit_restart_safe_v11.py ci-tools/replay_restart_safe_v11.py tools/matdog/apply_motion_timeout_v13.py tools/matdog/apply_probe_home_tolerance_v18.py
 
       - name: Apply restart-safe V11 foundation
         shell: bash
@@ -98,6 +99,17 @@ jobs:
           grep -q 'motion_timeout_for_distance' software/drivers/st3215/src/auto_calibrate/matdog.rs
           test "$(grep -c 'let deadline = Instant::now() + motion_timeout;' software/drivers/st3215/src/auto_calibrate/matdog.rs)" = 2
 
+      - name: Apply probe-home settle tolerance V18
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 tools/matdog/apply_probe_home_tolerance_v18.py \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            2>&1 | tee ci-output/apply-v18.log
+          grep -q 'const PROBE_HOME_TOLERANCE_TICKS: u16 = 16;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          test "$(grep -c 'PROBE_HOME_TOLERANCE_TICKS' software/drivers/st3215/src/auto_calibrate/matdog.rs)" = 4
+
       - name: Audit and format patched sources
         shell: bash
         run: |
@@ -112,7 +124,7 @@ jobs:
           expected=$'software/drivers/st3215/src/auto_calibrate/matdog.rs\nsoftware/drivers/st3215/src/auto_calibrate/matdog_test.rs\nsoftware/drivers/st3215/src/port.rs'
           test "$actual" = "$expected"
 
-      - name: Enforce RAM-only and distance-aware contract
+      - name: Enforce RAM-only and scoped tolerance contract
         shell: bash
         run: |
           set -euo pipefail
@@ -133,34 +145,41 @@ jobs:
               'motion_timeout_for_distance',
               'MIN_EXPECTED_MOTION_TICKS_PER_SECOND',
               'move plan: M{} start={} target={} distance={} timeout_ms={}',
+              'const STATIC_TOLERANCE_TICKS: u16 = 10;',
+              'const PROBE_HOME_TOLERANCE_TICKS: u16 = 16;',
               'global_torque_off_verified',
           )
           missing = [token for token in required if token not in source]
+          if source.count('PROBE_HOME_TOLERANCE_TICKS') != 4:
+              raise SystemExit('probe-home tolerance is not scoped to constant plus three calls')
           if found or missing:
               raise SystemExit(f'forbidden={found} missing={missing}')
-          print('RAM-only restart-safe distance-aware contract: PASS')
+          print('RAM-only restart-safe distance-aware scoped-tolerance contract: PASS')
           PY
 
-      - name: Targeted restart-safe and timeout regressions
+      - name: Targeted restart-safe, timeout, and M13 regressions
         shell: bash
         run: |
           set -o pipefail
           cargo test --package st3215 startup_ -- --nocapture 2>&1 | tee ci-output/targeted-regressions.log
           cargo test --package st3215 profile_entry_order_is_restart_safe_and_probe_lifecycle_is_strict -- --nocapture 2>&1 | tee -a ci-output/targeted-regressions.log
           cargo test --package st3215 motion_timeout_ -- --nocapture 2>&1 | tee -a ci-output/targeted-regressions.log
+          cargo test --package st3215 probe_home_tolerance_ -- --nocapture 2>&1 | tee -a ci-output/targeted-regressions.log
           grep -q 'startup_v10_pose_classifies_m42_as_valid_prerequisite_residue ... ok' ci-output/targeted-regressions.log
           grep -q 'startup_envelopes_match_exhaustive_oracle_for_all_profiles_and_ticks ... ok' ci-output/targeted-regressions.log
           grep -q 'motion_timeout_covers_observed_m12_max_return ... ok' ci-output/targeted-regressions.log
           grep -q 'motion_timeout_keeps_short_moves_fast_and_scales_for_every_profile ... ok' ci-output/targeted-regressions.log
+          grep -q 'probe_home_tolerance_covers_observed_m13_settle_without_weakening_static_gate ... ok' ci-output/targeted-regressions.log
+          grep -q 'probe_home_tolerance_is_scoped_to_exactly_three_active_probe_returns ... ok' ci-output/targeted-regressions.log
 
       - name: Full ST3215 test suite
         shell: bash
         run: |
           set -o pipefail
           cargo test --package st3215 2>&1 | tee ci-output/st3215-full-tests.log
-          grep -q '0 failed' ci-output/st3215-full-tests.log
+          grep -q '79 passed; 0 failed' ci-output/st3215-full-tests.log
           if grep -q '^warning:' ci-output/st3215-full-tests.log; then
-            echo 'Rust warnings detected in V13 validation' >&2
+            echo 'Rust warnings detected in V18 validation' >&2
             exit 1
           fi
 
@@ -175,7 +194,7 @@ jobs:
           asset=software/station/clients/station-viewer/dist/index.html
           test ! -e "$asset"
           mkdir -p "$(dirname "$asset")"
-          printf '<!doctype html><title>MATDOG restart-safe V13 build gate</title>\n' > "$asset"
+          printf '<!doctype html><title>MATDOG restart-safe V18 build gate</title>\n' > "$asset"
 
       - name: Station release build
         shell: bash
@@ -186,7 +205,7 @@ jobs:
           strings target/release/station | grep -F 'move plan: M'
           strings target/release/station | grep -F 'timeout_ms='
           if grep -q '^warning:' ci-output/station-build.log; then
-            echo 'Rust warnings detected in V13 Station build' >&2
+            echo 'Rust warnings detected in V18 Station build' >&2
             exit 1
           fi
 
@@ -198,6 +217,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: matdog-restart-safe-v13-distance-aware-evidence
+          name: matdog-restart-safe-v18-probe-home-evidence
           path: ci-output/
           if-no-files-found: error
