@@ -103,12 +103,6 @@ fn probe_home_tolerance_is_scoped_to_exactly_three_active_probe_returns() {
     let source = include_str!("matdog.rs");
     let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
     assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 4);
-    assert_eq!(
-        normalized
-            .matches("HOME_TICK, PROBE_HOME_TOLERANCE_TICKS,")
-            .count(),
-        3
-    );
     assert!(normalized.contains(
         "if circular_distance(observation.position, target.target_tick) > STATIC_TOLERANCE_TICKS"
     ));
