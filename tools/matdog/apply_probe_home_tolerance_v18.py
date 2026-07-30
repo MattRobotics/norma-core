@@ -13,6 +13,33 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
+def replace_calls(
+    source: str,
+    motor_expr: str,
+    expected_count: int,
+    replacement_motor_expr: str,
+    label: str,
+) -> str:
+    pattern = re.compile(
+        r"self\.move_motor_to\(\s*"
+        + re.escape(motor_expr)
+        + r",\s*HOME_TICK,\s*STATIC_TOLERANCE_TICKS,?\s*\)"
+    )
+    matches = list(pattern.finditer(source))
+    if len(matches) != expected_count:
+        raise SystemExit(
+            f"{label}: expected {expected_count} calls, found {len(matches)}"
+        )
+    return pattern.sub(
+        "self.move_motor_to(\n"
+        f"            {replacement_motor_expr},\n"
+        "            HOME_TICK,\n"
+        "            PROBE_HOME_TOLERANCE_TICKS,\n"
+        "        )",
+        source,
+    )
+
+
 def main() -> None:
     if len(sys.argv) != 3:
         raise SystemExit(
@@ -43,25 +70,19 @@ def main() -> None:
         "probe-home tolerance constant",
     )
 
-    probe_home_call = re.compile(
-        r"self\.move_motor_to\(\s*"
-        r"self\.profile\.motor_id,\s*"
-        r"HOME_TICK,\s*"
-        r"STATIC_TOLERANCE_TICKS,?\s*"
-        r"\)"
-    )
-    matches = list(probe_home_call.finditer(source))
-    if len(matches) != 3:
-        raise SystemExit(
-            f"probe-home move call count: expected 3, found {len(matches)}"
-        )
-    source = probe_home_call.sub(
-        "self.move_motor_to(\n"
-        "            self.profile.motor_id,\n"
-        "            HOME_TICK,\n"
-        "            PROBE_HOME_TOLERANCE_TICKS,\n"
-        "        )",
+    source = replace_calls(
         source,
+        "self.profile.motor_id",
+        2,
+        "self.profile.motor_id",
+        "run probe-home calls",
+    )
+    source = replace_calls(
+        source,
+        "motor_id",
+        1,
+        "motor_id",
+        "baseline probe-home call",
     )
 
     test_anchor = """#[test]
