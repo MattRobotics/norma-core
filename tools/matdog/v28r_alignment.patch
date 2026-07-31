@@ -1,0 +1,244 @@
+--- a/software/drivers/st3215/src/auto_calibrate/matdog.rs
++++ b/software/drivers/st3215/src/auto_calibrate/matdog.rs
+@@ -38,6 +38,11 @@
+ // geometry-prerequisite load and gearbox backlash. Keep this tolerance
+ // separate so prerequisite drift and contact tracking remain at 10 ticks.
+ const PROBE_HOME_TOLERANCE_TICKS: u16 = 16;
++// A prerequisite observed at the digital-home endpoint may settle just beyond
++// the 10-tick static gate before torque is enabled. Widen only that startup
++// endpoint; the prerequisite target endpoint and all live hold checks remain
++// at STATIC_TOLERANCE_TICKS.
++const STARTUP_PREREQUISITE_HOME_SETTLE_TICKS: u16 = 16;
+ const STARTUP_HOME_RECOVERY_LIMIT_TICKS: u16 = 64;
+ const REPEATABILITY_TOLERANCE_TICKS: u16 = 16;
+ const BASELINE_MIN_SAMPLES: usize = 6;
+@@ -634,13 +639,43 @@
+     (low, high)
+ }
+ 
++fn startup_prerequisite_bounds(target_tick: u16) -> (u16, u16) {
++    if target_tick >= HOME_TICK {
++        (
++            HOME_TICK.saturating_sub(STARTUP_PREREQUISITE_HOME_SETTLE_TICKS),
++            target_tick
++                .saturating_add(STATIC_TOLERANCE_TICKS)
++                .min(protocol::MAX_ANGLE_STEP),
++        )
++    } else {
++        (
++            target_tick.saturating_sub(STATIC_TOLERANCE_TICKS),
++            HOME_TICK
++                .saturating_add(STARTUP_PREREQUISITE_HOME_SETTLE_TICKS)
++                .min(protocol::MAX_ANGLE_STEP),
++        )
++    }
++}
++
++fn home_hold_tolerance(
++    profile: &ContactProfile,
++    motor_id: u8,
++    probe_home_handoff_active: bool,
++) -> u16 {
++    if probe_home_handoff_active && motor_id == profile.motor_id {
++        PROBE_HOME_TOLERANCE_TICKS
++    } else {
++        STATIC_TOLERANCE_TICKS
++    }
++}
++
+ fn startup_envelope(profile: &ContactProfile, motor_id: u8) -> (u16, u16) {
+     match startup_role_for_profile(profile, motor_id) {
+         StartupRole::Probe => {
+             expanded_linear_bounds(HOME_TICK, profile.guard_tick, STATIC_TOLERANCE_TICKS)
+         }
+         StartupRole::Prerequisite { target_tick } if target_tick != HOME_TICK => {
+-            expanded_linear_bounds(HOME_TICK, target_tick, STATIC_TOLERANCE_TICKS)
++            startup_prerequisite_bounds(target_tick)
+         }
+         StartupRole::Prerequisite { .. } | StartupRole::HomeOnly => (
+             HOME_TICK.saturating_sub(STARTUP_HOME_RECOVERY_LIMIT_TICKS),
+@@ -1105,6 +1140,7 @@
+     current_step: u32,
+     total_steps: u32,
+     held_targets: Vec<StaticTarget>,
++    probe_home_handoff_active: bool,
+ }
+ 
+ impl MatdogRamOnlyCalibrator {
+@@ -1126,6 +1162,7 @@
+             current_step: 0,
+             total_steps: 0,
+             held_targets: Vec::new(),
++            probe_home_handoff_active: false,
+         }
+     }
+ 
+@@ -1173,9 +1210,11 @@
+             .await?;
+         self.set_motor_torque_verified(self.profile.motor_id, false)
+             .await?;
++        self.probe_home_handoff_active = true;
+ 
+         self.next_phase("Restore prerequisite joints one at a time")?;
+         self.restore_prerequisites().await?;
++        self.probe_home_handoff_active = false;
+ 
+         self.next_phase("Final verified global torque OFF")?;
+ 
+@@ -1903,10 +1942,15 @@
+                 if observation.has_driver_error || observation.status != 0 {
+                     return Err(format!("non-active M{motor_id} became unhealthy").into());
+                 }
+-                if circular_distance(observation.position, HOME_TICK) > STATIC_TOLERANCE_TICKS {
++                let tolerance = home_hold_tolerance(
++                    &self.profile,
++                    motor_id,
++                    self.probe_home_handoff_active,
++                );
++                if circular_distance(observation.position, HOME_TICK) > tolerance {
+                     return Err(format!(
+                         "non-active M{motor_id} left home: present={}, expected={}, tolerance={}",
+-                        observation.position, HOME_TICK, STATIC_TOLERANCE_TICKS
++                        observation.position, HOME_TICK, tolerance
+                     )
+                     .into());
+                 }
+--- a/software/drivers/st3215/src/auto_calibrate/matdog_test.rs
++++ b/software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+@@ -424,6 +424,21 @@
+ }
+ 
+ #[test]
++fn startup_prerequisite_home_endpoint_accepts_observed_m42_2037_without_weakening_target() {
++    let profile = profile_for_arm_value("LF_LOWER_M11_MIN").unwrap();
++    let observed = 2037;
++    let observed_error = circular_distance(observed, HOME_TICK);
++    assert_eq!(observed_error, 11);
++    assert_eq!(STATIC_TOLERANCE_TICKS, 10);
++    assert_eq!(STARTUP_PREREQUISITE_HOME_SETTLE_TICKS, 16);
++    assert!(observed_error > STATIC_TOLERANCE_TICKS);
++    assert!(observed_error <= STARTUP_PREREQUISITE_HOME_SETTLE_TICKS);
++    assert_eq!(startup_envelope(&profile, 42), (2032, 2399));
++    assert!(startup_position_allowed(&profile, 42, observed));
++    assert!(!startup_position_allowed(&profile, 42, 2400));
++}
++
++#[test]
+ fn startup_wrong_profile_residue_is_rejected() {
+     let profile = profile_for_arm_value("LF_UPPER_M12_MAX").unwrap();
+     assert_eq!(
+@@ -450,7 +465,7 @@
+                     expanded_linear_bounds(HOME_TICK, profile.guard_tick, STATIC_TOLERANCE_TICKS)
+                 }
+                 StartupRole::Prerequisite { target_tick } if target_tick != HOME_TICK => {
+-                    expanded_linear_bounds(HOME_TICK, target_tick, STATIC_TOLERANCE_TICKS)
++                    startup_prerequisite_bounds(target_tick)
+                 }
+                 StartupRole::Prerequisite { .. } | StartupRole::HomeOnly => (
+                     HOME_TICK.saturating_sub(STARTUP_HOME_RECOVERY_LIMIT_TICKS),
+@@ -574,7 +589,7 @@
+ fn probe_home_tolerance_is_scoped_to_exactly_three_active_probe_returns() {
+     let source = include_str!("matdog.rs");
+     let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+-    assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 4);
++    assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 5);
+     assert!(normalized.contains(
+         "if circular_distance(observation.position, target.target_tick) > STATIC_TOLERANCE_TICKS"
+     ));
+@@ -583,6 +598,18 @@
+ }
+ 
+ #[test]
++fn probe_home_handoff_accepts_observed_m11_2062_only_for_probe() {
++    let profile = profile_for_arm_value("LF_LOWER_M11_MIN").unwrap();
++    let observed_error = circular_distance(2062, HOME_TICK);
++    assert_eq!(observed_error, 14);
++    assert!(observed_error > STATIC_TOLERANCE_TICKS);
++    assert!(observed_error <= PROBE_HOME_TOLERANCE_TICKS);
++    assert_eq!(home_hold_tolerance(&profile, 11, true), 16);
++    assert_eq!(home_hold_tolerance(&profile, 11, false), 10);
++    assert_eq!(home_hold_tolerance(&profile, 21, true), 10);
++}
++
++#[test]
+ fn robust_current_baseline_uses_median_and_mad() {
+     let baseline = BaselineStats::from_samples(&[10, 11, 10, 12, 10, 90]).unwrap();
+     assert_eq!(baseline.median_current, 11);
+--- a/software/station/clients/station-viewer/src/pages/St3215BusCalibrationPage.tsx
++++ b/software/station/clients/station-viewer/src/pages/St3215BusCalibrationPage.tsx
+@@ -9,6 +9,7 @@
+ import { supportsSt3215Device } from '@/devices/registry';
+ 
+ const MIN_CALIBRATED_RANGE = 100;
++const MATDOG_MOTOR_IDS = [11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43];
+ const actionButtonClasses = 'inline-flex w-full shrink-0 items-center justify-center whitespace-nowrap rounded-lg px-4 py-2 text-sm font-bold transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto md:px-6 md:py-3 md:text-base';
+ const wideActionButtonClasses = `${actionButtonClasses} sm:min-w-[13.5rem]`;
+ 
+@@ -53,6 +54,10 @@
+   const currentBusState = selectedBus
+     ? inferenceState?.st3215?.data.buses?.find((b: st3215.InferenceState.IBusState) => b.bus?.serialNumber === selectedBus.bus?.serialNumber) || selectedBus
+     : null;
++  const currentMotorIds = currentBusState?.motors?.map((motor) => motor.id).sort((a, b) => (a ?? 0) - (b ?? 0)) ?? [];
++  const isMatdogBus = currentMotorIds.length === MATDOG_MOTOR_IDS.length
++    && currentMotorIds.every((id, index) => id === MATDOG_MOTOR_IDS[index]);
++  const hasClassifiedMotorSet = currentMotorIds.length > 0;
+   const isCalibrationFrozen = currentBusState?.motors?.some((motor: st3215.InferenceState.IMotorState) => motor.rangeFreezed) ?? false;
+   const [showResetConfirmation, setShowResetConfirmation] = useState(isCalibrationFrozen);
+   const getMotorRange = (motor: st3215.InferenceState.IMotorState) => {
+@@ -64,11 +69,11 @@
+     (motor: st3215.InferenceState.IMotorState) => getMotorRange(motor) < MIN_CALIBRATED_RANGE
+   ) ?? [];
+   const allMotorsNarrow = motorsWithNarrowRange.length === (currentBusState?.motors?.length ?? 0);
+-  const showMoveOverlay = !isCalibrationFrozen && !showResetConfirmation && allMotorsNarrow;
++  const showMoveOverlay = !isMatdogBus && !isCalibrationFrozen && !showResetConfirmation && allMotorsNarrow;
+ 
+   const calibrationState = currentBusState?.autoCalibration;
+   const isCalibrating = calibrationState?.status === st3215.AutoCalibrationState.Status.IN_PROGRESS;
+-  const hasValidMotors = currentBusState ? supportsSt3215Device(currentBusState) : false;
++  const hasValidMotors = currentBusState ? supportsSt3215Device(currentBusState) || isMatdogBus : false;
+   const isSupportedRobot = hasValidMotors;
+ 
+   // Check voltage across all motors (voltage is in 0.1V units, so 70 = 7.0V)
+@@ -96,10 +101,10 @@
+   // Send reset command when the calibration page opens
+   useEffect(() => {
+     const busSerial = selectedBus?.bus?.serialNumber;
+-    if (!busSerial) return;
++    if (!busSerial || !hasClassifiedMotorSet || isMatdogBus) return;
+     resetCalibration(busSerial);
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+-  }, [selectedBus?.bus?.serialNumber]);
++  }, [selectedBus?.bus?.serialNumber, hasClassifiedMotorSet, isMatdogBus]);
+ 
+   useEffect(() => {
+     if (isSavePending && isCalibrationFrozen) {
+@@ -160,7 +165,7 @@
+     const renderResetButton = () => (
+       <button
+         onClick={() => setShowResetConfirmation(true)}
+-        disabled={!hasValidMotors}
++        disabled={!hasValidMotors || isMatdogBus}
+         className={`${actionButtonClasses} bg-accent-critical-bg text-text-primary hover:bg-accent-critical-bg active:scale-95`}
+       >
+         Reset
+@@ -206,7 +211,7 @@
+       return (
+         <button
+           onClick={handleFreeze}
+-          disabled={!hasValidMotors || isSavePending}
++          disabled={!hasValidMotors || isSavePending || isMatdogBus}
+           className={`${actionButtonClasses} bg-accent-info-bg text-text-primary shadow-lg shadow-accent-info-deep/30 hover:bg-accent-info-deep hover:scale-105 active:scale-95`}
+         >
+           {isSavePending ? <ButtonLoadingLabel label="Saving..." /> : 'Save'}
+@@ -251,6 +256,11 @@
+                 {renderSaveButton()}
+               </div>
+             </div>
++            {isMatdogBus && (
++              <div className="px-4 py-2 bg-accent-data/10 border border-accent-data rounded text-accent-data">
++                MATDOG native mode: Auto Calibrate only. Reset and Save are disabled.
++              </div>
++            )}
+             {!hasValidMotors && (
+               <div className="px-4 py-2 bg-accent-warning/10 border border-accent-warning-deep rounded text-accent-warning">
+                 Power disconnected or motors not detected. Calibration is unavailable.
