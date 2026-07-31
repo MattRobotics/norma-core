@@ -1,9 +1,9 @@
-name: MATDOG Ordered UPPER LOWER HIP V20
+name: MATDOG LF LOWER M11 MIN V28R Source CI
 
 on:
   push:
     branches:
-      - matdog/ordered-upper-lower-hip-v20
+      - matdog/lf-lower-m11-min-v28r-alignment
   pull_request:
     branches:
       - main
@@ -13,15 +13,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: matdog-ordered-v20-${{ github.event.pull_request.number || github.ref }}
+  group: matdog-v28r-source-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   offline-validation:
-    name: Ordered profiles, zero warnings, full tests, Station build
+    name: 87 tests, viewer, Station, RAM-only audit
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout exact V20 head
+      - name: Checkout exact draft head
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -38,17 +38,27 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Install Station build dependency
-        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: software/station/clients/station-viewer/package-lock.json
 
-      - name: Run reusable V20 validation
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm
+          npm install --global npm@11
+
+      - name: Run independent V28R validation
         shell: bash
-        run: bash tools/matdog/run_ordered_v20_ci.sh
+        run: bash tools/matdog/run_v28r_alignment_ci.sh
 
-      - name: Upload V20 evidence
+      - name: Upload V28R CI evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: matdog-ordered-upper-lower-hip-v20-evidence
-          path: ci-output/
+          name: matdog-lf-lower-m11-min-v28r-source-ci
+          path: ci-output-v28r/
           if-no-files-found: error
