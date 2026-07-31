@@ -1,9 +1,9 @@
-name: MATDOG Restart-Safe V18 Validation
+name: MATDOG Ordered UPPER LOWER HIP V20
 
 on:
   push:
     branches:
-      - matdog/restart-safe-profile-entry-v11
+      - matdog/ordered-upper-lower-hip-v20
   pull_request:
     branches:
       - main
@@ -12,33 +12,35 @@ on:
       - "tools/matdog/restart_safe_v11_bundle.part*.b64"
       - "tools/matdog/apply_motion_timeout_v13.py"
       - "tools/matdog/apply_probe_home_tolerance_v18.py"
+      - "tools/matdog/apply_ordered_sequence_v20.py"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: matdog-restart-safe-v18-${{ github.event.pull_request.number || github.ref }}
+  group: matdog-ordered-v20-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   offline-validation:
-    name: Restart-safe, distance-aware, probe-home tolerance, Station build
+    name: Ordered profiles, early-stall gate, full tests, Station build
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout isolated validation branch head
+      - name: Checkout isolated V20 branch head
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
-      - name: Verify canonical base ancestry and scope
+      - name: Verify canonical ancestry and exact branch scope
         shell: bash
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a HEAD
-          actual="$(git diff --name-only 32e3222c87016b7f5d7c1c1da497a4cea3e7b80a...HEAD | sort)"
-          expected=$'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/apply_motion_timeout_v13.py\ntools/matdog/apply_probe_home_tolerance_v18.py\ntools/matdog/restart_safe_v11_bundle.part00.b64\ntools/matdog/restart_safe_v11_bundle.part01.b64\ntools/matdog/restart_safe_v11_bundle.part02.b64\ntools/matdog/restart_safe_v11_bundle.part03.b64'
+          base=32e3222c87016b7f5d7c1c1da497a4cea3e7b80a
+          git merge-base --is-ancestor "$base" HEAD
+          actual="$(git diff --name-only "$base"...HEAD | sort)"
+          expected=$'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/apply_motion_timeout_v13.py\ntools/matdog/apply_ordered_sequence_v20.py\ntools/matdog/apply_probe_home_tolerance_v18.py\ntools/matdog/restart_safe_v11_bundle.part00.b64\ntools/matdog/restart_safe_v11_bundle.part01.b64\ntools/matdog/restart_safe_v11_bundle.part02.b64\ntools/matdog/restart_safe_v11_bundle.part03.b64'
           printf 'head=%s\nchanged_files:\n%s\n' "$(git rev-parse HEAD)" "$actual"
           test "$actual" = "$expected"
 
@@ -56,7 +58,7 @@ jobs:
       - name: Install Station native build dependency
         run: sudo apt-get update && sudo apt-get install -y nasm
 
-      - name: Decode immutable V11 validation bundle
+      - name: Decode immutable V11 bundle and compile transformers
         shell: bash
         run: |
           set -euo pipefail
@@ -70,121 +72,146 @@ jobs:
           for path, offset, observed, expected in fixes:
               text = ''.join(path.read_text().split())
               assert text[offset] == observed, (path, offset, text[offset], observed)
-              text = text[:offset] + expected + text[offset + 1:]
-              path.write_text(text)
+              path.write_text(text[:offset] + expected + text[offset + 1:])
           PY
-          cat tools/matdog/restart_safe_v11_bundle.part*.b64 | base64 -d > ci-output/restart_safe_v11_bundle.tar.gz
-          echo 'dc424847dcc8c7e7ccf39c9b607b3d58d3efa3555996de67a06a2c3441b63118  ci-output/restart_safe_v11_bundle.tar.gz' | sha256sum -c -
+          cat tools/matdog/restart_safe_v11_bundle.part*.b64 | base64 -d \
+            > ci-output/restart_safe_v11_bundle.tar.gz
+          echo 'dc424847dcc8c7e7ccf39c9b607b3d58d3efa3555996de67a06a2c3441b63118  ci-output/restart_safe_v11_bundle.tar.gz' \
+            | sha256sum -c -
           tar -xzf ci-output/restart_safe_v11_bundle.tar.gz -C ci-tools
-          python3 -m py_compile ci-tools/apply_restart_safe_v11.py ci-tools/audit_restart_safe_v11.py ci-tools/replay_restart_safe_v11.py tools/matdog/apply_motion_timeout_v13.py tools/matdog/apply_probe_home_tolerance_v18.py
+          python3 -m py_compile \
+            ci-tools/apply_restart_safe_v11.py \
+            ci-tools/audit_restart_safe_v11.py \
+            ci-tools/replay_restart_safe_v11.py \
+            tools/matdog/apply_motion_timeout_v13.py \
+            tools/matdog/apply_probe_home_tolerance_v18.py \
+            tools/matdog/apply_ordered_sequence_v20.py
 
-      - name: Apply restart-safe V11 foundation
+      - name: Apply validated V11, V13, and V18 foundation
         shell: bash
         run: |
           set -o pipefail
-          python3 ci-tools/apply_restart_safe_v11.py \
-            software/drivers/st3215/src/auto_calibrate/matdog.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
-            software/drivers/st3215/src/port.rs \
+          source=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          port=software/drivers/st3215/src/port.rs
+          python3 ci-tools/apply_restart_safe_v11.py "$source" "$tests" "$port" \
             2>&1 | tee ci-output/apply-v11.log
-
-      - name: Apply distance-aware V13 deadline patch
-        shell: bash
-        run: |
-          set -o pipefail
-          python3 tools/matdog/apply_motion_timeout_v13.py \
-            software/drivers/st3215/src/auto_calibrate/matdog.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+          python3 tools/matdog/apply_motion_timeout_v13.py "$source" "$tests" \
             2>&1 | tee ci-output/apply-v13.log
-          grep -q 'motion_timeout_for_distance' software/drivers/st3215/src/auto_calibrate/matdog.rs
-          test "$(grep -c 'let deadline = Instant::now() + motion_timeout;' software/drivers/st3215/src/auto_calibrate/matdog.rs)" = 2
+          python3 tools/matdog/apply_probe_home_tolerance_v18.py "$source" "$tests" \
+            2>&1 | tee ci-output/apply-v18.log
 
-      - name: Apply probe-home settle tolerance V18
+      - name: Apply ordered UPPER LOWER HIP V20
         shell: bash
         run: |
           set -o pipefail
-          python3 tools/matdog/apply_probe_home_tolerance_v18.py \
-            software/drivers/st3215/src/auto_calibrate/matdog.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
-            2>&1 | tee ci-output/apply-v18.log
-          grep -q 'const PROBE_HOME_TOLERANCE_TICKS: u16 = 16;' software/drivers/st3215/src/auto_calibrate/matdog.rs
-          test "$(grep -c 'PROBE_HOME_TOLERANCE_TICKS' software/drivers/st3215/src/auto_calibrate/matdog.rs)" = 4
+          source=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          python3 tools/matdog/apply_ordered_sequence_v20.py "$source" "$tests" \
+            2>&1 | tee ci-output/apply-v20.log
+          grep -q 'const UPPER_85_DELTA: i16 = 967;' "$source"
+          grep -q 'const LOWER_FOLDED_DELTA: i16 = -990;' "$source"
+          grep -q 'ContactState::EarlyStall' "$source"
+          grep -q 'HIP hardware is blocked until ordered UPPER MIN/MAX and LOWER MIN/MAX phase proof is verified' "$source"
 
-      - name: Audit and format patched sources
+      - name: Restart-safe audit, rustfmt, and changed-source scope
         shell: bash
         run: |
           set -euo pipefail
           source=software/drivers/st3215/src/auto_calibrate/matdog.rs
           tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
           port=software/drivers/st3215/src/port.rs
-          python3 ci-tools/audit_restart_safe_v11.py "$source" "$tests" "$port" | tee ci-output/restart-safe-audit.log
+          python3 ci-tools/audit_restart_safe_v11.py "$source" "$tests" "$port" \
+            | tee ci-output/restart-safe-audit.log
           rustfmt --edition 2021 "$source" "$tests" "$port"
           git diff --check
           actual="$(git diff --name-only | grep '^software/' | sort)"
           expected=$'software/drivers/st3215/src/auto_calibrate/matdog.rs\nsoftware/drivers/st3215/src/auto_calibrate/matdog_test.rs\nsoftware/drivers/st3215/src/port.rs'
           test "$actual" = "$expected"
 
-      - name: Enforce RAM-only and scoped tolerance contract
+      - name: Enforce ordered RAM-only safety contract
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY' | tee ci-output/ram-only-contract.log
+          python3 - <<'PY' | tee ci-output/ordered-contract.log
           from pathlib import Path
           source = Path('software/drivers/st3215/src/auto_calibrate/matdog.rs').read_text()
+          tests = Path('software/drivers/st3215/src/auto_calibrate/matdog_test.rs').read_text()
           forbidden = (
-              'EepromRegister', 'RamRegister::Lock', 'ST3215Request::',
-              'reg_write: Some', 'reset: Some', 'reset_calibration: Some',
+              'EepromRegister', 'RamRegister::Lock', 'reg_write: Some',
+              'reset: Some', 'reset_calibration: Some',
               'freeze_calibration: Some', 'action: Some', 'Offset.address',
           )
-          found = [token for token in forbidden if token in source]
           required = (
               'Inspect restart-safe profile entry',
-              'restart-safe profile entry refused before motion',
-              'establish_prerequisites_restart_safe',
-              'verify_profile_entry_holds_except',
               'motion_timeout_for_distance',
-              'MIN_EXPECTED_MOTION_TICKS_PER_SECOND',
-              'move plan: M{} start={} target={} distance={} timeout_ms={}',
-              'const STATIC_TOLERANCE_TICKS: u16 = 10;',
               'const PROBE_HOME_TOLERANCE_TICKS: u16 = 16;',
+              'for joint in [JointKind::Upper, JointKind::Lower, JointKind::Hip]',
+              'const UPPER_85_DELTA: i16 = 967;',
+              'const LOWER_FOLDED_DELTA: i16 = -990;',
+              'contact_acceptance_bounds',
+              'ContactState::EarlyStall',
+              'early stall outside model contact corridor',
+              'HIP_HARDWARE_BLOCK_REASON',
               'global_torque_off_verified',
           )
+          found = [token for token in forbidden if token in source]
           missing = [token for token in required if token not in source]
+          test_required = (
+              'ordered_profile_table_lists_upper_then_lower_then_hip',
+              'lf_lower_profiles_use_horizontal_upper_and_exact_unsigned_numbers',
+              'hip_prerequisites_are_compact_and_side_specific',
+              'isolated_hip_hardware_profiles_are_blocked_but_lower_is_allowed',
+              'v19_m13_2405_is_early_stall_not_contact',
+          )
+          missing_tests = [token for token in test_required if token not in tests]
           if source.count('PROBE_HOME_TOLERANCE_TICKS') != 4:
-              raise SystemExit('probe-home tolerance is not scoped to constant plus three calls')
-          if found or missing:
-              raise SystemExit(f'forbidden={found} missing={missing}')
-          print('RAM-only restart-safe distance-aware scoped-tolerance contract: PASS')
+              raise SystemExit('probe-home tolerance scope changed')
+          if found or missing or missing_tests:
+              raise SystemExit(
+                  f'forbidden={found} missing={missing} missing_tests={missing_tests}'
+              )
+          print('ordered RAM-only contract: PASS')
           PY
 
-      - name: Targeted restart-safe, timeout, and M13 regressions
+      - name: Targeted V20 regressions
         shell: bash
         run: |
           set -o pipefail
-          cargo test --package st3215 startup_ -- --nocapture 2>&1 | tee ci-output/targeted-regressions.log
-          cargo test --package st3215 profile_entry_order_is_restart_safe_and_probe_lifecycle_is_strict -- --nocapture 2>&1 | tee -a ci-output/targeted-regressions.log
-          cargo test --package st3215 motion_timeout_ -- --nocapture 2>&1 | tee -a ci-output/targeted-regressions.log
-          cargo test --package st3215 probe_home_tolerance_ -- --nocapture 2>&1 | tee -a ci-output/targeted-regressions.log
-          grep -q 'startup_v10_pose_classifies_m42_as_valid_prerequisite_residue ... ok' ci-output/targeted-regressions.log
-          grep -q 'startup_envelopes_match_exhaustive_oracle_for_all_profiles_and_ticks ... ok' ci-output/targeted-regressions.log
-          grep -q 'motion_timeout_covers_observed_m12_max_return ... ok' ci-output/targeted-regressions.log
-          grep -q 'motion_timeout_keeps_short_moves_fast_and_scales_for_every_profile ... ok' ci-output/targeted-regressions.log
-          grep -q 'probe_home_tolerance_covers_observed_m13_settle_without_weakening_static_gate ... ok' ci-output/targeted-regressions.log
-          grep -q 'probe_home_tolerance_is_scoped_to_exactly_three_active_probe_returns ... ok' ci-output/targeted-regressions.log
+          log=ci-output/targeted-v20.log
+          cargo test --package st3215 ordered_profile_table_ -- --nocapture 2>&1 | tee "$log"
+          cargo test --package st3215 lf_lower_profiles_ -- --nocapture 2>&1 | tee -a "$log"
+          cargo test --package st3215 hip_prerequisites_ -- --nocapture 2>&1 | tee -a "$log"
+          cargo test --package st3215 isolated_hip_ -- --nocapture 2>&1 | tee -a "$log"
+          cargo test --package st3215 contact_acceptance_ -- --nocapture 2>&1 | tee -a "$log"
+          cargo test --package st3215 v19_m13_ -- --nocapture 2>&1 | tee -a "$log"
+          cargo test --package st3215 detector_confirms_only_ -- --nocapture 2>&1 | tee -a "$log"
+          cargo test --package st3215 startup_ -- --nocapture 2>&1 | tee -a "$log"
+          cargo test --package st3215 motion_timeout_ -- --nocapture 2>&1 | tee -a "$log"
+          cargo test --package st3215 probe_home_tolerance_ -- --nocapture 2>&1 | tee -a "$log"
+          for token in \
+            'ordered_profile_table_lists_upper_then_lower_then_hip ... ok' \
+            'lf_lower_profiles_use_horizontal_upper_and_exact_unsigned_numbers ... ok' \
+            'hip_prerequisites_are_compact_and_side_specific ... ok' \
+            'isolated_hip_hardware_profiles_are_blocked_but_lower_is_allowed ... ok' \
+            'contact_acceptance_corridors_match_model_inner_boundary_and_guard ... ok' \
+            'v19_m13_2405_is_early_stall_not_contact ... ok' \
+            'detector_confirms_only_persistent_stall_inside_profile_corridor ... ok'; do
+            grep -q "$token" "$log"
+          done
 
-      - name: Full ST3215 test suite
+      - name: Full ST3215 suite
         shell: bash
         run: |
           set -o pipefail
           cargo test --package st3215 2>&1 | tee ci-output/st3215-full-tests.log
-          grep -q '79 passed; 0 failed' ci-output/st3215-full-tests.log
+          grep -q '85 passed; 0 failed' ci-output/st3215-full-tests.log
           if grep -q '^warning:' ci-output/st3215-full-tests.log; then
-            echo 'Rust warnings detected in V18 validation' >&2
+            echo 'Rust warnings detected in V20 tests' >&2
             exit 1
           fi
 
       - name: Deterministic restart-state replay
-        shell: bash
         run: python3 ci-tools/replay_restart_safe_v11.py | tee ci-output/restart-safe-replay.log
 
       - name: Create CI-only Station viewer stub
@@ -194,7 +221,7 @@ jobs:
           asset=software/station/clients/station-viewer/dist/index.html
           test ! -e "$asset"
           mkdir -p "$(dirname "$asset")"
-          printf '<!doctype html><title>MATDOG restart-safe V18 build gate</title>\n' > "$asset"
+          printf '<!doctype html><title>MATDOG ordered V20 build gate</title>\n' > "$asset"
 
       - name: Station release build
         shell: bash
@@ -202,10 +229,10 @@ jobs:
           set -o pipefail
           cargo build --release --package station 2>&1 | tee ci-output/station-build.log
           strings target/release/station | grep -F 'Inspect restart-safe profile entry'
-          strings target/release/station | grep -F 'move plan: M'
-          strings target/release/station | grep -F 'timeout_ms='
+          strings target/release/station | grep -F 'early stall outside model contact corridor'
+          strings target/release/station | grep -F 'HIP hardware is blocked until ordered UPPER MIN/MAX and LOWER MIN/MAX phase proof is verified'
           if grep -q '^warning:' ci-output/station-build.log; then
-            echo 'Rust warnings detected in V18 Station build' >&2
+            echo 'Rust warnings detected in V20 Station build' >&2
             exit 1
           fi
 
@@ -213,10 +240,10 @@ jobs:
         if: always()
         run: rm -rf software/station/clients/station-viewer/dist
 
-      - name: Upload validation evidence
+      - name: Upload V20 evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: matdog-restart-safe-v18-probe-home-evidence
+          name: matdog-ordered-upper-lower-hip-v20-evidence
           path: ci-output/
           if-no-files-found: error
