@@ -1,0 +1,78 @@
+name: MATDOG Materialize V20 Source
+
+on:
+  push:
+    branches:
+      - matdog/lf-lower-m11-min-v28r-alignment
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  materialize:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact branch head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decode immutable V11 bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-tools materialized-source
+          python3 - <<'PY'
+          from pathlib import Path
+          fixes = (
+              (Path('tools/matdog/restart_safe_v11_bundle.part00.b64'), 3068, 'U', 'c'),
+              (Path('tools/matdog/restart_safe_v11_bundle.part02.b64'), 3243, 'a', 'i'),
+          )
+          for path, offset, observed, expected in fixes:
+              text = ''.join(path.read_text().split())
+              assert text[offset] == observed, (path, offset, text[offset], observed)
+              path.write_text(text[:offset] + expected + text[offset + 1:])
+          PY
+          cat tools/matdog/restart_safe_v11_bundle.part*.b64 | base64 -d > /tmp/v11.tar.gz
+          echo 'dc424847dcc8c7e7ccf39c9b607b3d58d3efa3555996de67a06a2c3441b63118  /tmp/v11.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/v11.tar.gz -C ci-tools
+
+      - name: Apply validated V11 V13 V18 V20 chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          port=software/drivers/st3215/src/port.rs
+          python3 ci-tools/apply_restart_safe_v11.py "$source" "$tests" "$port"
+          python3 tools/matdog/apply_motion_timeout_v13.py "$source" "$tests"
+          python3 tools/matdog/apply_probe_home_tolerance_v18.py "$source" "$tests"
+          python3 tools/matdog/apply_ordered_sequence_v20.py "$source" "$tests"
+          python3 tools/matdog/fix_ordered_sequence_v20_quote.py "$source"
+          python3 tools/matdog/clean_ordered_sequence_v20_warnings.py "$source"
+          rustfmt --edition 2021 "$source" "$tests" "$port"
+          git diff --check
+
+      - name: Package exact materialized inspection source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p materialized-source/software/drivers/st3215/src/auto_calibrate
+          mkdir -p materialized-source/software/drivers/st3215/src
+          mkdir -p materialized-source/software/station/clients/station-viewer
+          cp software/drivers/st3215/src/auto_calibrate/matdog.rs materialized-source/software/drivers/st3215/src/auto_calibrate/
+          cp software/drivers/st3215/src/auto_calibrate/matdog_test.rs materialized-source/software/drivers/st3215/src/auto_calibrate/
+          cp software/drivers/st3215/src/port.rs materialized-source/software/drivers/st3215/src/
+          cp -a software/station/clients/station-viewer/src materialized-source/software/station/clients/station-viewer/
+          find materialized-source -type f -print0 | sort -z | xargs -0 sha256sum > materialized-source/SHA256SUMS
+          printf 'base=%s\nhead=%s\nhardware_started=false\nserial_opened=false\n' \
+            32e3222c87016b7f5d7c1c1da497a4cea3e7b80a "$(git rev-parse HEAD)" \
+            > materialized-source/PROVENANCE.env
+
+      - name: Upload exact materialized source
+        uses: actions/upload-artifact@v4
+        with:
+          name: matdog-v20-materialized-source
+          path: materialized-source/
+          if-no-files-found: error
