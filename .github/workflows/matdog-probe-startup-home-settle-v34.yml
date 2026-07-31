@@ -41,11 +41,23 @@ jobs:
           grep -Fq 'assert_eq!(startup_envelope(&profile, 11), (1547, 2064));' software/drivers/st3215/src/auto_calibrate/matdog_test.rs
           grep -Fq 'assert!(!startup_position_allowed(&profile, 11, 1546));' software/drivers/st3215/src/auto_calibrate/matdog_test.rs
 
-      - name: Rust format and ST3215 tests
+      - name: Format generated sources and recheck exact scope
         shell: bash
         run: |
           set -euo pipefail
+          cargo fmt --all
           cargo fmt --all -- --check
+          changed=$(git diff --name-only | sort)
+          expected=$(printf '%s\n' \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs | sort)
+          test "$changed" = "$expected"
+          git diff --check
+
+      - name: Run complete ST3215 test suite
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test --package st3215
 
       - name: Build Station viewer
