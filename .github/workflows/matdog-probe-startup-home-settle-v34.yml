@@ -1,0 +1,112 @@
+name: MATDOG Probe Startup Home Settle V34
+
+on:
+  push:
+    branches:
+      - matdog/lf-lower-m11-min-v28r-alignment
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scoped-probe-home-settle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify transformation source and base blobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object software/drivers/st3215/src/auto_calibrate/matdog.rs)" = b286e309728e2cb49b397d130507d293cd7b03b2
+          test "$(git hash-object software/drivers/st3215/src/auto_calibrate/matdog_test.rs)" = 4d3f44f237722c46661e33992a0da5846bf225d4
+          python3 -m py_compile tools/matdog/apply_probe_startup_home_settle_v34.py
+
+      - name: Apply exact V34 correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/matdog/apply_probe_startup_home_settle_v34.py
+          changed=$(git diff --name-only | sort)
+          expected=$(printf '%s\n' \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs | sort)
+          test "$changed" = "$expected"
+          git diff --check
+          grep -Fq 'StartupRole::Probe => startup_probe_bounds(profile)' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -Fq 'assert_eq!(startup_envelope(&profile, 11), (1547, 2064));' software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          grep -Fq 'assert!(!startup_position_allowed(&profile, 11, 1546));' software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+
+      - name: Rust format and ST3215 tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo test --package st3215
+
+      - name: Build Station viewer
+        working-directory: software/station/clients/station-viewer
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Build Station release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --package station
+
+      - name: Enforce permanent MATDOG constraints
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          ! grep -Fq 'EepromRegister' "$src"
+          ! grep -Fq 'RamRegister::Lock' "$src"
+          ! grep -Fq 'reg_write: Some' "$src"
+          ! grep -Fq 'reset: Some' "$src"
+          ! grep -Fq 'reset_calibration: Some' "$src"
+          ! grep -Fq 'freeze_calibration: Some' "$src"
+          ! grep -Fq 'action: Some' "$src"
+          grep -Fq 'HIP hardware is blocked' "$src"
+          grep -Fq 'unsigned GoalPosition out of range' "$src"
+          grep -Fq 'profile.guard_tick.saturating_sub(STATIC_TOLERANCE_TICKS)' "$src"
+          grep -Fq 'HOME_TICK' "$src"
+
+      - name: Publish transformed source hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-output
+          sha256sum \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            software/station/clients/station-viewer/dist/assets/* \
+            target/release/station \
+            > ci-output/SHA256SUMS
+          cat > ci-output/SUMMARY.env <<'EOF'
+          result=PASS
+          correction=V34_PROBE_STARTUP_HOME_ENDPOINT
+          observed_probe_position=2059
+          old_probe_envelope=1547..2058
+          new_probe_envelope=1547..2064
+          guard_side_unchanged=true
+          contact_corridor_unchanged=true
+          ram_only=true
+          goal_position_unsigned=true
+          hip_profiles_blocked=true
+          hardware_started=false
+          serial_opened=false
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matdog-probe-startup-home-settle-v34
+          path: ci-output/
+          if-no-files-found: error
