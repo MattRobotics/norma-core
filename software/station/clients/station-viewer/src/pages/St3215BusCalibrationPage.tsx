@@ -9,6 +9,7 @@ import { getMotorVoltage } from '../st3215/motor-parser';
 import { supportsSt3215Device } from '@/devices/registry';
 
 const MIN_CALIBRATED_RANGE = 100;
+const MATDOG_MOTOR_IDS = [11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43];
 const actionButtonClasses = 'inline-flex w-full shrink-0 items-center justify-center whitespace-nowrap rounded-lg px-4 py-2 text-sm font-bold transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto md:px-6 md:py-3 md:text-base';
 const wideActionButtonClasses = `${actionButtonClasses} sm:min-w-[13.5rem]`;
 
@@ -53,6 +54,10 @@ const St3215BusCalibrationPage: React.FC = () => {
   const currentBusState = selectedBus
     ? inferenceState?.st3215?.data.buses?.find((b: st3215.InferenceState.IBusState) => b.bus?.serialNumber === selectedBus.bus?.serialNumber) || selectedBus
     : null;
+  const currentMotorIds = currentBusState?.motors?.map((motor) => motor.id).sort((a, b) => (a ?? 0) - (b ?? 0)) ?? [];
+  const isMatdogBus = currentMotorIds.length === MATDOG_MOTOR_IDS.length
+    && currentMotorIds.every((id, index) => id === MATDOG_MOTOR_IDS[index]);
+  const hasClassifiedMotorSet = currentMotorIds.length > 0;
   const isCalibrationFrozen = currentBusState?.motors?.some((motor: st3215.InferenceState.IMotorState) => motor.rangeFreezed) ?? false;
   const [showResetConfirmation, setShowResetConfirmation] = useState(isCalibrationFrozen);
   const getMotorRange = (motor: st3215.InferenceState.IMotorState) => {
@@ -64,11 +69,11 @@ const St3215BusCalibrationPage: React.FC = () => {
     (motor: st3215.InferenceState.IMotorState) => getMotorRange(motor) < MIN_CALIBRATED_RANGE
   ) ?? [];
   const allMotorsNarrow = motorsWithNarrowRange.length === (currentBusState?.motors?.length ?? 0);
-  const showMoveOverlay = !isCalibrationFrozen && !showResetConfirmation && allMotorsNarrow;
+  const showMoveOverlay = !isMatdogBus && !isCalibrationFrozen && !showResetConfirmation && allMotorsNarrow;
 
   const calibrationState = currentBusState?.autoCalibration;
   const isCalibrating = calibrationState?.status === st3215.AutoCalibrationState.Status.IN_PROGRESS;
-  const hasValidMotors = currentBusState ? supportsSt3215Device(currentBusState) : false;
+  const hasValidMotors = currentBusState ? supportsSt3215Device(currentBusState) || isMatdogBus : false;
   const isSupportedRobot = hasValidMotors;
 
   // Check voltage across all motors (voltage is in 0.1V units, so 70 = 7.0V)
@@ -96,10 +101,10 @@ const St3215BusCalibrationPage: React.FC = () => {
   // Send reset command when the calibration page opens
   useEffect(() => {
     const busSerial = selectedBus?.bus?.serialNumber;
-    if (!busSerial) return;
+    if (!busSerial || !hasClassifiedMotorSet || isMatdogBus) return;
     resetCalibration(busSerial);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedBus?.bus?.serialNumber]);
+  }, [selectedBus?.bus?.serialNumber, hasClassifiedMotorSet, isMatdogBus]);
 
   useEffect(() => {
     if (isSavePending && isCalibrationFrozen) {
@@ -160,7 +165,7 @@ const St3215BusCalibrationPage: React.FC = () => {
     const renderResetButton = () => (
       <button
         onClick={() => setShowResetConfirmation(true)}
-        disabled={!hasValidMotors}
+        disabled={!hasValidMotors || isMatdogBus}
         className={`${actionButtonClasses} bg-accent-critical-bg text-text-primary hover:bg-accent-critical-bg active:scale-95`}
       >
         Reset
@@ -206,7 +211,7 @@ const St3215BusCalibrationPage: React.FC = () => {
       return (
         <button
           onClick={handleFreeze}
-          disabled={!hasValidMotors || isSavePending}
+          disabled={!hasValidMotors || isSavePending || isMatdogBus}
           className={`${actionButtonClasses} bg-accent-info-bg text-text-primary shadow-lg shadow-accent-info-deep/30 hover:bg-accent-info-deep hover:scale-105 active:scale-95`}
         >
           {isSavePending ? <ButtonLoadingLabel label="Saving..." /> : 'Save'}
@@ -251,6 +256,11 @@ const St3215BusCalibrationPage: React.FC = () => {
                 {renderSaveButton()}
               </div>
             </div>
+            {isMatdogBus && (
+              <div className="px-4 py-2 bg-accent-data/10 border border-accent-data rounded text-accent-data">
+                MATDOG native mode: Auto Calibrate only. Reset and Save are disabled.
+              </div>
+            )}
             {!hasValidMotors && (
               <div className="px-4 py-2 bg-accent-warning/10 border border-accent-warning-deep rounded text-accent-warning">
                 Power disconnected or motors not detected. Calibration is unavailable.

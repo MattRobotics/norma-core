@@ -1612,7 +1612,7 @@ mod topology_discovery_tests {
     }
 
     #[test]
-    fn matdog_runtime_gate_allows_only_armed_profile_ram_and_global_torque_off() {
+    fn matdog_runtime_gate_allows_profile_motion_bounded_home_recovery_and_global_torque_off() {
         let allowed = |command: &TxEnvelope| {
             matdog_command_allowed_with(command, |motor_id, address, value| {
                 crate::auto_calibrate::matdog_ram_write_allowed_for_arm_value(
@@ -1640,7 +1640,7 @@ mod topology_discovery_tests {
         };
         assert!(allowed(&goal_position));
 
-        let wrong_motor = TxEnvelope {
+        let non_profile_home_recovery = TxEnvelope {
             write: Some(crate::st3215_proto::St3215WriteCommand {
                 motor_id: 21,
                 address: protocol::RamRegister::GoalPosition.address() as u32,
@@ -1648,7 +1648,17 @@ mod topology_discovery_tests {
             }),
             ..Default::default()
         };
-        assert!(!allowed(&wrong_motor));
+        assert!(allowed(&non_profile_home_recovery));
+
+        let non_profile_outside_home_window = TxEnvelope {
+            write: Some(crate::st3215_proto::St3215WriteCommand {
+                motor_id: 21,
+                address: protocol::RamRegister::GoalPosition.address() as u32,
+                value: Bytes::copy_from_slice(&2200_u16.to_le_bytes()),
+            }),
+            ..Default::default()
+        };
+        assert!(!allowed(&non_profile_outside_home_window));
 
         let torque_off = TxEnvelope {
             sync_write: Some(crate::st3215_proto::St3215SyncWriteCommand {

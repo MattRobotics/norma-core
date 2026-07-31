@@ -34,6 +34,16 @@ const COARSE_STEP_TICKS: u16 = 32;
 const FINE_STEP_TICKS: u16 = 8;
 const BACKOFF_TICKS: u16 = 96;
 const STATIC_TOLERANCE_TICKS: u16 = 10;
+// The active probe can settle a few ticks farther from digital home under
+// geometry-prerequisite load and gearbox backlash. Keep this tolerance
+// separate so prerequisite drift and contact tracking remain at 10 ticks.
+const PROBE_HOME_TOLERANCE_TICKS: u16 = 16;
+// A prerequisite observed at the digital-home endpoint may settle just beyond
+// the 10-tick static gate before torque is enabled. Widen only that startup
+// endpoint; the prerequisite target endpoint and all live hold checks remain
+// at STATIC_TOLERANCE_TICKS.
+const STARTUP_PREREQUISITE_HOME_SETTLE_TICKS: u16 = 16;
+const STARTUP_HOME_RECOVERY_LIMIT_TICKS: u16 = 64;
 const REPEATABILITY_TOLERANCE_TICKS: u16 = 16;
 const BASELINE_MIN_SAMPLES: usize = 6;
 const MINIMUM_CONTACT_TRAVEL_TICKS: u16 = 24;
@@ -44,6 +54,12 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const TELEMETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_TELEMETRY_AGE: Duration = Duration::from_secs(3);
 const MOTION_TIMEOUT: Duration = Duration::from_secs(12);
+// Long MAX returns and +90-degree prerequisites can exceed the original fixed
+// 12-second budget at GOAL_SPEED=80. Size the deadline from the commanded
+// distance using a conservative half-speed floor, retaining 12 seconds
+// as the minimum for short movements and telemetry/settling overhead.
+const MIN_EXPECTED_MOTION_TICKS_PER_SECOND: u64 = 40;
+const MOTION_SETTLE_MARGIN: Duration = Duration::from_secs(5);
 
 const LF_ALLOWED: [u8; 4] = [11, 12, 13, 42];
 const RF_ALLOWED: [u8; 4] = [21, 22, 23, 32];
@@ -57,8 +73,12 @@ const UPPER_MAX_DELTA: i16 = 1394;
 const LOWER_MIN_DELTA: i16 = -1047;
 const LOWER_MAX_DELTA: i16 = 427;
 const UPPER_30_DELTA: i16 = 341;
-const UPPER_50_DELTA: i16 = 569;
 const UPPER_90_DELTA: i16 = 1024;
+const UPPER_85_DELTA: i16 = 967;
+const LOWER_FOLDED_DELTA: i16 = -990;
+const CONTACT_ACCEPTANCE_INNER_TICKS: u16 = 64;
+const HIP_HARDWARE_BLOCK_REASON: &str =
+    "HIP hardware is blocked until ordered UPPER MIN/MAX and LOWER MIN/MAX phase proof is verified";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Leg {
@@ -302,7 +322,20 @@ fn static_target(leg: Leg, kind: JointKind, q_delta: i16) -> Result<StaticTarget
     })
 }
 
-fn prerequisites_for(leg: Leg, kind: JointKind) -> Result<Vec<StaticTarget>, String> {
+fn hip_upper_clearance_delta(leg: Leg, side: ContactSide) -> i16 {
+    match (leg, side) {
+        (Leg::Lf, ContactSide::Min) | (Leg::Rf, ContactSide::Max) | (Leg::Rh, _) | (Leg::Lh, _) => {
+            UPPER_90_DELTA
+        }
+        (Leg::Lf, ContactSide::Max) | (Leg::Rf, ContactSide::Min) => UPPER_85_DELTA,
+    }
+}
+
+fn prerequisites_for(
+    leg: Leg,
+    kind: JointKind,
+    side: ContactSide,
+) -> Result<Vec<StaticTarget>, String> {
     let mut targets = Vec::new();
     match leg {
         Leg::Lf => targets.push(static_target(Leg::Lh, JointKind::Upper, UPPER_30_DELTA)?),
@@ -315,13 +348,17 @@ fn prerequisites_for(leg: Leg, kind: JointKind) -> Result<Vec<StaticTarget>, Str
             targets.push(static_target(leg, JointKind::Hip, 0)?);
             targets.push(static_target(leg, JointKind::Lower, 0)?);
         }
-        JointKind::Hip => {
-            targets.push(static_target(leg, JointKind::Upper, UPPER_50_DELTA)?);
-            targets.push(static_target(leg, JointKind::Lower, 0)?);
-        }
         JointKind::Lower => {
             targets.push(static_target(leg, JointKind::Hip, 0)?);
             targets.push(static_target(leg, JointKind::Upper, UPPER_90_DELTA)?);
+        }
+        JointKind::Hip => {
+            targets.push(static_target(
+                leg,
+                JointKind::Upper,
+                hip_upper_clearance_delta(leg, side),
+            )?);
+            targets.push(static_target(leg, JointKind::Lower, LOWER_FOLDED_DELTA)?);
         }
     }
     Ok(targets)
@@ -383,14 +420,14 @@ fn build_profile(leg: Leg, joint: JointKind, side: ContactSide) -> Result<Contac
         guard_tick,
         baseline_target_tick,
         allowed_motor_ids: leg.allowed_motor_ids(),
-        prerequisites: prerequisites_for(leg, joint)?,
+        prerequisites: prerequisites_for(leg, joint, side)?,
     })
 }
 
 pub(crate) fn all_profiles() -> Result<Vec<ContactProfile>, String> {
     let mut profiles = Vec::with_capacity(24);
     for leg in [Leg::Lf, Leg::Rf, Leg::Rh, Leg::Lh] {
-        for joint in [JointKind::Upper, JointKind::Hip, JointKind::Lower] {
+        for joint in [JointKind::Upper, JointKind::Lower, JointKind::Hip] {
             for side in [ContactSide::Min, ContactSide::Max] {
                 profiles.push(build_profile(leg, joint, side)?);
             }
@@ -414,13 +451,19 @@ pub(crate) fn profile_for_arm_value(value: &str) -> Result<ContactProfile, Strin
         })
 }
 
-pub(crate) fn active_profile() -> Result<ContactProfile, String> {
-    match std::env::var(MATDOG_ARM_ENV) {
-        Ok(value) => profile_for_arm_value(&value),
-        Err(_) => Err(format!(
-            "MATDOG calibrator is not armed: set {MATDOG_ARM_ENV} explicitly"
-        )),
+fn hardware_profile_allowed(profile: &ContactProfile) -> Result<(), String> {
+    if profile.joint == JointKind::Hip {
+        return Err(format!("{}: {}", profile.label, HIP_HARDWARE_BLOCK_REASON));
     }
+    Ok(())
+}
+
+pub(crate) fn active_profile() -> Result<ContactProfile, String> {
+    let value = std::env::var(MATDOG_ARM_ENV)
+        .map_err(|_| format!("MATDOG calibrator is not armed: set {MATDOG_ARM_ENV} explicitly"))?;
+    let profile = profile_for_arm_value(&value)?;
+    hardware_profile_allowed(&profile)?;
+    Ok(profile)
 }
 
 pub(crate) fn armed_ram_write_allowed(motor_id: u8, address: u32, value: &[u8]) -> bool {
@@ -436,7 +479,9 @@ pub(crate) fn ram_write_allowed_for_profile(
     address: u32,
     value: &[u8],
 ) -> bool {
-    if !profile.allowed_motor_ids.contains(&motor_id) {
+    // Non-profile MATDOG joints are admitted only for the bounded startup-home
+    // sequence. GoalPosition remains constrained by armed_goal_target_allowed().
+    if !MATDOG_MOTOR_IDS.contains(&motor_id) {
         return false;
     }
 
@@ -466,6 +511,15 @@ pub(crate) fn ram_write_allowed_for_profile(
 }
 
 fn armed_goal_target_allowed(profile: &ContactProfile, motor_id: u8, target: u16) -> bool {
+    if MATDOG_MOTOR_IDS.contains(&motor_id) {
+        let recovery_low = HOME_TICK.saturating_sub(STARTUP_HOME_RECOVERY_LIMIT_TICKS);
+        let recovery_high = HOME_TICK
+            .saturating_add(STARTUP_HOME_RECOVERY_LIMIT_TICKS)
+            .min(protocol::MAX_ANGLE_STEP);
+        if (recovery_low..=recovery_high).contains(&target) {
+            return true;
+        }
+    }
     if motor_id == profile.motor_id {
         let low = profile
             .guard_tick
@@ -505,11 +559,32 @@ pub fn is_exact_matdog_motor_set(found: &[u8]) -> bool {
     found == MATDOG_MOTOR_IDS.into_iter().collect()
 }
 
+fn contact_acceptance_bounds(profile: &ContactProfile) -> (u16, u16) {
+    let inner = i32::from(profile.urdf_limit_tick)
+        - i32::from(profile.probe_sign) * i32::from(CONTACT_ACCEPTANCE_INNER_TICKS);
+    let inner = u16::try_from(inner).unwrap_or(if profile.probe_sign > 0 {
+        0
+    } else {
+        protocol::MAX_ANGLE_STEP
+    });
+    (
+        inner.min(profile.guard_tick),
+        inner.max(profile.guard_tick).min(protocol::MAX_ANGLE_STEP),
+    )
+}
+
+#[cfg(test)]
+fn position_inside_contact_acceptance(profile: &ContactProfile, position: u16) -> bool {
+    let (low, high) = contact_acceptance_bounds(profile);
+    (low..=high).contains(&position)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContactState {
     FreeMotion,
     ContactSuspected,
     ContactConfirmed,
+    EarlyStall,
     HardAbort,
 }
 
@@ -524,6 +599,192 @@ struct MotorObservation {
     torque_enabled: bool,
     status: u8,
     has_driver_error: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupRole {
+    Probe,
+    Prerequisite { target_tick: u16 },
+    HomeOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupEntryPlan {
+    home_recovery_motors: Vec<u8>,
+    home_ready_motors: BTreeSet<u8>,
+}
+
+fn startup_role_for_profile(profile: &ContactProfile, motor_id: u8) -> StartupRole {
+    if motor_id == profile.motor_id {
+        return StartupRole::Probe;
+    }
+    if let Some(target) = profile
+        .prerequisites
+        .iter()
+        .find(|target| target.motor_id == motor_id)
+    {
+        return StartupRole::Prerequisite {
+            target_tick: target.target_tick,
+        };
+    }
+    StartupRole::HomeOnly
+}
+
+fn expanded_linear_bounds(a: u16, b: u16, tolerance: u16) -> (u16, u16) {
+    let low = a.min(b).saturating_sub(tolerance);
+    let high = a
+        .max(b)
+        .saturating_add(tolerance)
+        .min(protocol::MAX_ANGLE_STEP);
+    (low, high)
+}
+
+fn startup_prerequisite_bounds(target_tick: u16) -> (u16, u16) {
+    if target_tick >= HOME_TICK {
+        (
+            HOME_TICK.saturating_sub(STARTUP_PREREQUISITE_HOME_SETTLE_TICKS),
+            target_tick
+                .saturating_add(STATIC_TOLERANCE_TICKS)
+                .min(protocol::MAX_ANGLE_STEP),
+        )
+    } else {
+        (
+            target_tick.saturating_sub(STATIC_TOLERANCE_TICKS),
+            HOME_TICK
+                .saturating_add(STARTUP_PREREQUISITE_HOME_SETTLE_TICKS)
+                .min(protocol::MAX_ANGLE_STEP),
+        )
+    }
+}
+
+fn home_hold_tolerance(
+    profile: &ContactProfile,
+    motor_id: u8,
+    probe_home_handoff_active: bool,
+) -> u16 {
+    if probe_home_handoff_active && motor_id == profile.motor_id {
+        PROBE_HOME_TOLERANCE_TICKS
+    } else {
+        STATIC_TOLERANCE_TICKS
+    }
+}
+
+fn startup_envelope(profile: &ContactProfile, motor_id: u8) -> (u16, u16) {
+    match startup_role_for_profile(profile, motor_id) {
+        StartupRole::Probe => {
+            expanded_linear_bounds(HOME_TICK, profile.guard_tick, STATIC_TOLERANCE_TICKS)
+        }
+        StartupRole::Prerequisite { target_tick } if target_tick != HOME_TICK => {
+            startup_prerequisite_bounds(target_tick)
+        }
+        StartupRole::Prerequisite { .. } | StartupRole::HomeOnly => (
+            HOME_TICK.saturating_sub(STARTUP_HOME_RECOVERY_LIMIT_TICKS),
+            HOME_TICK
+                .saturating_add(STARTUP_HOME_RECOVERY_LIMIT_TICKS)
+                .min(protocol::MAX_ANGLE_STEP),
+        ),
+    }
+}
+
+fn startup_position_allowed(profile: &ContactProfile, motor_id: u8, position: u16) -> bool {
+    let (low, high) = startup_envelope(profile, motor_id);
+    (low..=high).contains(&position)
+}
+
+fn startup_role_label(role: StartupRole) -> String {
+    match role {
+        StartupRole::Probe => "probe".to_string(),
+        StartupRole::Prerequisite { target_tick } => {
+            format!("prerequisite(target={target_tick})")
+        }
+        StartupRole::HomeOnly => "home-only".to_string(),
+    }
+}
+
+fn validate_profile_entry_hold(
+    profile: &ContactProfile,
+    motor_id: u8,
+    ignored_motor: u8,
+    home_ready_motors: &BTreeSet<u8>,
+    established_prerequisites: &BTreeSet<u8>,
+    observation: MotorObservation,
+) -> Result<(), String> {
+    if motor_id == ignored_motor {
+        return Ok(());
+    }
+    if observation.has_driver_error || observation.status != 0 {
+        return Err(format!(
+            "profile-entry M{motor_id} unhealthy: status=0x{:02X}, driver_error={}",
+            observation.status, observation.has_driver_error
+        ));
+    }
+    if observation.current >= HARD_CURRENT_ABORT_RAW {
+        return Err(format!(
+            "profile-entry M{motor_id} hard current abort: {} >= {}",
+            observation.current, HARD_CURRENT_ABORT_RAW
+        ));
+    }
+
+    if established_prerequisites.contains(&motor_id) {
+        let target = profile
+            .prerequisites
+            .iter()
+            .find(|target| target.motor_id == motor_id)
+            .ok_or_else(|| format!("profile-entry established M{motor_id} has no target"))?;
+        if !observation.torque_enabled {
+            return Err(format!(
+                "profile-entry prerequisite M{motor_id} unexpectedly torque-disabled"
+            ));
+        }
+        if observation.torque_limit != TORQUE_LIMIT {
+            return Err(format!(
+                "profile-entry prerequisite M{motor_id} torque-limit changed: expected={}, observed={}",
+                TORQUE_LIMIT, observation.torque_limit
+            ));
+        }
+        if observation.goal_position != target.target_tick {
+            return Err(format!(
+                "profile-entry prerequisite M{motor_id} goal changed: expected={}, observed={}",
+                target.target_tick, observation.goal_position
+            ));
+        }
+        if circular_distance(observation.position, target.target_tick) > STATIC_TOLERANCE_TICKS {
+            return Err(format!(
+                "profile-entry prerequisite M{motor_id} drifted: target={}, present={}, tolerance={}",
+                target.target_tick, observation.position, STATIC_TOLERANCE_TICKS
+            ));
+        }
+        return Ok(());
+    }
+
+    if observation.torque_enabled {
+        return Err(format!(
+            "profile-entry pending M{motor_id} unexpectedly torque-enabled"
+        ));
+    }
+
+    if home_ready_motors.contains(&motor_id) {
+        let distance = circular_distance(observation.position, HOME_TICK);
+        if distance > STATIC_TOLERANCE_TICKS {
+            return Err(format!(
+                "profile-entry recovered M{motor_id} left home: present={}, distance={}, tolerance={}",
+                observation.position, distance, STATIC_TOLERANCE_TICKS
+            ));
+        }
+        return Ok(());
+    }
+
+    if !startup_position_allowed(profile, motor_id, observation.position) {
+        let (low, high) = startup_envelope(profile, motor_id);
+        return Err(format!(
+            "profile-entry pending M{motor_id} left restart envelope: role={}, present={}, allowed={}..={}",
+            startup_role_label(startup_role_for_profile(profile, motor_id)),
+            observation.position,
+            low,
+            high
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -587,10 +848,44 @@ struct HybridContactDetector {
     confirming_samples: u8,
     active_target: Option<u16>,
     target_samples_seen: u8,
+    acceptance_low: u16,
+    acceptance_high: u16,
 }
 
 impl HybridContactDetector {
+    #[cfg(test)]
     fn new(start_position: u16, baseline: BaselineStats, probe_sign: i8) -> Self {
+        Self::with_acceptance(
+            start_position,
+            baseline,
+            probe_sign,
+            0,
+            protocol::MAX_ANGLE_STEP,
+        )
+    }
+
+    fn new_for_profile(
+        start_position: u16,
+        baseline: BaselineStats,
+        profile: &ContactProfile,
+    ) -> Self {
+        let (acceptance_low, acceptance_high) = contact_acceptance_bounds(profile);
+        Self::with_acceptance(
+            start_position,
+            baseline,
+            profile.probe_sign,
+            acceptance_low,
+            acceptance_high,
+        )
+    }
+
+    fn with_acceptance(
+        start_position: u16,
+        baseline: BaselineStats,
+        probe_sign: i8,
+        acceptance_low: u16,
+        acceptance_high: u16,
+    ) -> Self {
         Self {
             start_position,
             previous_position: start_position,
@@ -600,6 +895,8 @@ impl HybridContactDetector {
             confirming_samples: 0,
             active_target: None,
             target_samples_seen: 0,
+            acceptance_low,
+            acceptance_high,
         }
     }
 
@@ -652,7 +949,11 @@ impl HybridContactDetector {
         if enough_travel && low_progress && low_velocity && target_ahead {
             self.confirming_samples = self.confirming_samples.saturating_add(1);
             if self.confirming_samples >= self.config.persistence_samples {
-                ContactState::ContactConfirmed
+                if (self.acceptance_low..=self.acceptance_high).contains(&observation.position) {
+                    ContactState::ContactConfirmed
+                } else {
+                    ContactState::EarlyStall
+                }
             } else {
                 ContactState::ContactSuspected
             }
@@ -783,7 +1084,7 @@ async fn run_profile(
         inference_rx,
         stop_requested,
     );
-    calibrator.total_steps = 13;
+    calibrator.total_steps = 14;
     calibrator.publish_progress(
         0,
         "MATDOG native profile preflight",
@@ -839,6 +1140,7 @@ struct MatdogRamOnlyCalibrator {
     current_step: u32,
     total_steps: u32,
     held_targets: Vec<StaticTarget>,
+    probe_home_handoff_active: bool,
 }
 
 impl MatdogRamOnlyCalibrator {
@@ -860,6 +1162,7 @@ impl MatdogRamOnlyCalibrator {
             current_step: 0,
             total_steps: 0,
             held_targets: Vec::new(),
+            probe_home_handoff_active: false,
         }
     }
 
@@ -870,15 +1173,19 @@ impl MatdogRamOnlyCalibrator {
         self.next_phase("Verified global torque OFF")?;
         self.global_torque_off_verified().await?;
 
-        self.next_phase("Verify all joints near digital home")?;
-        self.verify_all_near_home().await?;
+        self.next_phase("Inspect restart-safe profile entry")?;
+        let mut entry_plan = self.inspect_profile_entry().await?;
 
-        self.next_phase("Apply geometry prerequisites one joint at a time")?;
-        self.apply_prerequisites().await?;
+        self.next_phase("Recover home-only joints to digital home")?;
+        self.recover_home_only_joints(&mut entry_plan).await?;
 
-        self.next_phase("Prime and configure probing joint RAM only")?;
+        self.next_phase("Establish geometry prerequisites from restart-safe state")?;
+        self.establish_prerequisites_restart_safe(&entry_plan)
+            .await?;
+
+        self.next_phase("Prime and return probing joint home")?;
         self.prepare_motor(self.profile.motor_id).await?;
-        self.move_motor_to(self.profile.motor_id, HOME_TICK, STATIC_TOLERANCE_TICKS)
+        self.move_motor_to(self.profile.motor_id, HOME_TICK, PROBE_HOME_TOLERANCE_TICKS)
             .await?;
 
         self.next_phase("Acquire moving-current baseline")?;
@@ -899,11 +1206,15 @@ impl MatdogRamOnlyCalibrator {
         self.next_phase("Return probing joint home")?;
         self.stop_pressure(self.profile.motor_id, second_tick)
             .await?;
-        self.move_motor_to(self.profile.motor_id, HOME_TICK, STATIC_TOLERANCE_TICKS)
+        self.move_motor_to(self.profile.motor_id, HOME_TICK, PROBE_HOME_TOLERANCE_TICKS)
             .await?;
+        self.set_motor_torque_verified(self.profile.motor_id, false)
+            .await?;
+        self.probe_home_handoff_active = true;
 
         self.next_phase("Restore prerequisite joints one at a time")?;
         self.restore_prerequisites().await?;
+        self.probe_home_handoff_active = false;
 
         self.next_phase("Final verified global torque OFF")?;
 
@@ -915,49 +1226,263 @@ impl MatdogRamOnlyCalibrator {
         })
     }
 
-    async fn verify_all_near_home(&mut self) -> Result<(), DynError> {
+    async fn inspect_profile_entry(&mut self) -> Result<StartupEntryPlan, DynError> {
+        let mut outliers = Vec::new();
+        let mut home_recovery_motors = Vec::new();
+        let mut home_ready_motors = BTreeSet::new();
+
+        // All-or-nothing inventory. No torque is enabled until every motor has
+        // fresh, healthy telemetry in the envelope allowed by the armed profile.
         for motor_id in MATDOG_MOTOR_IDS {
             let observation = self.latest_observation(motor_id)?;
             self.ensure_observation_fresh(motor_id, observation)?;
             if observation.torque_enabled {
-                return Err(format!(
-                    "M{motor_id} unexpectedly torque-enabled during home preflight"
-                )
-                .into());
-            }
-            if observation.has_driver_error || observation.status != 0 {
-                return Err(format!("M{motor_id} unhealthy during home preflight").into());
-            }
-            if circular_distance(observation.position, HOME_TICK) > STATIC_TOLERANCE_TICKS {
-                return Err(format!(
-                    "M{motor_id} is not at digital home: present={}, expected={}, tolerance={}",
-                    observation.position, HOME_TICK, STATIC_TOLERANCE_TICKS
-                )
-                .into());
-            }
-        }
-        Ok(())
-    }
-
-    async fn apply_prerequisites(&mut self) -> Result<(), DynError> {
-        for target in self.profile.prerequisites.clone() {
-            if target.motor_id == self.profile.motor_id {
+                outliers.push(format!(
+                    "M{motor_id}:torque-enabled,role={}",
+                    startup_role_label(startup_role_for_profile(&self.profile, motor_id))
+                ));
                 continue;
             }
-            self.prepare_motor(target.motor_id).await?;
-            self.move_motor_to(target.motor_id, target.target_tick, STATIC_TOLERANCE_TICKS)
+            if observation.has_driver_error || observation.status != 0 {
+                outliers.push(format!(
+                    "M{motor_id}:unhealthy,status=0x{:02X},driver_error={}",
+                    observation.status, observation.has_driver_error
+                ));
+                continue;
+            }
+            if observation.current >= HARD_CURRENT_ABORT_RAW {
+                outliers.push(format!(
+                    "M{motor_id}:current={},limit={}",
+                    observation.current, HARD_CURRENT_ABORT_RAW
+                ));
+                continue;
+            }
+            if !startup_position_allowed(&self.profile, motor_id, observation.position) {
+                let (low, high) = startup_envelope(&self.profile, motor_id);
+                outliers.push(format!(
+                    "M{motor_id}:role={},present={},allowed={}..={}",
+                    startup_role_label(startup_role_for_profile(&self.profile, motor_id)),
+                    observation.position,
+                    low,
+                    high
+                ));
+                continue;
+            }
+
+            if matches!(
+                startup_role_for_profile(&self.profile, motor_id),
+                StartupRole::HomeOnly
+            ) {
+                let distance = circular_distance(observation.position, HOME_TICK);
+                if distance <= STATIC_TOLERANCE_TICKS {
+                    home_ready_motors.insert(motor_id);
+                } else {
+                    home_recovery_motors.push(motor_id);
+                }
+            }
+        }
+
+        if !outliers.is_empty() {
+            return Err(format!(
+                "restart-safe profile entry refused before motion; outliers=[{}]",
+                outliers.join(", ")
+            )
+            .into());
+        }
+
+        for target in &self.profile.prerequisites {
+            let observation = self.latest_observation(target.motor_id)?;
+            info!(
+                "MATDOG {} restart prerequisite inventory: M{} present={} target={}",
+                self.profile.label, target.motor_id, observation.position, target.target_tick
+            );
+        }
+        let probe = self.latest_observation(self.profile.motor_id)?;
+        info!(
+            "MATDOG {} restart probe inventory: M{} present={} home={} guard={}",
+            self.profile.label,
+            self.profile.motor_id,
+            probe.position,
+            HOME_TICK,
+            self.profile.guard_tick
+        );
+
+        Ok(StartupEntryPlan {
+            home_recovery_motors,
+            home_ready_motors,
+        })
+    }
+
+    async fn recover_home_only_joints(
+        &mut self,
+        plan: &mut StartupEntryPlan,
+    ) -> Result<(), DynError> {
+        let established_prerequisites = BTreeSet::new();
+        for motor_id in plan.home_recovery_motors.clone() {
+            self.verify_profile_entry_holds_except(
+                0,
+                &plan.home_ready_motors,
+                &established_prerequisites,
+            )
+            .await?;
+
+            let before = self.latest_observation(motor_id)?;
+            info!(
+                "MATDOG {} home-only recovery: M{} present={} target={} distance={}",
+                self.profile.label,
+                motor_id,
+                before.position,
+                HOME_TICK,
+                circular_distance(before.position, HOME_TICK)
+            );
+            self.prepare_startup_home_recovery_motor(motor_id).await?;
+            self.move_profile_entry_motor_to_target(
+                motor_id,
+                HOME_TICK,
+                &plan.home_ready_motors,
+                &established_prerequisites,
+                true,
+            )
+            .await?;
+            self.set_startup_home_torque_verified(motor_id, false)
                 .await?;
+            plan.home_ready_motors.insert(motor_id);
+        }
+        self.verify_profile_entry_holds_except(
+            0,
+            &plan.home_ready_motors,
+            &established_prerequisites,
+        )
+        .await
+    }
+
+    async fn establish_prerequisites_restart_safe(
+        &mut self,
+        plan: &StartupEntryPlan,
+    ) -> Result<(), DynError> {
+        let mut established_prerequisites = BTreeSet::new();
+        for target in self.profile.prerequisites.clone() {
+            self.verify_profile_entry_holds_except(
+                0,
+                &plan.home_ready_motors,
+                &established_prerequisites,
+            )
+            .await?;
+
+            let before = self.latest_observation(target.motor_id)?;
+            info!(
+                "MATDOG {} establish prerequisite: M{} present={} target={}",
+                self.profile.label, target.motor_id, before.position, target.target_tick
+            );
+            self.prepare_motor(target.motor_id).await?;
+            self.move_profile_entry_motor_to_target(
+                target.motor_id,
+                target.target_tick,
+                &plan.home_ready_motors,
+                &established_prerequisites,
+                false,
+            )
+            .await?;
             if self
                 .held_targets
                 .iter()
                 .any(|held| held.motor_id == target.motor_id)
             {
-                return Err(
-                    format!("duplicate prerequisite target for M{}", target.motor_id).into(),
-                );
+                return Err(format!(
+                    "duplicate restart-safe prerequisite target for M{}",
+                    target.motor_id
+                )
+                .into());
             }
             self.held_targets.push(target);
-            self.verify_static_holds().await?;
+            established_prerequisites.insert(target.motor_id);
+            self.verify_profile_entry_holds_except(
+                0,
+                &plan.home_ready_motors,
+                &established_prerequisites,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn move_profile_entry_motor_to_target(
+        &mut self,
+        motor_id: u8,
+        target: u16,
+        home_ready_motors: &BTreeSet<u8>,
+        established_prerequisites: &BTreeSet<u8>,
+        startup_writer: bool,
+    ) -> Result<MotorObservation, DynError> {
+        if startup_writer {
+            self.set_startup_home_goal_verified(motor_id, target)
+                .await?;
+        } else {
+            self.set_motor_goal_verified(motor_id, target).await?;
+        }
+        let mut last_stamp = self.latest_observation(motor_id)?.monotonic_stamp_ns;
+        let start_position = self.latest_observation(motor_id)?.position;
+        let distance_ticks = circular_distance(start_position, target);
+        let motion_timeout = motion_timeout_for_distance(distance_ticks);
+        let deadline = Instant::now() + motion_timeout;
+        info!(
+            "MATDOG {} move plan: M{} start={} target={} distance={} timeout_ms={}",
+            self.profile.label,
+            motor_id,
+            start_position,
+            target,
+            distance_ticks,
+            motion_timeout.as_millis()
+        );
+
+        while Instant::now() < deadline {
+            self.check_stop()?;
+            let observation = self
+                .wait_for_motor_observation_after(motor_id, last_stamp, TELEMETRY_TIMEOUT)
+                .await?;
+            last_stamp = observation.monotonic_stamp_ns;
+            self.ensure_observation_safe(motor_id, observation, true, Some(target))?;
+            self.verify_profile_entry_holds_except(
+                motor_id,
+                home_ready_motors,
+                established_prerequisites,
+            )
+            .await?;
+            if circular_distance(observation.position, target) <= STATIC_TOLERANCE_TICKS {
+                return Ok(observation);
+            }
+        }
+
+        let last = self.latest_observation(motor_id)?;
+        Err(format!(
+            "M{motor_id} profile-entry timeout: target={target}, present={}, error={}",
+            last.position,
+            circular_distance(last.position, target)
+        )
+        .into())
+    }
+
+    async fn verify_profile_entry_holds_except(
+        &self,
+        ignored_motor: u8,
+        home_ready_motors: &BTreeSet<u8>,
+        established_prerequisites: &BTreeSet<u8>,
+    ) -> Result<(), DynError> {
+        for motor_id in MATDOG_MOTOR_IDS {
+            if motor_id == ignored_motor {
+                continue;
+            }
+            let observation = self.latest_observation(motor_id)?;
+            self.ensure_observation_fresh(motor_id, observation)?;
+            validate_profile_entry_hold(
+                &self.profile,
+                motor_id,
+                ignored_motor,
+                home_ready_motors,
+                established_prerequisites,
+                observation,
+            )
+            .map_err(|message| -> DynError { message.into() })?;
         }
         Ok(())
     }
@@ -970,6 +1495,133 @@ impl MatdogRamOnlyCalibrator {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn prepare_startup_home_recovery_motor(&mut self, motor_id: u8) -> Result<(), DynError> {
+        if !MATDOG_MOTOR_IDS.contains(&motor_id) {
+            return Err(format!("M{motor_id} is outside the exact MATDOG motor set").into());
+        }
+        if !matches!(
+            startup_role_for_profile(&self.profile, motor_id),
+            StartupRole::HomeOnly
+        ) {
+            return Err(format!(
+                "M{motor_id} startup-home writer requested for non-home-only role {}",
+                startup_role_label(startup_role_for_profile(&self.profile, motor_id))
+            )
+            .into());
+        }
+        let initial = self.latest_observation(motor_id)?;
+        self.ensure_observation_safe(motor_id, initial, false, None)?;
+        if !startup_position_allowed(&self.profile, motor_id, initial.position) {
+            let (low, high) = startup_envelope(&self.profile, motor_id);
+            return Err(format!(
+                "M{motor_id} outside home-only restart envelope before torque enable: present={}, allowed={}..={}",
+                initial.position, low, high
+            )
+            .into());
+        }
+
+        self.set_startup_home_goal_verified(motor_id, initial.position)
+            .await?;
+        self.write_startup_home_ram_verified(
+            motor_id,
+            RamRegister::TorqueLimit,
+            TORQUE_LIMIT.to_le_bytes().to_vec(),
+        )
+        .await?;
+        self.write_startup_home_ram_verified(motor_id, RamRegister::Acc, vec![ACCELERATION])
+            .await?;
+        self.write_startup_home_ram_verified(
+            motor_id,
+            RamRegister::GoalSpeed,
+            GOAL_SPEED.to_le_bytes().to_vec(),
+        )
+        .await?;
+        self.set_startup_home_torque_verified(motor_id, true).await
+    }
+
+    async fn set_startup_home_goal_verified(
+        &mut self,
+        motor_id: u8,
+        target: u16,
+    ) -> Result<(), DynError> {
+        if target > protocol::MAX_ANGLE_STEP {
+            return Err(format!("unsigned startup GoalPosition out of range: {target}").into());
+        }
+        self.write_startup_home_ram_verified(
+            motor_id,
+            RamRegister::GoalPosition,
+            target.to_le_bytes().to_vec(),
+        )
+        .await
+    }
+
+    async fn set_startup_home_torque_verified(
+        &mut self,
+        motor_id: u8,
+        enabled: bool,
+    ) -> Result<(), DynError> {
+        self.write_startup_home_ram_verified(
+            motor_id,
+            RamRegister::TorqueEnable,
+            vec![u8::from(enabled)],
+        )
+        .await?;
+        let observation = self.latest_observation(motor_id)?;
+        if observation.torque_enabled != enabled {
+            return Err(format!(
+                "M{motor_id} startup torque readback mismatch: expected={enabled}, observed={}",
+                observation.torque_enabled
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn write_startup_home_ram_verified(
+        &mut self,
+        motor_id: u8,
+        register: RamRegister,
+        value: Vec<u8>,
+    ) -> Result<(), DynError> {
+        validate_ram_write(register, &value)?;
+        if !MATDOG_MOTOR_IDS.contains(&motor_id) {
+            return Err(format!("M{motor_id} is outside the exact MATDOG motor set").into());
+        }
+        if !ram_write_allowed_for_profile(
+            &self.profile,
+            motor_id,
+            register.address() as u32,
+            &value,
+        ) {
+            return Err(format!(
+                "M{motor_id} startup RAM write rejected locally: register={}, value={:?}",
+                register.name(),
+                value
+            )
+            .into());
+        }
+
+        let initial_stamp = self.latest_observation(motor_id)?.monotonic_stamp_ns;
+        let command_id = self.next_command_id();
+        let envelope = TxEnvelope {
+            monotonic_stamp_ns: systime::get_monotonic_stamp_ns(),
+            local_stamp_ns: systime::get_local_stamp_ns(),
+            app_start_id: systime::get_app_start_id(),
+            target_bus_serial: self.target_bus_serial.clone(),
+            command_id: command_id.clone(),
+            write: Some(crate::st3215_proto::St3215WriteCommand {
+                motor_id: motor_id as u32,
+                address: register.address() as u32,
+                value: value.clone().into(),
+            }),
+            ..Default::default()
+        };
+        self.comm.send_tx(&envelope)?;
+        self.wait_for_command_result(&command_id).await?;
+        self.wait_for_register_value(motor_id, register, &value, initial_stamp)
+            .await
     }
 
     async fn prepare_motor(&mut self, motor_id: u8) -> Result<(), DynError> {
@@ -1019,7 +1671,7 @@ impl MatdogRamOnlyCalibrator {
                 true,
                 Some(self.profile.baseline_target_tick),
             )?;
-            self.verify_static_holds().await?;
+            self.verify_profile_holds().await?;
             if circular_distance(observation.position, previous_position) > 0
                 || speed_magnitude(observation.velocity) > 0
             {
@@ -1043,7 +1695,7 @@ impl MatdogRamOnlyCalibrator {
         }
         let baseline = BaselineStats::from_samples(&samples)
             .map_err(|message| -> DynError { message.into() })?;
-        self.move_motor_to(motor_id, HOME_TICK, STATIC_TOLERANCE_TICKS)
+        self.move_motor_to(motor_id, HOME_TICK, PROBE_HOME_TOLERANCE_TICKS)
             .await?;
         Ok(baseline)
     }
@@ -1057,7 +1709,7 @@ impl MatdogRamOnlyCalibrator {
         let start = self.latest_observation(motor_id)?;
         self.ensure_observation_safe(motor_id, start, true, None)?;
         let mut detector =
-            HybridContactDetector::new(start.position, baseline, self.profile.probe_sign);
+            HybridContactDetector::new_for_profile(start.position, baseline, &self.profile);
         let mut target = start.position;
         let mut last_stamp = start.monotonic_stamp_ns;
 
@@ -1090,7 +1742,7 @@ impl MatdogRamOnlyCalibrator {
                 last_stamp = observation.monotonic_stamp_ns;
                 last_observation = Some(observation);
                 self.ensure_observation_safe(motor_id, observation, true, Some(target))?;
-                self.verify_static_holds().await?;
+                self.verify_profile_holds().await?;
                 if circular_distance(observation.position, target) <= STATIC_TOLERANCE_TICKS {
                     break;
                 }
@@ -1110,6 +1762,25 @@ impl MatdogRamOnlyCalibrator {
                         );
                         self.stop_pressure(motor_id, observation.position).await?;
                         return Ok(observation.position);
+                    }
+                    ContactState::EarlyStall => {
+                        self.stop_pressure(motor_id, observation.position).await?;
+                        let (acceptance_low, acceptance_high) =
+                            contact_acceptance_bounds(&self.profile);
+                        return Err(format!(
+                            "{} early stall outside model contact corridor: target={}, present={}, acceptance={}..={}, URDF={}, guard={}, current={}, threshold={}, velocity={}",
+                            self.profile.label,
+                            target,
+                            observation.position,
+                            acceptance_low,
+                            acceptance_high,
+                            self.profile.urdf_limit_tick,
+                            self.profile.guard_tick,
+                            observation.current,
+                            baseline.contact_threshold(),
+                            speed_magnitude(observation.velocity)
+                        )
+                        .into());
                     }
                     ContactState::HardAbort => {
                         return self.abort_with_global_torque_off(format!(
@@ -1193,7 +1864,19 @@ impl MatdogRamOnlyCalibrator {
     ) -> Result<MotorObservation, DynError> {
         self.set_motor_goal_verified(motor_id, target).await?;
         let mut last_stamp = self.latest_observation(motor_id)?.monotonic_stamp_ns;
-        let deadline = Instant::now() + MOTION_TIMEOUT;
+        let start_position = self.latest_observation(motor_id)?.position;
+        let distance_ticks = circular_distance(start_position, target);
+        let motion_timeout = motion_timeout_for_distance(distance_ticks);
+        let deadline = Instant::now() + motion_timeout;
+        info!(
+            "MATDOG {} move plan: M{} start={} target={} distance={} timeout_ms={}",
+            self.profile.label,
+            motor_id,
+            start_position,
+            target,
+            distance_ticks,
+            motion_timeout.as_millis()
+        );
         while Instant::now() < deadline {
             self.check_stop()?;
             let observation = self
@@ -1215,8 +1898,8 @@ impl MatdogRamOnlyCalibrator {
         .into())
     }
 
-    async fn verify_static_holds(&self) -> Result<(), DynError> {
-        self.verify_static_holds_except(0).await
+    async fn verify_profile_holds(&self) -> Result<(), DynError> {
+        self.verify_static_holds_except(self.profile.motor_id).await
     }
 
     async fn verify_static_holds_except(&self, ignored_motor: u8) -> Result<(), DynError> {
@@ -1259,10 +1942,12 @@ impl MatdogRamOnlyCalibrator {
                 if observation.has_driver_error || observation.status != 0 {
                     return Err(format!("non-active M{motor_id} became unhealthy").into());
                 }
-                if circular_distance(observation.position, HOME_TICK) > STATIC_TOLERANCE_TICKS {
+                let tolerance =
+                    home_hold_tolerance(&self.profile, motor_id, self.probe_home_handoff_active);
+                if circular_distance(observation.position, HOME_TICK) > tolerance {
                     return Err(format!(
                         "non-active M{motor_id} left home: present={}, expected={}, tolerance={}",
-                        observation.position, HOME_TICK, STATIC_TOLERANCE_TICKS
+                        observation.position, HOME_TICK, tolerance
                     )
                     .into());
                 }
@@ -1758,6 +2443,16 @@ fn advance_tick(value: u16, sign: i8, amount: u16) -> Result<u16, DynError> {
         .ok()
         .filter(|tick| *tick <= protocol::MAX_ANGLE_STEP)
         .ok_or_else(|| format!("unsigned GoalPosition out of range: {next}").into())
+}
+
+fn motion_timeout_for_distance(distance_ticks: u16) -> Duration {
+    let travel_ms = u64::from(distance_ticks)
+        .saturating_mul(1000)
+        .saturating_add(MIN_EXPECTED_MOTION_TICKS_PER_SECOND - 1)
+        / MIN_EXPECTED_MOTION_TICKS_PER_SECOND;
+    Duration::from_millis(travel_ms)
+        .saturating_add(MOTION_SETTLE_MARGIN)
+        .max(MOTION_TIMEOUT)
 }
 
 fn passed_guard(value: u16, guard: u16, sign: i8) -> bool {

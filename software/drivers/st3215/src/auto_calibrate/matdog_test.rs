@@ -181,18 +181,106 @@ fn front_profiles_park_only_the_ipsilateral_rear_upper() {
 }
 
 #[test]
-fn hip_and_lower_prerequisites_match_geometry_checkpoint() {
-    for leg in [Leg::Lf, Leg::Rf, Leg::Rh, Leg::Lh] {
-        let hip = build_profile(leg, JointKind::Hip, ContactSide::Min).unwrap();
-        let upper_50 = static_target(leg, JointKind::Upper, UPPER_50_DELTA).unwrap();
-        assert!(hip.prerequisites.contains(&upper_50));
+fn ordered_profile_table_lists_upper_then_lower_then_hip() {
+    let profiles = all_profiles().unwrap();
+    let lf: Vec<_> = profiles
+        .iter()
+        .filter(|profile| profile.leg == Leg::Lf)
+        .map(|profile| (profile.joint, profile.side))
+        .collect();
+    assert_eq!(
+        lf,
+        vec![
+            (JointKind::Upper, ContactSide::Min),
+            (JointKind::Upper, ContactSide::Max),
+            (JointKind::Lower, ContactSide::Min),
+            (JointKind::Lower, ContactSide::Max),
+            (JointKind::Hip, ContactSide::Min),
+            (JointKind::Hip, ContactSide::Max),
+        ]
+    );
+}
 
-        let lower = build_profile(leg, JointKind::Lower, ContactSide::Min).unwrap();
-        let upper_90 = static_target(leg, JointKind::Upper, UPPER_90_DELTA).unwrap();
-        let hip_home = static_target(leg, JointKind::Hip, 0).unwrap();
-        assert!(lower.prerequisites.contains(&upper_90));
-        assert!(lower.prerequisites.contains(&hip_home));
+#[test]
+fn lf_lower_profiles_use_horizontal_upper_and_exact_unsigned_numbers() {
+    let minimum = profile_for_arm_value("LF_LOWER_M11_MIN").unwrap();
+    assert_eq!(minimum.motor_id, 11);
+    assert_eq!(minimum.probe_sign, 1);
+    assert_eq!(minimum.urdf_limit_tick, 3095);
+    assert_eq!(minimum.guard_tick, 3159);
+    assert_eq!(minimum.baseline_target_tick, 2112);
+    assert_eq!(minimum.allowed_motor_ids, &LF_ALLOWED);
+    assert!(minimum.prerequisites.contains(&StaticTarget {
+        motor_id: 42,
+        target_tick: 2389
+    }));
+    assert!(minimum.prerequisites.contains(&StaticTarget {
+        motor_id: 13,
+        target_tick: 2048
+    }));
+    assert!(minimum.prerequisites.contains(&StaticTarget {
+        motor_id: 12,
+        target_tick: 3072
+    }));
+
+    let maximum = profile_for_arm_value("LF_LOWER_M11_MAX").unwrap();
+    assert_eq!(maximum.probe_sign, -1);
+    assert_eq!(maximum.urdf_limit_tick, 1621);
+    assert_eq!(maximum.guard_tick, 1557);
+    assert_eq!(maximum.baseline_target_tick, 1984);
+}
+
+#[test]
+fn hip_prerequisites_are_compact_and_side_specific() {
+    let cases = [
+        ("LF_HIP_M13_MIN", 12, 3072, 11, 3038),
+        ("LF_HIP_M13_MAX", 12, 3015, 11, 3038),
+        ("RF_HIP_M23_MIN", 22, 1081, 21, 1058),
+        ("RF_HIP_M23_MAX", 22, 1024, 21, 1058),
+        ("RH_HIP_M33_MIN", 32, 1024, 31, 1058),
+        ("RH_HIP_M33_MAX", 32, 1024, 31, 1058),
+        ("LH_HIP_M43_MIN", 42, 3072, 41, 3038),
+        ("LH_HIP_M43_MAX", 42, 3072, 41, 3038),
+    ];
+    for (token, upper_id, upper_tick, lower_id, lower_tick) in cases {
+        let profile = profile_for_arm_value(token).unwrap();
+        assert!(profile.prerequisites.contains(&StaticTarget {
+            motor_id: upper_id,
+            target_tick: upper_tick,
+        }));
+        assert!(profile.prerequisites.contains(&StaticTarget {
+            motor_id: lower_id,
+            target_tick: lower_tick,
+        }));
     }
+}
+
+#[test]
+fn isolated_hip_hardware_profiles_are_blocked_but_lower_is_allowed() {
+    let hip = profile_for_arm_value("LF_HIP_M13_MIN").unwrap();
+    let error = hardware_profile_allowed(&hip).unwrap_err();
+    assert!(error.contains(HIP_HARDWARE_BLOCK_REASON));
+
+    let lower = profile_for_arm_value("LF_LOWER_M11_MIN").unwrap();
+    assert!(hardware_profile_allowed(&lower).is_ok());
+}
+
+#[test]
+fn contact_acceptance_corridors_match_model_inner_boundary_and_guard() {
+    let m12_min = profile_for_arm_value("LF_UPPER_M12_MIN").unwrap();
+    assert_eq!(contact_acceptance_bounds(&m12_min), (1387, 1515));
+    assert!(position_inside_contact_acceptance(&m12_min, 1443));
+
+    let m12_max = profile_for_arm_value("LF_UPPER_M12_MAX").unwrap();
+    assert_eq!(contact_acceptance_bounds(&m12_max), (3378, 3506));
+    assert!(position_inside_contact_acceptance(&m12_max, 3442));
+
+    let m13_min = profile_for_arm_value("LF_HIP_M13_MIN").unwrap();
+    assert_eq!(contact_acceptance_bounds(&m13_min), (2496, 2624));
+    assert!(!position_inside_contact_acceptance(&m13_min, 2405));
+
+    let m11_min = profile_for_arm_value("LF_LOWER_M11_MIN").unwrap();
+    assert_eq!(contact_acceptance_bounds(&m11_min), (3031, 3159));
 }
 
 #[test]
@@ -221,6 +309,304 @@ fn armed_motor_allowlists_are_leg_scoped_and_include_front_parking_joint() {
             .allowed_motor_ids,
         &LH_ALLOWED
     );
+}
+
+#[test]
+fn lf_upper_m12_max_profile_matches_reviewed_geometry() {
+    let profile = profile_for_arm_value("LF_UPPER_M12_MAX").unwrap();
+    assert_eq!(profile.motor_id, 12);
+    assert_eq!(profile.probe_sign, 1);
+    assert_eq!(profile.urdf_limit_tick, 3442);
+    assert_eq!(profile.guard_tick, 3506);
+    assert_eq!(profile.baseline_target_tick, 2112);
+    assert_eq!(profile.allowed_motor_ids, &LF_ALLOWED);
+
+    assert!(profile
+        .prerequisites
+        .contains(&static_target(Leg::Lh, JointKind::Upper, UPPER_30_DELTA).unwrap()));
+    assert!(profile
+        .prerequisites
+        .contains(&static_target(Leg::Lf, JointKind::Hip, 0).unwrap()));
+    assert!(profile
+        .prerequisites
+        .contains(&static_target(Leg::Lf, JointKind::Lower, 0).unwrap()));
+}
+
+#[test]
+fn startup_home_recovery_goal_gate_is_global_but_bounded() {
+    let profile = profile_for_arm_value("LF_UPPER_M12_MAX").unwrap();
+    assert!(armed_goal_target_allowed(&profile, 22, 2069));
+    assert!(armed_goal_target_allowed(
+        &profile,
+        43,
+        HOME_TICK + STARTUP_HOME_RECOVERY_LIMIT_TICKS
+    ));
+    assert!(!armed_goal_target_allowed(
+        &profile,
+        22,
+        HOME_TICK + STARTUP_HOME_RECOVERY_LIMIT_TICKS + 1
+    ));
+    assert!(armed_goal_target_allowed(&profile, 42, 2386));
+    assert!(armed_goal_target_allowed(&profile, 42, 2389));
+    assert!(armed_goal_target_allowed(&profile, 12, 3442));
+    assert!(!armed_goal_target_allowed(&profile, 99, HOME_TICK));
+}
+
+#[test]
+fn startup_recovery_ram_gate_allows_exact_non_profile_home_sequence() {
+    let profile = profile_for_arm_value("LF_UPPER_M12_MAX").unwrap();
+    let allowed = |register: RamRegister, value: &[u8]| {
+        ram_write_allowed_for_profile(&profile, 22, register.address() as u32, value)
+    };
+
+    assert!(allowed(RamRegister::GoalPosition, &2069_u16.to_le_bytes()));
+    assert!(allowed(RamRegister::GoalPosition, &HOME_TICK.to_le_bytes()));
+    assert!(allowed(RamRegister::TorqueEnable, &[0]));
+    assert!(allowed(RamRegister::TorqueEnable, &[1]));
+    assert!(allowed(RamRegister::Acc, &[ACCELERATION]));
+    assert!(allowed(RamRegister::GoalSpeed, &GOAL_SPEED.to_le_bytes()));
+    assert!(allowed(
+        RamRegister::TorqueLimit,
+        &TORQUE_LIMIT.to_le_bytes()
+    ));
+
+    assert!(!allowed(
+        RamRegister::GoalPosition,
+        &(HOME_TICK + STARTUP_HOME_RECOVERY_LIMIT_TICKS + 1).to_le_bytes()
+    ));
+    assert!(!allowed(RamRegister::Acc, &[ACCELERATION + 1]));
+}
+
+#[test]
+fn startup_v10_pose_classifies_m42_as_valid_prerequisite_residue() {
+    let profile = profile_for_arm_value("LF_UPPER_M12_MAX").unwrap();
+    assert_eq!(
+        startup_role_for_profile(&profile, 42),
+        StartupRole::Prerequisite { target_tick: 2389 }
+    );
+    assert!(startup_position_allowed(&profile, 42, 2386));
+    assert!(!startup_position_allowed(&profile, 42, 2400));
+
+    let mut m42 = observation(2386, 0, 0, 2389);
+    m42.torque_enabled = false;
+    let home_ready = BTreeSet::new();
+    let established = BTreeSet::new();
+    assert!(validate_profile_entry_hold(&profile, 42, 22, &home_ready, &established, m42).is_ok());
+
+    m42.torque_enabled = true;
+    assert!(validate_profile_entry_hold(&profile, 42, 22, &home_ready, &established, m42).is_err());
+
+    let established = BTreeSet::from([42]);
+    assert!(validate_profile_entry_hold(&profile, 42, 22, &home_ready, &established, m42).is_ok());
+}
+
+#[test]
+fn startup_probe_and_prerequisite_corridors_are_restart_safe() {
+    let profile = profile_for_arm_value("LF_UPPER_M12_MAX").unwrap();
+    for position in [2040, HOME_TICK, 2112, 3000, 3442, 3506, 3516] {
+        assert!(
+            startup_position_allowed(&profile, 12, position),
+            "M12 {position}"
+        );
+    }
+    assert!(!startup_position_allowed(&profile, 12, 3517));
+
+    for position in [2038, HOME_TICK, 2200, 2386, 2389, 2399] {
+        assert!(
+            startup_position_allowed(&profile, 42, position),
+            "M42 {position}"
+        );
+    }
+    assert!(!startup_position_allowed(&profile, 42, 2400));
+
+    assert!(startup_position_allowed(&profile, 22, 2112));
+    assert!(!startup_position_allowed(&profile, 22, 2113));
+}
+
+#[test]
+fn startup_prerequisite_home_endpoint_accepts_observed_m42_2037_without_weakening_target() {
+    let profile = profile_for_arm_value("LF_LOWER_M11_MIN").unwrap();
+    let observed = 2037;
+    let observed_error = circular_distance(observed, HOME_TICK);
+    assert_eq!(observed_error, 11);
+    assert_eq!(STATIC_TOLERANCE_TICKS, 10);
+    assert_eq!(STARTUP_PREREQUISITE_HOME_SETTLE_TICKS, 16);
+    assert!(observed_error > STATIC_TOLERANCE_TICKS);
+    assert!(observed_error <= STARTUP_PREREQUISITE_HOME_SETTLE_TICKS);
+    assert_eq!(startup_envelope(&profile, 42), (2032, 2399));
+    assert!(startup_position_allowed(&profile, 42, observed));
+    assert!(!startup_position_allowed(&profile, 42, 2400));
+}
+
+#[test]
+fn startup_wrong_profile_residue_is_rejected() {
+    let profile = profile_for_arm_value("LF_UPPER_M12_MAX").unwrap();
+    assert_eq!(
+        startup_role_for_profile(&profile, 32),
+        StartupRole::HomeOnly
+    );
+    assert!(!startup_position_allowed(&profile, 32, 1707));
+
+    let rf = profile_for_arm_value("RF_UPPER_M22_MAX").unwrap();
+    assert_eq!(
+        startup_role_for_profile(&rf, 32),
+        StartupRole::Prerequisite { target_tick: 1707 }
+    );
+    assert!(startup_position_allowed(&rf, 32, 1707));
+}
+
+#[test]
+fn startup_envelopes_match_exhaustive_oracle_for_all_profiles_and_ticks() {
+    for profile in all_profiles().unwrap() {
+        for motor_id in MATDOG_MOTOR_IDS {
+            let role = startup_role_for_profile(&profile, motor_id);
+            let expected_bounds = match role {
+                StartupRole::Probe => {
+                    expanded_linear_bounds(HOME_TICK, profile.guard_tick, STATIC_TOLERANCE_TICKS)
+                }
+                StartupRole::Prerequisite { target_tick } if target_tick != HOME_TICK => {
+                    startup_prerequisite_bounds(target_tick)
+                }
+                StartupRole::Prerequisite { .. } | StartupRole::HomeOnly => (
+                    HOME_TICK.saturating_sub(STARTUP_HOME_RECOVERY_LIMIT_TICKS),
+                    HOME_TICK
+                        .saturating_add(STARTUP_HOME_RECOVERY_LIMIT_TICKS)
+                        .min(protocol::MAX_ANGLE_STEP),
+                ),
+            };
+            assert_eq!(startup_envelope(&profile, motor_id), expected_bounds);
+            for position in 0..=protocol::MAX_ANGLE_STEP {
+                let expected = (expected_bounds.0..=expected_bounds.1).contains(&position);
+                assert_eq!(
+                    startup_position_allowed(&profile, motor_id, position),
+                    expected,
+                    "profile={} M{} position={}",
+                    profile.label,
+                    motor_id,
+                    position
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn profile_entry_order_is_restart_safe_and_probe_lifecycle_is_strict() {
+    let source = include_str!("matdog.rs");
+    let run_start = source.find("    async fn run(&mut self)").expect("run");
+    let inspect_start = source[run_start..]
+        .find("    async fn inspect_profile_entry(")
+        .map(|offset| run_start + offset)
+        .expect("inspect function");
+    let run = &source[run_start..inspect_start];
+
+    let inspect = run.find("Inspect restart-safe profile entry").unwrap();
+    let recover = run
+        .find("Recover home-only joints to digital home")
+        .unwrap();
+    let establish = run
+        .find("Establish geometry prerequisites from restart-safe state")
+        .unwrap();
+    let home_probe = run.find("Prime and return probing joint home").unwrap();
+    let baseline = run.find("Acquire moving-current baseline").unwrap();
+    assert!(
+        inspect < recover && recover < establish && establish < home_probe && home_probe < baseline
+    );
+    assert!(!run.contains("Verify all joints near digital home"));
+    assert!(!run.contains("Apply geometry prerequisites one joint at a time"));
+
+    let baseline_start = source
+        .find("    async fn acquire_moving_current_baseline(")
+        .expect("baseline function");
+    let approach_start = source[baseline_start..]
+        .find("    async fn approach(")
+        .map(|offset| baseline_start + offset)
+        .expect("approach function");
+    let backoff_start = source[approach_start..]
+        .find("    async fn backoff_and_verify(")
+        .map(|offset| approach_start + offset)
+        .expect("backoff function");
+    let baseline_body = &source[baseline_start..approach_start];
+    let approach_body = &source[approach_start..backoff_start];
+    assert!(baseline_body.contains("self.verify_profile_holds().await?;"));
+    assert!(!baseline_body.contains("self.verify_static_holds().await?;"));
+    assert!(approach_body.contains("self.verify_profile_holds().await?;"));
+    assert!(!approach_body.contains("self.verify_static_holds().await?;"));
+
+    let return_home = run.find("Return probing joint home").unwrap();
+    let torque_off = run[return_home..]
+        .find("self.set_motor_torque_verified(self.profile.motor_id, false)")
+        .map(|offset| return_home + offset)
+        .unwrap();
+    let restore = run
+        .find("Restore prerequisite joints one at a time")
+        .unwrap();
+    assert!(return_home < torque_off && torque_off < restore);
+}
+
+#[test]
+fn motion_timeout_covers_observed_m12_max_return() {
+    let distance = circular_distance(3327, HOME_TICK);
+    assert_eq!(distance, 1279);
+
+    // Hardware V12R measured 958 ticks in the old 12-second window at
+    // GOAL_SPEED=80, leaving 321 ticks. The fixed deadline is therefore
+    // mathematically insufficient for this valid MAX return.
+    assert!(u64::from(distance) > u64::from(GOAL_SPEED) * MOTION_TIMEOUT.as_secs());
+
+    let timeout = motion_timeout_for_distance(distance);
+    assert!(timeout > MOTION_TIMEOUT);
+    assert!(timeout >= Duration::from_secs(36));
+}
+
+#[test]
+fn motion_timeout_keeps_short_moves_fast_and_scales_for_every_profile() {
+    assert_eq!(motion_timeout_for_distance(64), MOTION_TIMEOUT);
+
+    for profile in all_profiles().unwrap() {
+        let distance = circular_distance(profile.guard_tick, HOME_TICK);
+        let ideal_ms_at_commanded_speed =
+            (u64::from(distance) * 1000 + u64::from(GOAL_SPEED) - 1) / u64::from(GOAL_SPEED);
+        assert!(
+            motion_timeout_for_distance(distance)
+                >= Duration::from_millis(ideal_ms_at_commanded_speed)
+                    .saturating_add(MOTION_SETTLE_MARGIN)
+        );
+    }
+}
+
+#[test]
+fn probe_home_tolerance_covers_observed_m13_settle_without_weakening_static_gate() {
+    let observed_error = circular_distance(2059, HOME_TICK);
+    assert_eq!(observed_error, 11);
+    assert_eq!(STATIC_TOLERANCE_TICKS, 10);
+    assert_eq!(PROBE_HOME_TOLERANCE_TICKS, 16);
+    assert!(observed_error > STATIC_TOLERANCE_TICKS);
+    assert!(observed_error <= PROBE_HOME_TOLERANCE_TICKS);
+}
+
+#[test]
+fn probe_home_tolerance_is_scoped_to_exactly_three_active_probe_returns() {
+    let source = include_str!("matdog.rs");
+    let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 5);
+    assert!(normalized.contains(
+        "if circular_distance(observation.position, target.target_tick) > STATIC_TOLERANCE_TICKS"
+    ));
+    assert!(normalized
+        .contains("if circular_distance(observation.position, target) <= STATIC_TOLERANCE_TICKS"));
+}
+
+#[test]
+fn probe_home_handoff_accepts_observed_m11_2062_only_for_probe() {
+    let profile = profile_for_arm_value("LF_LOWER_M11_MIN").unwrap();
+    let observed_error = circular_distance(2062, HOME_TICK);
+    assert_eq!(observed_error, 14);
+    assert!(observed_error > STATIC_TOLERANCE_TICKS);
+    assert!(observed_error <= PROBE_HOME_TOLERANCE_TICKS);
+    assert_eq!(home_hold_tolerance(&profile, 11, true), 16);
+    assert_eq!(home_hold_tolerance(&profile, 11, false), 10);
+    assert_eq!(home_hold_tolerance(&profile, 21, true), 10);
 }
 
 #[test]
@@ -556,4 +942,70 @@ fn canonical_matdog_source_has_no_eeprom_reset_offset_regwrite_action_or_freeze_
     ] {
         assert!(!source.contains(forbidden), "forbidden token: {forbidden}");
     }
+}
+
+#[test]
+fn v19_m13_2405_is_early_stall_not_contact() {
+    let profile = profile_for_arm_value("LF_HIP_M13_MIN").unwrap();
+    let baseline = BaselineStats {
+        median_current: 0,
+        mad_current: 0,
+    };
+    let mut detector = HybridContactDetector::new_for_profile(HOME_TICK, baseline, &profile);
+    let target = 2464;
+    assert_eq!(
+        detector.observe(observation(2405, 0, 1, target), target),
+        ContactState::FreeMotion
+    );
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(
+            detector.observe(observation(2405, 0, 1, target), target),
+            ContactState::FreeMotion
+        );
+    }
+    assert_eq!(
+        detector.observe(observation(2405, 0, 1, target), target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(observation(2405, 0, 1, target), target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(observation(2405, 0, 1, target), target),
+        ContactState::EarlyStall
+    );
+}
+
+#[test]
+fn detector_confirms_only_persistent_stall_inside_profile_corridor() {
+    let profile = profile_for_arm_value("LF_HIP_M13_MIN").unwrap();
+    let baseline = BaselineStats {
+        median_current: 0,
+        mad_current: 0,
+    };
+    let mut detector = HybridContactDetector::new_for_profile(HOME_TICK, baseline, &profile);
+    let target = 2568;
+    assert_eq!(
+        detector.observe(observation(2520, 0, 1, target), target),
+        ContactState::FreeMotion
+    );
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(
+            detector.observe(observation(2520, 0, 1, target), target),
+            ContactState::FreeMotion
+        );
+    }
+    assert_eq!(
+        detector.observe(observation(2520, 0, 1, target), target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(observation(2520, 0, 1, target), target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(observation(2520, 0, 1, target), target),
+        ContactState::ContactConfirmed
+    );
 }
