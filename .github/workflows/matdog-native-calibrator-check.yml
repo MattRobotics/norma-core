@@ -87,8 +87,9 @@ jobs:
               "global_torque_off_verified",
               "GUARD_OVERSHOOT_TICKS",
               "UPPER_30_DELTA",
-              "UPPER_50_DELTA",
+              "UPPER_85_DELTA",
               "UPPER_90_DELTA",
+              "LOWER_FOLDED_DELTA",
           )
           required_tests = (
               "profile_table_covers_exactly_24_unique_contacts",
