@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - matdog/lf-lower-m11-min-v28r-alignment
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
