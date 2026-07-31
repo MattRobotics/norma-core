@@ -28,6 +28,23 @@ def main() -> None:
     source = SOURCE.read_text(encoding="utf-8")
     tests = TESTS.read_text(encoding="utf-8")
 
+    obsolete_symmetric_helper = """fn expanded_linear_bounds(a: u16, b: u16, tolerance: u16) -> (u16, u16) {
+    let low = a.min(b).saturating_sub(tolerance);
+    let high = a
+        .max(b)
+        .saturating_add(tolerance)
+        .min(protocol::MAX_ANGLE_STEP);
+    (low, high)
+}
+
+"""
+    source = replace_exact(
+        source,
+        obsolete_symmetric_helper,
+        "",
+        "remove obsolete symmetric startup helper",
+    )
+
     helper_anchor = """fn home_hold_tolerance(
     profile: &ContactProfile,
     motor_id: u8,
@@ -123,7 +140,7 @@ fn startup_wrong_profile_residue_is_rejected() {
     new_scope = """fn probe_home_tolerance_is_scoped_to_startup_home_endpoint_and_active_probe_returns() {
     let source = include_str!("matdog.rs");
     let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 6);
+    assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 7);
     assert!(normalized.contains("StartupRole::Probe => startup_probe_bounds(profile)"));
 """
     tests = replace_exact(tests, old_scope, new_scope, "update tolerance scope test")
