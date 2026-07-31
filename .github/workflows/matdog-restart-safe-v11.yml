@@ -13,6 +13,7 @@ on:
       - "tools/matdog/apply_motion_timeout_v13.py"
       - "tools/matdog/apply_probe_home_tolerance_v18.py"
       - "tools/matdog/apply_ordered_sequence_v20.py"
+      - "tools/matdog/fix_ordered_sequence_v20_quote.py"
   workflow_dispatch:
 
 permissions:
@@ -40,7 +41,7 @@ jobs:
           base=32e3222c87016b7f5d7c1c1da497a4cea3e7b80a
           git merge-base --is-ancestor "$base" HEAD
           actual="$(git diff --name-only "$base"...HEAD | sort)"
-          expected=$'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/apply_motion_timeout_v13.py\ntools/matdog/apply_ordered_sequence_v20.py\ntools/matdog/apply_probe_home_tolerance_v18.py\ntools/matdog/restart_safe_v11_bundle.part00.b64\ntools/matdog/restart_safe_v11_bundle.part01.b64\ntools/matdog/restart_safe_v11_bundle.part02.b64\ntools/matdog/restart_safe_v11_bundle.part03.b64'
+          expected=$'.github/workflows/matdog-restart-safe-v11.yml\ntools/matdog/apply_motion_timeout_v13.py\ntools/matdog/apply_ordered_sequence_v20.py\ntools/matdog/apply_probe_home_tolerance_v18.py\ntools/matdog/fix_ordered_sequence_v20_quote.py\ntools/matdog/restart_safe_v11_bundle.part00.b64\ntools/matdog/restart_safe_v11_bundle.part01.b64\ntools/matdog/restart_safe_v11_bundle.part02.b64\ntools/matdog/restart_safe_v11_bundle.part03.b64'
           printf 'head=%s\nchanged_files:\n%s\n' "$(git rev-parse HEAD)" "$actual"
           test "$actual" = "$expected"
 
@@ -85,7 +86,8 @@ jobs:
             ci-tools/replay_restart_safe_v11.py \
             tools/matdog/apply_motion_timeout_v13.py \
             tools/matdog/apply_probe_home_tolerance_v18.py \
-            tools/matdog/apply_ordered_sequence_v20.py
+            tools/matdog/apply_ordered_sequence_v20.py \
+            tools/matdog/fix_ordered_sequence_v20_quote.py
 
       - name: Apply validated V11, V13, and V18 foundation
         shell: bash
@@ -109,10 +111,16 @@ jobs:
           tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
           python3 tools/matdog/apply_ordered_sequence_v20.py "$source" "$tests" \
             2>&1 | tee ci-output/apply-v20.log
+          python3 tools/matdog/fix_ordered_sequence_v20_quote.py "$source" \
+            2>&1 | tee ci-output/fix-v20-quote.log
           grep -q 'const UPPER_85_DELTA: i16 = 967;' "$source"
           grep -q 'const LOWER_FOLDED_DELTA: i16 = -990;' "$source"
           grep -q 'ContactState::EarlyStall' "$source"
           grep -q 'HIP hardware is blocked until ordered UPPER MIN/MAX and LOWER MIN/MAX phase proof is verified' "$source"
+          if grep -Fq '\"HIP hardware is blocked' "$source"; then
+            echo 'escaped Rust quote remained after normalization' >&2
+            exit 1
+          fi
 
       - name: Restart-safe audit, rustfmt, and changed-source scope
         shell: bash
