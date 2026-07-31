@@ -98,7 +98,7 @@ missing += [x for x in required_ui if x not in ui]
 found=[x for x in forbidden if x in source]
 assert not missing and not found, (missing, found)
 assert source.count('PROBE_HOME_TOLERANCE_TICKS') == 5
-assert source.count('STARTUP_PREREQUISITE_HOME_SETTLE_TICKS') == 4
+assert source.count('STARTUP_PREREQUISITE_HOME_SETTLE_TICKS') == 3
 assert source.count('probe_home_handoff_active') == 7
 print('V28R source/UI RAM-only contract: PASS')
 PY
