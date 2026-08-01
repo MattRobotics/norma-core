@@ -15,7 +15,7 @@ import gzip
 import hashlib
 from pathlib import Path
 
-EXPECTED_SOURCE_SHA256 = "b4703c876ca3fd3c633c5b30bc352bd526f1ff33bb6986c1d8bb250daf09ca1d"
+EXPECTED_SOURCE_SHA256 = "d668315a6bba3dd1904726542239967cae339f963f49123145e7dd5ac45f2f2e"
 PAYLOAD = Path(__file__).with_suffix(".py.gz.b64")
 
 
