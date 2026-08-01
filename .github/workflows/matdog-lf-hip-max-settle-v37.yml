@@ -1,0 +1,148 @@
+name: MATDOG LF HIP MAX Settle V37
+
+on:
+  push:
+    branches:
+      - matdog/lf-lower-m11-min-v28r-alignment
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lf-hip-max-settle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify exact transformation chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object software/drivers/st3215/src/auto_calibrate/matdog.rs)" = b286e309728e2cb49b397d130507d293cd7b03b2
+          test "$(git hash-object software/drivers/st3215/src/auto_calibrate/matdog_test.rs)" = 4d3f44f237722c46661e33992a0da5846bf225d4
+          test "$(git hash-object tools/matdog/apply_probe_startup_home_settle_v34.py)" = 66df5dd7a5efb289bf4b3e76e6e0d6bfddb84ae9
+          test "$(git hash-object tools/matdog/apply_probe_reverse_recovery_rehome_v35.py)" = f2e2b394151b326e03e349b6b72cebb76d16c6d3
+          test "$(git hash-object tools/matdog/apply_lf_hip_min_max_sequence_v36.py)" = 4b50b7c3199a4427e1ef727c069b57f8631274af
+          test "$(git hash-object tools/matdog/fix_lf_hip_sequence_startup_bounds_v36.py)" = 6f054424abdac6351160c5e0a644c5b866ba713a
+          test "$(git hash-object tools/matdog/fix_lf_hip_sequence_test_oracles_v36.py)" = 1dd4128aaa2dcd126e56fa92f14689ad6649b566
+          test "$(git hash-object tools/matdog/apply_lf_hip_max_settle_v37.py)" = 2d3bb6bcf85c3a7b95742757d75866d31ded87b5
+          python3 -m py_compile tools/matdog/apply_lf_hip_max_settle_v37.py
+
+      - name: Materialize V34 through V37
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          )
+          python3 tools/matdog/apply_probe_startup_home_settle_v34.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_probe_reverse_recovery_rehome_v35.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_lf_hip_min_max_sequence_v36.py
+          python3 tools/matdog/fix_lf_hip_sequence_startup_bounds_v36.py
+          python3 tools/matdog/fix_lf_hip_sequence_test_oracles_v36.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_lf_hip_max_settle_v37.py
+          rustfmt --edition 2021 "${files[@]}"
+          rustfmt --edition 2021 --check "${files[@]}"
+          changed=$(git diff --name-only | sort)
+          expected=$(printf '%s\n' "${files[@]}" | sort)
+          test "$changed" = "$expected"
+          git diff --check
+          grep -Fq 'OUTSIDE_CORRIDOR_SETTLE_TOLERANCE_TICKS: u16 = 16' "${files[0]}"
+          grep -Fq 'let target_settle_tolerance = if inside_acceptance' "${files[0]}"
+          grep -Fq 'lf_hip_max_v36_1981_settle_continues_once_but_real_stall_and_contact_remain_bounded' "${files[1]}"
+
+      - name: Install native build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler nasm
+
+      - name: Run complete ST3215 suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-output
+          cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
+          grep -Fq 'test result: ok. 94 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
+
+      - name: Build Station viewer
+        shell: bash
+        working-directory: software/station/clients/station-viewer
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Build Station release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --package station
+
+      - name: Enforce V37 bounded-settle and permanent safety contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          ! grep -Fq 'EepromRegister' "$src"
+          ! grep -Fq 'RamRegister::Lock' "$src"
+          ! grep -Fq 'reg_write: Some' "$src"
+          ! grep -Fq 'reset: Some' "$src"
+          ! grep -Fq 'reset_calibration: Some' "$src"
+          ! grep -Fq 'freeze_calibration: Some' "$src"
+          ! grep -Fq 'action: Some' "$src"
+          grep -Fq 'LF_HIP_M13_MIN_MAX' "$src"
+          grep -Fq 'OUTSIDE_CORRIDOR_SETTLE_TOLERANCE_TICKS: u16 = 16' "$src"
+          grep -Fq 'target_settle_tolerance' "$src"
+          grep -Fq 'circular_distance(settle.position, settle_target), 13' "$tests"
+          grep -Fq 'circular_distance(stuck.position, next_target), 45' "$tests"
+          grep -Fq 'contact_acceptance_bounds(&profile), (1472, 1600)' "$tests"
+          grep -Fq 'ContactState::EarlyStall' "$tests"
+          grep -Fq 'ContactState::ContactConfirmed' "$tests"
+
+      - name: Publish V37 hashes and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            target/release/station \
+            > ci-output/SHA256SUMS
+          cp software/drivers/st3215/src/auto_calibrate/matdog.rs ci-output/matdog.materialized.rs
+          cp software/drivers/st3215/src/auto_calibrate/matdog_test.rs ci-output/matdog_test.materialized.rs
+          cat > ci-output/SUMMARY.env <<'EOF'
+          result=PASS
+          correction=LF_HIP_MAX_PRE_CORRIDOR_SETTLE_V37
+          observed_target=1968
+          observed_present=1981
+          observed_error_ticks=13
+          strict_inside_corridor_tolerance_ticks=10
+          outside_corridor_settle_tolerance_ticks=16
+          persistent_next_step_error_ticks=45
+          persistent_stall_still_rejected=true
+          max_contact_corridor=1472..1600
+          min_then_max_same_program=true
+          final_home=true
+          final_global_torque_off=true
+          ram_only=true
+          goal_position_unsigned=true
+          hardware_started=false
+          serial_opened=false
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matdog-lf-hip-max-settle-v37
+          path: ci-output/
+          if-no-files-found: error
