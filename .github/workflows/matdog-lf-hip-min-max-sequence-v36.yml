@@ -28,10 +28,12 @@ jobs:
           test "$(git hash-object tools/matdog/apply_probe_reverse_recovery_rehome_v35.py)" = f2e2b394151b326e03e349b6b72cebb76d16c6d3
           test "$(git hash-object tools/matdog/apply_lf_hip_min_max_sequence_v36.py)" = 4b50b7c3199a4427e1ef727c069b57f8631274af
           test "$(git hash-object tools/matdog/fix_lf_hip_sequence_startup_bounds_v36.py)" = 6f054424abdac6351160c5e0a644c5b866ba713a
+          test "$(git hash-object tools/matdog/fix_lf_hip_sequence_test_oracles_v36.py)" = 1dd4128aaa2dcd126e56fa92f14689ad6649b566
           python3 -m py_compile tools/matdog/apply_probe_startup_home_settle_v34.py
           python3 -m py_compile tools/matdog/apply_probe_reverse_recovery_rehome_v35.py
           python3 -m py_compile tools/matdog/apply_lf_hip_min_max_sequence_v36.py
           python3 -m py_compile tools/matdog/fix_lf_hip_sequence_startup_bounds_v36.py
+          python3 -m py_compile tools/matdog/fix_lf_hip_sequence_test_oracles_v36.py
 
       - name: Reproduce exact rustfmt-normalized V35 source
         shell: bash
@@ -60,6 +62,7 @@ jobs:
           )
           python3 tools/matdog/apply_lf_hip_min_max_sequence_v36.py
           python3 tools/matdog/fix_lf_hip_sequence_startup_bounds_v36.py
+          python3 tools/matdog/fix_lf_hip_sequence_test_oracles_v36.py
           rustfmt --edition 2021 "${files[@]}"
           rustfmt --edition 2021 --check "${files[@]}"
           changed=$(git diff --name-only | sort)
@@ -124,6 +127,7 @@ jobs:
           grep -Fq 'target_tick: 3038' "$tests"
           grep -Fq 'contact_acceptance_bounds(&minimum), (2496, 2624)' "$tests"
           grep -Fq 'contact_acceptance_bounds(&maximum), (1472, 1600)' "$tests"
+          grep -Fq 'i16::from_le_bytes' "$tests"
 
       - name: Publish V36 hashes and summary
         shell: bash
