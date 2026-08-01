@@ -32,15 +32,19 @@ jobs:
           test "$(git hash-object tools/matdog/apply_lf_hip_max_settle_v37.py)" = 2d3bb6bcf85c3a7b95742757d75866d31ded87b5
           test -s tools/matdog/apply_full_calibration_v38.py
           test -s tools/matdog/fix_v38_motion_oracles.py
+          test -s tools/matdog/fix_v38_two_fine_metrology.py
           for index in 00 01 02 03 04 05; do
             test -s "tools/matdog/apply_full_calibration_v38.py.gz.b64.part${index}"
           done
           test "$(find tools/matdog -maxdepth 1 -name 'apply_full_calibration_v38.py.gz.b64.part*' | wc -l)" = 6
           grep -Fq 'EXPECTED_SOURCE_SHA256 = "d668315a6bba3dd1904726542239967cae339f963f49123145e7dd5ac45f2f2e"' tools/matdog/apply_full_calibration_v38.py
           grep -Fq 'EXPECTED_PART_COUNT = 6' tools/matdog/apply_full_calibration_v38.py
-          python3 -m py_compile tools/matdog/apply_full_calibration_v38.py tools/matdog/fix_v38_motion_oracles.py
+          python3 -m py_compile \
+            tools/matdog/apply_full_calibration_v38.py \
+            tools/matdog/fix_v38_motion_oracles.py \
+            tools/matdog/fix_v38_two_fine_metrology.py
 
-      - name: Materialize V34 through V38
+      - name: Materialize V34 through V38 hotfix
         shell: bash
         run: |
           set -euo pipefail
@@ -60,6 +64,7 @@ jobs:
           rustfmt --edition 2021 "${files[@]}"
           python3 tools/matdog/apply_full_calibration_v38.py
           python3 tools/matdog/fix_v38_motion_oracles.py
+          python3 tools/matdog/fix_v38_two_fine_metrology.py
           rustfmt --edition 2021 "${files[@]}"
           rustfmt --edition 2021 --check "${files[@]}"
           changed=$(git diff --name-only | sort)
@@ -80,7 +85,7 @@ jobs:
           set -euo pipefail
           mkdir -p ci-output
           cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
-          grep -Fq 'test result: ok. 100 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
+          grep -Fq 'test result: ok. 102 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
 
       - name: Build Station viewer
         shell: bash
@@ -112,6 +117,12 @@ jobs:
           grep -Fq 'ACCELERATION: u8 = 8' "$src"
           grep -Fq 'COARSE_STEP_TICKS: u16 = 64' "$src"
           grep -Fq 'HARD_CURRENT_ABORT_RAW: u16 = 200' "$src"
+          grep -Fq 'Coarse scouting approach — measurement discarded' "$src"
+          grep -Fq 'First fine metrology approach' "$src"
+          grep -Fq 'Second fine metrology approach' "$src"
+          grep -Fq 'repeatability_spread(first_tick, second_tick)' "$src"
+          ! grep -Fq 'repeatability_spread(coarse_scout_tick' "$src"
+          grep -Fq 'v38_2026_08_01_failure_is_coarse_loading_not_mechanical_change' "$tests"
           grep -Fq 'current_lf_hardware_evidence_proves_upper_zero_but_requires_stronger_lower_and_hip_recheck' "$tests"
           grep -Fq 'Duration::from_millis(20_988)' "$tests"
           ! grep -Fq 'EepromRegister' "$src"
@@ -136,7 +147,12 @@ jobs:
           cat > ci-output/SUMMARY.env <<'EOF'
           result=PASS
           program=LF_LEG_FULL_V38
-          one_auto_calibrate_click=true
+          repeatability_mode=COARSE_SCOUT_DISCARDED_TWO_IDENTICAL_FINE_PASSES
+          coarse_measurement_used_for_model_zero=false
+          fine_measurements_per_contact=2
+          observed_20260801_coarse_tick=1416
+          observed_20260801_fine_tick=1440
+          historical_fine_tick=1443
           upper_min_max=true
           lower_min_max=true
           hip_min_max=true
@@ -149,6 +165,7 @@ jobs:
           acceleration=8
           coarse_step_ticks=64
           fine_step_ticks=8
+          repeatability_tolerance_ticks=16
           hard_current_abort=200
           ram_only=true
           eeprom_written=false
@@ -160,6 +177,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: matdog-full-lf-calibration-v38
+          name: matdog-full-lf-calibration-v38-two-fine-hotfix
           path: ci-output/
           if-no-files-found: error
