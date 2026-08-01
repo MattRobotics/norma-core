@@ -24,13 +24,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = c5eca2774ec3ba4c37319ed2e16ab008236a2cc6
+          git merge-base --is-ancestor c5eca2774ec3ba4c37319ed2e16ab008236a2cc6 HEAD
           test "$(sha256sum tools/matdog/apply_lh_full_calibration_v39.py | cut -d' ' -f1)" = 92f8c6ab4f7d5c6e96fa7489b0ea34c762e3b316a5ecdac4785e56d8d26ba8a0
+          test -s tools/matdog/fix_v38_two_fine_metrology.py
           python3 -m py_compile \
             tools/matdog/apply_lh_full_calibration_v39.py \
+            tools/matdog/fix_v38_two_fine_metrology.py \
             tools/matdog/fix_v39_home_scope_oracle.py
 
-      - name: Materialize V34 through V39
+      - name: Materialize V34 through V39 hotfix
         shell: bash
         run: |
           set -euo pipefail
@@ -50,6 +52,7 @@ jobs:
           rustfmt --edition 2021 "${files[@]}"
           python3 tools/matdog/apply_full_calibration_v38.py
           python3 tools/matdog/fix_v38_motion_oracles.py
+          python3 tools/matdog/fix_v38_two_fine_metrology.py
           rustfmt --edition 2021 "${files[@]}"
           python3 tools/matdog/apply_lh_full_calibration_v39.py
           python3 tools/matdog/fix_v39_home_scope_oracle.py
@@ -73,7 +76,7 @@ jobs:
           set -euo pipefail
           mkdir -p ci-output
           cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
-          grep -Fq 'test result: ok. 104 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
+          grep -Fq 'test result: ok. 106 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
 
       - name: Build Station viewer
         shell: bash
@@ -109,6 +112,9 @@ jobs:
           grep -Fq 'GOAL_SPEED: u16 = 160' "$src"
           grep -Fq 'ACCELERATION: u8 = 8' "$src"
           grep -Fq 'HARD_CURRENT_ABORT_RAW: u16 = 200' "$src"
+          grep -Fq 'Coarse scouting approach — measurement discarded' "$src"
+          grep -Fq 'First fine metrology approach' "$src"
+          grep -Fq 'Second fine metrology approach' "$src"
           grep -Fq 'count(), 15' "$tests"
           ! grep -Fq 'EepromRegister' "$src"
           ! grep -Fq 'RamRegister::Lock' "$src"
@@ -132,6 +138,7 @@ jobs:
           cat > ci-output/SUMMARY.env <<'EOF'
           result=PASS
           program=LH_LEG_FULL_V39
+          repeatability_mode=COARSE_SCOUT_DISCARDED_TWO_IDENTICAL_FINE_PASSES
           one_auto_calibrate_click=true
           upper_min_max=true
           lower_min_max=true
@@ -157,6 +164,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: matdog-full-lh-calibration-v39
+          name: matdog-full-lh-calibration-v39-two-fine-hotfix
           path: ci-output/
           if-no-files-found: error
