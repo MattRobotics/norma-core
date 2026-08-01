@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Carry the V38 two-fine repeatability correction into V40.
-
-The coarse approach is a fast scouting pass and is discarded. Only two
-identical fine approaches, separated by verified backoff, enter the
-repeatability gate and the model-zero evidence.
-"""
+"""Carry the V38 two-fine repeatability correction into V40."""
 
 from pathlib import Path
 
@@ -24,7 +19,12 @@ def main() -> None:
     source = SOURCE.read_text(encoding="utf-8")
     tests = TESTS.read_text(encoding="utf-8")
 
-    source = replace_exact(source, "calibrator.total_steps = 14;", "calibrator.total_steps = 16;", "progress total")
+    old_progress = "calibrator.total_steps = 14;"
+    count = source.count(old_progress)
+    if count != 2:
+        raise SystemExit(f"contact-stage progress totals: expected exactly two matches, found {count}")
+    source = source.replace(old_progress, "calibrator.total_steps = 16;")
+
     old = '''        self.next_phase("Coarse approach")?;
         let first_tick = self.approach(COARSE_STEP_TICKS, baseline).await?;
 
@@ -64,10 +64,7 @@ fn current_rise_without_kinematic_stall_is_not_contact() {
 fn v38_repeatability_compares_two_identical_fine_approaches_not_the_coarse_scout() {
     let source = include_str!("matdog.rs");
     let start = source.find("async fn run(&mut self) -> Result<ContactResult, DynError>").unwrap();
-    let end = source[start..]
-        .find("async fn inspect_profile_entry")
-        .map(|offset| start + offset)
-        .unwrap();
+    let end = source[start..].find("async fn inspect_profile_entry").map(|offset| start + offset).unwrap();
     let body = &source[start..end];
     assert!(body.contains("let coarse_scout_tick = self.approach(COARSE_STEP_TICKS"));
     assert_eq!(body.matches("self.approach(FINE_STEP_TICKS, baseline).await?").count(), 2);
