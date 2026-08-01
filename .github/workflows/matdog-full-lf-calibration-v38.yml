@@ -30,8 +30,8 @@ jobs:
           test "$(git hash-object tools/matdog/fix_lf_hip_sequence_startup_bounds_v36.py)" = 6f054424abdac6351160c5e0a644c5b866ba713a
           test "$(git hash-object tools/matdog/fix_lf_hip_sequence_test_oracles_v36.py)" = 1dd4128aaa2dcd126e56fa92f14689ad6649b566
           test "$(git hash-object tools/matdog/apply_lf_hip_max_settle_v37.py)" = 2d3bb6bcf85c3a7b95742757d75866d31ded87b5
-          test "$(sha256sum tools/matdog/apply_full_calibration_v38.py | cut -d' ' -f1)" = 52461a266db4eda575e6eb6b87a4e29ebc02730f9f659fbe81166d0359bea2a2
-          test "$(sha256sum tools/matdog/apply_full_calibration_v38.py.gz.b64 | cut -d' ' -f1)" = 973a089d3b0c8b07f5e3a5589b99137a4ea5c23cdfdc887825ac9ebf1da27b31
+          test "$(sha256sum tools/matdog/apply_full_calibration_v38.py | cut -d' ' -f1)" = 5af602216848f57c751ae43a470f1b68e5862372f623af5a82582b44b5c3e00b
+          test "$(sha256sum tools/matdog/apply_full_calibration_v38.py.gz.b64 | cut -d' ' -f1)" = c3e90941145d7f7356643bc9b682e3ae87f7b1a6403a94ca27fe4c36b410c3be
           python3 -m py_compile tools/matdog/apply_full_calibration_v38.py
 
       - name: Materialize V34 through V38
