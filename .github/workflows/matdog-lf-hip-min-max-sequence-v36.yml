@@ -162,6 +162,8 @@ jobs:
           hardware_started=false
           serial_opened=false
           EOF
+          cp software/drivers/st3215/src/auto_calibrate/matdog.rs ci-output/matdog.materialized.rs
+          cp software/drivers/st3215/src/auto_calibrate/matdog_test.rs ci-output/matdog_test.materialized.rs
 
       - uses: actions/upload-artifact@v4
         with:
