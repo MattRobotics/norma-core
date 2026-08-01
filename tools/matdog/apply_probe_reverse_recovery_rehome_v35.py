@@ -143,7 +143,7 @@ const PROBE_PASSIVE_RESTORE_DRIFT_TICKS: u16 = 32;
     tests = replace_exact(
         tests,
         'assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 7);',
-        'assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 6);',
+        'assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 8);',
         "update V35 probe-home scope count",
     )
 
