@@ -25,9 +25,12 @@ jobs:
           test -s tools/matdog/apply_lf_native_v41.py
           test -s tools/matdog/apply_lf_native_v41.py.gz.b64.part00
           test -s tools/matdog/apply_lf_native_v41.py.gz.b64.part01
+          test -s tools/matdog/fix_lf_native_v41_test_oracles.py
           test "$(find tools/matdog -maxdepth 1 -name 'apply_lf_native_v41.py.gz.b64.part*' | wc -l)" = 2
           grep -Fq 'EXPECTED_SHA256 = "c0135527997ba5a9499013f2bf14b7a485b5de4874bdd8b7487d0eba7a9eb172"' tools/matdog/apply_lf_native_v41.py
-          python3 -m py_compile tools/matdog/apply_lf_native_v41.py
+          python3 -m py_compile \
+            tools/matdog/apply_lf_native_v41.py \
+            tools/matdog/fix_lf_native_v41_test_oracles.py
 
       - name: Materialize V34 through efficient V41
         shell: bash
@@ -52,6 +55,7 @@ jobs:
           python3 tools/matdog/fix_v38_two_fine_metrology.py
           rustfmt --edition 2021 "${files[@]}"
           python3 tools/matdog/apply_lf_native_v41.py
+          python3 tools/matdog/fix_lf_native_v41_test_oracles.py
           rustfmt --edition 2021 "${files[@]}"
           rustfmt --edition 2021 --check "${files[@]}"
           sha256sum "${files[@]}"
@@ -104,6 +108,8 @@ jobs:
           grep -Fq 'v41_affine_solver_accepts_complete_observed_lf_contact_set' "$tests"
           grep -Fq 'v41_full_lf_source_is_one_persistent_session_not_six_stage_restarts' "$tests"
           ! grep -Fq 'execute_contact_stage(' "$src"
+          ! grep -Fq 'execute_lf_hip_stage(' "$src"
+          ! grep -Fq 'place_lf_at_model_zero(' "$src"
           ! grep -Fq 'EepromRegister' "$src"
           ! grep -Fq 'RamRegister::Lock' "$src"
           ! grep -Fq 'reg_write: Some' "$src"
@@ -127,6 +133,7 @@ jobs:
           result=PASS
           program=LF_LEG_NATIVE_V41
           architecture=ONE_PERSISTENT_STATE_MACHINE
+          legacy_v38_stage_wrappers_present=false
           calibrator_recreated_per_endpoint=false
           initial_neutralization_count=1
           rear_parking_setup_count=1
