@@ -78,6 +78,14 @@ jobs:
           cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
           grep -Fq 'test result: ok. 88 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
 
+      - name: Build Station viewer
+        working-directory: software/station/clients/station-viewer
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
       - name: Build Station release
         shell: bash
         run: |
