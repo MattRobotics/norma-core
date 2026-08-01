@@ -20,13 +20,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify V38 base and V39 transformation
+      - name: Verify V38 base and V39 transformations
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD^)" = c5eca2774ec3ba4c37319ed2e16ab008236a2cc6
           test "$(sha256sum tools/matdog/apply_lh_full_calibration_v39.py | cut -d' ' -f1)" = 92f8c6ab4f7d5c6e96fa7489b0ea34c762e3b316a5ecdac4785e56d8d26ba8a0
-          python3 -m py_compile tools/matdog/apply_lh_full_calibration_v39.py
+          python3 -m py_compile \
+            tools/matdog/apply_lh_full_calibration_v39.py \
+            tools/matdog/fix_v39_home_scope_oracle.py
 
       - name: Materialize V34 through V39
         shell: bash
@@ -50,6 +52,7 @@ jobs:
           python3 tools/matdog/fix_v38_motion_oracles.py
           rustfmt --edition 2021 "${files[@]}"
           python3 tools/matdog/apply_lh_full_calibration_v39.py
+          python3 tools/matdog/fix_v39_home_scope_oracle.py
           rustfmt --edition 2021 "${files[@]}"
           rustfmt --edition 2021 --check "${files[@]}"
           changed=$(git diff --name-only | sort)
@@ -106,6 +109,7 @@ jobs:
           grep -Fq 'GOAL_SPEED: u16 = 160' "$src"
           grep -Fq 'ACCELERATION: u8 = 8' "$src"
           grep -Fq 'HARD_CURRENT_ABORT_RAW: u16 = 200' "$src"
+          grep -Fq 'count(), 15' "$tests"
           ! grep -Fq 'EepromRegister' "$src"
           ! grep -Fq 'RamRegister::Lock' "$src"
           ! grep -Fq 'reg_write: Some' "$src"
