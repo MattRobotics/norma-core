@@ -1,0 +1,156 @@
+name: MATDOG Full LH Calibration V39
+
+on:
+  push:
+    branches:
+      - matdog/lh-full-calibration-v39
+  pull_request:
+    branches:
+      - matdog/full-calibration-v38
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-lh-v39:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify V38 base and V39 transformation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = c5eca2774ec3ba4c37319ed2e16ab008236a2cc6
+          test "$(sha256sum tools/matdog/apply_lh_full_calibration_v39.py | cut -d' ' -f1)" = 92f8c6ab4f7d5c6e96fa7489b0ea34c762e3b316a5ecdac4785e56d8d26ba8a0
+          python3 -m py_compile tools/matdog/apply_lh_full_calibration_v39.py
+
+      - name: Materialize V34 through V39
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          )
+          python3 tools/matdog/apply_probe_startup_home_settle_v34.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_probe_reverse_recovery_rehome_v35.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_lf_hip_min_max_sequence_v36.py
+          python3 tools/matdog/fix_lf_hip_sequence_startup_bounds_v36.py
+          python3 tools/matdog/fix_lf_hip_sequence_test_oracles_v36.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_lf_hip_max_settle_v37.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_full_calibration_v38.py
+          python3 tools/matdog/fix_v38_motion_oracles.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_lh_full_calibration_v39.py
+          rustfmt --edition 2021 "${files[@]}"
+          rustfmt --edition 2021 --check "${files[@]}"
+          changed=$(git diff --name-only | sort)
+          expected=$(printf '%s\n' "${files[@]}" | sort)
+          test "$changed" = "$expected"
+          git diff --check
+
+      - name: Install native build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler nasm
+
+      - name: Run complete ST3215 suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-output
+          cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
+          grep -Fq 'test result: ok. 104 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
+
+      - name: Build Station viewer
+        shell: bash
+        working-directory: software/station/clients/station-viewer
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Build Station release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --package station
+
+      - name: Enforce LH rear-leg and permanent safety contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          grep -Fq 'LH_LEG_FULL_V39' "$src"
+          grep -Fq 'async fn run_lh_full_calibration(' "$src"
+          grep -Fq 'async fn place_lh_at_model_zero(' "$src"
+          grep -Fq 'fn lh_full_sequence_goal_allowed(' "$src"
+          grep -Fq 'Rear-leg exact-mesh checkpoint: no front-leg parking is required.' "$tests"
+          grep -Fq 'motor_id: 42' "$tests"
+          grep -Fq 'target_tick: 3072' "$tests"
+          grep -Fq 'motor_id: 41' "$tests"
+          grep -Fq 'target_tick: 3038' "$tests"
+          grep -Fq 'MODEL_ZERO_INCONSISTENT' "$src"
+          grep -Fq 'TORQUE_LIMIT: u16 = 500' "$src"
+          grep -Fq 'GOAL_SPEED: u16 = 160' "$src"
+          grep -Fq 'ACCELERATION: u8 = 8' "$src"
+          grep -Fq 'HARD_CURRENT_ABORT_RAW: u16 = 200' "$src"
+          ! grep -Fq 'EepromRegister' "$src"
+          ! grep -Fq 'RamRegister::Lock' "$src"
+          ! grep -Fq 'reg_write: Some' "$src"
+          ! grep -Fq 'reset: Some' "$src"
+          ! grep -Fq 'reset_calibration: Some' "$src"
+          ! grep -Fq 'freeze_calibration: Some' "$src"
+          ! grep -Fq 'action: Some' "$src"
+
+      - name: Publish V39 review artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            target/release/station \
+            > ci-output/SHA256SUMS
+          cp software/drivers/st3215/src/auto_calibrate/matdog.rs ci-output/matdog.materialized.rs
+          cp software/drivers/st3215/src/auto_calibrate/matdog_test.rs ci-output/matdog_test.materialized.rs
+          cat > ci-output/SUMMARY.env <<'EOF'
+          result=PASS
+          program=LH_LEG_FULL_V39
+          one_auto_calibrate_click=true
+          upper_min_max=true
+          lower_min_max=true
+          hip_min_max=true
+          rear_leg_requires_front_parking=false
+          lh_hip_upper_horizontal_tick=3072
+          lh_hip_lower_parallel_tick=3038
+          model_zero_from_both_urdf_endpoints=true
+          model_zero_rejects_inconsistent_contacts=true
+          torque_limit=500
+          goal_speed=160
+          acceleration=8
+          coarse_step_ticks=64
+          fine_step_ticks=8
+          hard_current_abort=200
+          ram_only=true
+          eeprom_written=false
+          goal_position_unsigned=true
+          final_global_torque_off=true
+          hardware_started=false
+          serial_opened=false
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matdog-full-lh-calibration-v39
+          path: ci-output/
+          if-no-files-found: error
