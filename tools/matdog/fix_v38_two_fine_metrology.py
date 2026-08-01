@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Fix V38+ repeatability so only identical fine approaches are compared.
-
-The coarse approach is a fast scouting pass. With the faster envelope it can
-elastically load a mechanical stop more than a fine pass and must never be
-used as a metrology sample. The sequence is:
-
-    coarse scout (discarded) -> backoff -> fine #1 -> backoff -> fine #2
-
-Only fine #1 and fine #2 enter the repeatability gate and ContactResult.
-"""
+"""Fix V38+ repeatability so only identical fine approaches are compared."""
 
 from pathlib import Path
 
@@ -28,12 +19,11 @@ def main() -> None:
     source = SOURCE.read_text(encoding="utf-8")
     tests = TESTS.read_text(encoding="utf-8")
 
-    source = replace_exact(
-        source,
-        "calibrator.total_steps = 14;",
-        "calibrator.total_steps = 16;",
-        "contact-stage progress total",
-    )
+    old_progress = "calibrator.total_steps = 14;"
+    count = source.count(old_progress)
+    if count != 2:
+        raise SystemExit(f"contact-stage progress totals: expected exactly two matches, found {count}")
+    source = source.replace(old_progress, "calibrator.total_steps = 16;")
 
     old_sequence = '''        self.next_phase("Coarse approach")?;
         let first_tick = self.approach(COARSE_STEP_TICKS, baseline).await?;
@@ -70,28 +60,14 @@ def main() -> None:
     anchor = '''#[test]
 fn current_rise_without_kinematic_stall_is_not_contact() {
 '''
-    new_tests = r'''#[test]
+    injected = r'''#[test]
 fn v38_repeatability_compares_two_identical_fine_approaches_not_the_coarse_scout() {
     let source = include_str!("matdog.rs");
-    let start = source
-        .find("async fn run(&mut self) -> Result<ContactResult, DynError>")
-        .unwrap();
-    let end = source[start..]
-        .find("async fn inspect_profile_entry")
-        .map(|offset| start + offset)
-        .unwrap();
+    let start = source.find("async fn run(&mut self) -> Result<ContactResult, DynError>").unwrap();
+    let end = source[start..].find("async fn inspect_profile_entry").map(|offset| start + offset).unwrap();
     let body = &source[start..end];
-
-    assert!(body.contains(
-        "let coarse_scout_tick = self.approach(COARSE_STEP_TICKS, baseline).await?;"
-    ));
-    assert_eq!(
-        body.matches("self.approach(FINE_STEP_TICKS, baseline).await?")
-            .count(),
-        2
-    );
-    assert!(body.contains("let first_tick = self.approach(FINE_STEP_TICKS"));
-    assert!(body.contains("let second_tick = self.approach(FINE_STEP_TICKS"));
+    assert!(body.contains("let coarse_scout_tick = self.approach(COARSE_STEP_TICKS"));
+    assert_eq!(body.matches("self.approach(FINE_STEP_TICKS, baseline).await?").count(), 2);
     assert!(body.contains("repeatability_spread(first_tick, second_tick)"));
     assert!(!body.contains("repeatability_spread(coarse_scout_tick"));
     assert!(body.contains("backoff_and_verify(first_tick, baseline)"));
@@ -108,7 +84,7 @@ fn v38_2026_08_01_failure_is_coarse_loading_not_mechanical_change() {
 #[test]
 fn current_rise_without_kinematic_stall_is_not_contact() {
 '''
-    tests = replace_exact(tests, anchor, new_tests, "V38 two-fine regression tests")
+    tests = replace_exact(tests, anchor, injected, "regression tests")
 
     SOURCE.write_text(source, encoding="utf-8")
     TESTS.write_text(tests, encoding="utf-8")
