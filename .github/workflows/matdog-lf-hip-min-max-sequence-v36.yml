@@ -1,0 +1,162 @@
+name: MATDOG LF HIP MIN MAX Sequence V36
+
+on:
+  push:
+    branches:
+      - matdog/lf-lower-m11-min-v28r-alignment
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lf-hip-min-max-sequence:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify exact V35 transformation chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object software/drivers/st3215/src/auto_calibrate/matdog.rs)" = b286e309728e2cb49b397d130507d293cd7b03b2
+          test "$(git hash-object software/drivers/st3215/src/auto_calibrate/matdog_test.rs)" = 4d3f44f237722c46661e33992a0da5846bf225d4
+          test "$(git hash-object tools/matdog/apply_probe_startup_home_settle_v34.py)" = 66df5dd7a5efb289bf4b3e76e6e0d6bfddb84ae9
+          test "$(git hash-object tools/matdog/apply_probe_reverse_recovery_rehome_v35.py)" = f2e2b394151b326e03e349b6b72cebb76d16c6d3
+          test "$(git hash-object tools/matdog/apply_lf_hip_min_max_sequence_v36.py)" = 7be221b2778c2c2da1802b627f6cca921137f187
+          python3 -m py_compile tools/matdog/apply_probe_startup_home_settle_v34.py
+          python3 -m py_compile tools/matdog/apply_probe_reverse_recovery_rehome_v35.py
+          python3 -m py_compile tools/matdog/apply_lf_hip_min_max_sequence_v36.py
+
+      - name: Reproduce exact rustfmt-normalized V35 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          )
+          python3 tools/matdog/apply_probe_startup_home_settle_v34.py
+          rustfmt --edition 2021 "${files[@]}"
+          test "$(sha256sum "${files[0]}" | awk '{print $1}')" = 6dfe739a55778a9cc3da1a866c9f902aaad091ba3cc815753c10e056848ff345
+          test "$(sha256sum "${files[1]}" | awk '{print $1}')" = 96c5cfae355822fa19686dd1c015d0d3c01e7f8db78e6d2ff72584f6bfa332d8
+          python3 tools/matdog/apply_probe_reverse_recovery_rehome_v35.py
+          rustfmt --edition 2021 "${files[@]}"
+          test "$(sha256sum "${files[0]}" | awk '{print $1}')" = 549c773a55c4c1c35eb2ba9d3fb53f4e56bafc80adcbb3a55e2bf3d4c960be9d
+          test "$(sha256sum "${files[1]}" | awk '{print $1}')" = 7631a2109272afe874ef1124c6fe93640718272f73417d66f9384396ce3524f3
+
+      - name: Apply V36 combined LF HIP sequence
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          )
+          python3 tools/matdog/apply_lf_hip_min_max_sequence_v36.py
+          rustfmt --edition 2021 "${files[@]}"
+          rustfmt --edition 2021 --check "${files[@]}"
+          changed=$(git diff --name-only | sort)
+          expected=$(printf '%s\n' "${files[@]}" | sort)
+          test "$changed" = "$expected"
+          git diff --check
+          grep -Fq 'const LF_HIP_SEQUENCE_ARM_VALUE: &str = "LF_HIP_M13_MIN_MAX";' "${files[0]}"
+          grep -Fq 'Set M12 horizontal and M11 parallel' "${files[0]}"
+          grep -Fq 'LF HIP MIN coarse approach' "${files[0]}"
+          grep -Fq 'LF HIP MAX coarse approach' "${files[0]}"
+          grep -Fq 'Restore M11, M12 and M42 to home' "${files[0]}"
+
+      - name: Install native build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler nasm
+          protoc --version
+          nasm -v
+
+      - name: Run complete ST3215 suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-output
+          cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
+          grep -Fq 'test result: ok. 93 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
+
+      - name: Build Station viewer
+        shell: bash
+        working-directory: software/station/clients/station-viewer
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Build Station release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --package station
+
+      - name: Enforce LF HIP sequence and permanent safety contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          ! grep -Fq 'EepromRegister' "$src"
+          ! grep -Fq 'RamRegister::Lock' "$src"
+          ! grep -Fq 'reg_write: Some' "$src"
+          ! grep -Fq 'reset: Some' "$src"
+          ! grep -Fq 'reset_calibration: Some' "$src"
+          ! grep -Fq 'freeze_calibration: Some' "$src"
+          ! grep -Fq 'action: Some' "$src"
+          grep -Fq 'isolated HIP hardware profiles remain blocked' "$src"
+          grep -Fq 'GoalPosition out of range' "$src"
+          grep -Fq 'LF_HIP_M13_MIN_MAX' "$src"
+          grep -Fq 'target_tick: 3072' "$tests"
+          grep -Fq 'target_tick: 3038' "$tests"
+          grep -Fq 'contact_acceptance_bounds(&minimum), (2496, 2624)' "$tests"
+          grep -Fq 'contact_acceptance_bounds(&maximum), (1472, 1600)' "$tests"
+
+      - name: Publish V36 hashes and summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            target/release/station \
+            > ci-output/SHA256SUMS
+          cat > ci-output/SUMMARY.env <<'EOF'
+          result=PASS
+          sequence=LF_HIP_M13_MIN_MAX
+          bus=5B14114953
+          probe_motor=13
+          shared_parking_m42=2389
+          shared_upper_horizontal_m12=3072
+          shared_lower_parallel_m11=3038
+          min_urdf_tick=2560
+          min_guard_tick=2624
+          min_contact_corridor=2496..2624
+          max_urdf_tick=1536
+          max_guard_tick=1472
+          max_contact_corridor=1472..1600
+          min_then_max_same_program=true
+          geometry_restored_once_after_both=true
+          final_home_m13_m11_m12_m42=true
+          final_global_torque_off=true
+          isolated_hip_profiles_blocked=true
+          ram_only=true
+          goal_position_unsigned=true
+          hardware_started=false
+          serial_opened=false
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matdog-lf-hip-min-max-sequence-v36
+          path: ci-output/
+          if-no-files-found: error
