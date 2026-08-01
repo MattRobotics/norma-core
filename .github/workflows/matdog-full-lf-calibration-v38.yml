@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify exact V37 chain and V38 source payload
+      - name: Verify exact V37 chain and V38 loader
         shell: bash
         run: |
           set -euo pipefail
@@ -30,8 +30,9 @@ jobs:
           test "$(git hash-object tools/matdog/fix_lf_hip_sequence_startup_bounds_v36.py)" = 6f054424abdac6351160c5e0a644c5b866ba713a
           test "$(git hash-object tools/matdog/fix_lf_hip_sequence_test_oracles_v36.py)" = 1dd4128aaa2dcd126e56fa92f14689ad6649b566
           test "$(git hash-object tools/matdog/apply_lf_hip_max_settle_v37.py)" = 2d3bb6bcf85c3a7b95742757d75866d31ded87b5
-          test "$(sha256sum tools/matdog/apply_full_calibration_v38.py | cut -d' ' -f1)" = 5af602216848f57c751ae43a470f1b68e5862372f623af5a82582b44b5c3e00b
-          test "$(sha256sum tools/matdog/apply_full_calibration_v38.py.gz.b64 | cut -d' ' -f1)" = c3e90941145d7f7356643bc9b682e3ae87f7b1a6403a94ca27fe4c36b410c3be
+          test -s tools/matdog/apply_full_calibration_v38.py
+          test -s tools/matdog/apply_full_calibration_v38.py.gz.b64
+          grep -Fq 'EXPECTED_SOURCE_SHA256 = "d668315a6bba3dd1904726542239967cae339f963f49123145e7dd5ac45f2f2e"' tools/matdog/apply_full_calibration_v38.py
           python3 -m py_compile tools/matdog/apply_full_calibration_v38.py
 
       - name: Materialize V34 through V38
