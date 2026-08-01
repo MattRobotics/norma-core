@@ -27,11 +27,13 @@ jobs:
           git merge-base --is-ancestor c62a540a52811e2c2e30fda5b76d171bb3761115 HEAD
           test "$(git hash-object tools/matdog/apply_all_legs_full_calibration_v40.py)" = 82c0dbdd1fd0a747c045c8cd5c055d75c48d90b2
           test "$(git hash-object tools/matdog/fix_v40_home_scope_oracle.py)" = 5780d43301361cf7fad5de4b93a08c21513ec29b
+          test -s tools/matdog/fix_v38_two_fine_metrology.py
           python3 -m py_compile \
+            tools/matdog/fix_v38_two_fine_metrology.py \
             tools/matdog/apply_all_legs_full_calibration_v40.py \
             tools/matdog/fix_v40_home_scope_oracle.py
 
-      - name: Materialize V34 through V40
+      - name: Materialize V34 through V40 hotfix
         shell: bash
         run: |
           set -euo pipefail
@@ -51,6 +53,7 @@ jobs:
           rustfmt --edition 2021 "${files[@]}"
           python3 tools/matdog/apply_full_calibration_v38.py
           python3 tools/matdog/fix_v38_motion_oracles.py
+          python3 tools/matdog/fix_v38_two_fine_metrology.py
           rustfmt --edition 2021 "${files[@]}"
           python3 tools/matdog/apply_lh_full_calibration_v39.py
           python3 tools/matdog/fix_v39_home_scope_oracle.py
@@ -77,7 +80,7 @@ jobs:
           set -euo pipefail
           mkdir -p ci-output
           cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
-          grep -Fq 'test result: ok. 108 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
+          grep -Fq 'test result: ok. 110 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
 
       - name: Build Station viewer
         shell: bash
@@ -93,7 +96,7 @@ jobs:
           set -euo pipefail
           cargo build --release --package station
 
-      - name: Enforce V40 order, fail-closed gates and permanent safety
+      - name: Enforce V40 order, metrology, fail-closed gates and permanent safety
         shell: bash
         run: |
           set -euo pipefail
@@ -111,6 +114,11 @@ jobs:
           grep -Fq 'GOAL_SPEED: u16 = 160' "$src"
           grep -Fq 'ACCELERATION: u8 = 8' "$src"
           grep -Fq 'HARD_CURRENT_ABORT_RAW: u16 = 200' "$src"
+          grep -Fq 'Coarse scouting approach — measurement discarded' "$src"
+          grep -Fq 'First fine metrology approach' "$src"
+          grep -Fq 'Second fine metrology approach' "$src"
+          grep -Fq 'repeatability_spread(first_tick, second_tick)' "$src"
+          ! grep -Fq 'repeatability_spread(coarse_scout_tick' "$src"
           grep -Fq 'count(), 16' "$tests"
           ! grep -Fq 'EepromRegister' "$src"
           ! grep -Fq 'RamRegister::Lock' "$src"
@@ -134,9 +142,12 @@ jobs:
           cat > ci-output/SUMMARY.env <<'EOF'
           result=PASS
           program=MATDOG_ALL_LEGS_FULL_V40
+          repeatability_mode=COARSE_SCOUT_DISCARDED_TWO_IDENTICAL_FINE_PASSES
           one_auto_calibrate_click=true
           canonical_order=LF_RF_RH_LH
           contacts_total=24
+          fine_measurements_total=48
+          coarse_measurements_used_for_model_zero=0
           model_zero_targets_total=12
           each_leg_model_zero_required_before_next=true
           final_home_applied_only_after_all_four_legs=true
@@ -151,6 +162,7 @@ jobs:
           acceleration=8
           coarse_step_ticks=64
           fine_step_ticks=8
+          repeatability_tolerance_ticks=16
           hard_current_abort=200
           ram_only=true
           eeprom_written=false
@@ -163,6 +175,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: matdog-all-legs-full-calibration-v40
+          name: matdog-all-legs-full-calibration-v40-two-fine-hotfix
           path: ci-output/
           if-no-files-found: error
