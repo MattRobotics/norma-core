@@ -1,0 +1,139 @@
+name: MATDOG Probe Reverse Recovery Rehome V35
+
+on:
+  push:
+    branches:
+      - matdog/lf-lower-m11-min-v28r-alignment
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bounded-recovery-rehome:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify exact base and transformations
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object software/drivers/st3215/src/auto_calibrate/matdog.rs)" = b286e309728e2cb49b397d130507d293cd7b03b2
+          test "$(git hash-object software/drivers/st3215/src/auto_calibrate/matdog_test.rs)" = 4d3f44f237722c46661e33992a0da5846bf225d4
+          test "$(git hash-object tools/matdog/apply_probe_startup_home_settle_v34.py)" = 66df5dd7a5efb289bf4b3e76e6e0d6bfddb84ae9
+          test "$(git hash-object tools/matdog/apply_probe_reverse_recovery_rehome_v35.py)" = af0c70ffefc630141d84c821af37e04725af1e44
+          python3 -m py_compile tools/matdog/apply_probe_startup_home_settle_v34.py
+          python3 -m py_compile tools/matdog/apply_probe_reverse_recovery_rehome_v35.py
+
+      - name: Reproduce exact rustfmt-normalized V34 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          )
+          python3 tools/matdog/apply_probe_startup_home_settle_v34.py
+          rustfmt --edition 2021 "${files[@]}"
+          test "$(sha256sum "${files[0]}" | awk '{print $1}')" = 6dfe739a55778a9cc3da1a866c9f902aaad091ba3cc815753c10e056848ff345
+          test "$(sha256sum "${files[1]}" | awk '{print $1}')" = 96c5cfae355822fa19686dd1c015d0d3c01e7f8db78e6d2ff72584f6bfa332d8
+
+      - name: Apply bounded V35 reverse recovery correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          )
+          python3 tools/matdog/apply_probe_reverse_recovery_rehome_v35.py
+          rustfmt --edition 2021 "${files[@]}"
+          rustfmt --edition 2021 --check "${files[@]}"
+          changed=$(git diff --name-only | sort)
+          expected=$(printf '%s\n' "${files[@]}" | sort)
+          test "$changed" = "$expected"
+          git diff --check
+          grep -Fq 'const PROBE_PASSIVE_RESTORE_DRIFT_TICKS: u16 = 32;' "${files[0]}"
+          grep -Fq 'M{} post-restore home settle failed' "${files[0]}"
+          grep -Fq 'probe_reverse_recovery_accepts_observed_2031_then_requires_final_rehome' "${files[1]}"
+
+      - name: Install native build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler nasm
+          protoc --version
+          nasm -v
+
+      - name: Run complete ST3215 suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-output
+          cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
+          grep -Fq 'test result: ok. 88 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
+
+      - name: Build Station release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --package station
+
+      - name: Enforce unchanged MATDOG safety contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          ! grep -Fq 'EepromRegister' "$src"
+          ! grep -Fq 'RamRegister::Lock' "$src"
+          ! grep -Fq 'reg_write: Some' "$src"
+          ! grep -Fq 'reset: Some' "$src"
+          ! grep -Fq 'reset_calibration: Some' "$src"
+          ! grep -Fq 'freeze_calibration: Some' "$src"
+          ! grep -Fq 'action: Some' "$src"
+          grep -Fq 'HIP hardware is blocked' "$src"
+          grep -Fq 'unsigned GoalPosition out of range' "$src"
+          grep -Fq 'profile.guard_tick.saturating_sub(STATIC_TOLERANCE_TICKS)' "$src"
+          grep -Fq 'PROBE_PASSIVE_RESTORE_DRIFT_TICKS' "$src"
+          grep -Fq 'STATIC_TOLERANCE_TICKS' "$src"
+
+      - name: Publish V35 hashes and summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            target/release/station \
+            > ci-output/SHA256SUMS
+          cat > ci-output/SUMMARY.env <<'EOF'
+          result=PASS
+          correction=V35_PROBE_REVERSE_RECOVERY_REHOME
+          observed_contact_coarse=1666
+          observed_contact_fine=1668
+          observed_contact_spread=2
+          observed_passive_home_position=2031
+          passive_restore_drift_limit=32
+          final_rehome_move_tolerance=10
+          final_torque_off_home_tolerance=16
+          guard_side_unchanged=true
+          contact_corridor_unchanged=true
+          contact_detection_unchanged=true
+          prerequisites_unchanged=true
+          ram_only=true
+          goal_position_unsigned=true
+          hip_profiles_blocked=true
+          hardware_started=false
+          serial_opened=false
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matdog-probe-reverse-recovery-rehome-v35
+          path: ci-output/
+          if-no-files-found: error
