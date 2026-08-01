@@ -28,12 +28,13 @@ def main() -> None:
     source = SOURCE.read_text(encoding="utf-8")
     tests = TESTS.read_text(encoding="utf-8")
 
-    source = replace_exact(
-        source,
-        "calibrator.total_steps = 14;",
-        "calibrator.total_steps = 16;",
-        "contact-stage progress total",
-    )
+    progress_old = "calibrator.total_steps = 14;"
+    progress_count = source.count(progress_old)
+    if progress_count != 2:
+        raise SystemExit(
+            f"contact-stage progress totals: expected exactly two matches, found {progress_count}"
+        )
+    source = source.replace(progress_old, "calibrator.total_steps = 16;")
 
     old_sequence = '''        self.next_phase("Coarse approach")?;
         let first_tick = self.approach(COARSE_STEP_TICKS, baseline).await?;
