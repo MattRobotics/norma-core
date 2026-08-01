@@ -26,7 +26,7 @@ jobs:
           test "$(git hash-object software/drivers/st3215/src/auto_calibrate/matdog_test.rs)" = 4d3f44f237722c46661e33992a0da5846bf225d4
           test "$(git hash-object tools/matdog/apply_probe_startup_home_settle_v34.py)" = 66df5dd7a5efb289bf4b3e76e6e0d6bfddb84ae9
           test "$(git hash-object tools/matdog/apply_probe_reverse_recovery_rehome_v35.py)" = f2e2b394151b326e03e349b6b72cebb76d16c6d3
-          test "$(git hash-object tools/matdog/apply_lf_hip_min_max_sequence_v36.py)" = 7be221b2778c2c2da1802b627f6cca921137f187
+          test "$(git hash-object tools/matdog/apply_lf_hip_min_max_sequence_v36.py)" = 4b50b7c3199a4427e1ef727c069b57f8631274af
           python3 -m py_compile tools/matdog/apply_probe_startup_home_settle_v34.py
           python3 -m py_compile tools/matdog/apply_probe_reverse_recovery_rehome_v35.py
           python3 -m py_compile tools/matdog/apply_lf_hip_min_max_sequence_v36.py
