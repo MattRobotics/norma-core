@@ -1,0 +1,170 @@
+name: MATDOG Efficient LF Native Calibration V41
+
+on:
+  push:
+    branches:
+      - matdog/lf-efficient-calibration-v41
+  pull_request:
+    branches:
+      - matdog/full-calibration-v38
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  efficient-lf-v41:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify V38 base and V41 payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s tools/matdog/apply_lf_native_v41.py
+          test -s tools/matdog/apply_lf_native_v41.py.gz.b64.part00
+          test -s tools/matdog/apply_lf_native_v41.py.gz.b64.part01
+          test "$(find tools/matdog -maxdepth 1 -name 'apply_lf_native_v41.py.gz.b64.part*' | wc -l)" = 2
+          grep -Fq 'EXPECTED_SHA256 = "c0135527997ba5a9499013f2bf14b7a485b5de4874bdd8b7487d0eba7a9eb172"' tools/matdog/apply_lf_native_v41.py
+          python3 -m py_compile tools/matdog/apply_lf_native_v41.py
+
+      - name: Materialize V34 through efficient V41
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          )
+          python3 tools/matdog/apply_probe_startup_home_settle_v34.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_probe_reverse_recovery_rehome_v35.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_lf_hip_min_max_sequence_v36.py
+          python3 tools/matdog/fix_lf_hip_sequence_startup_bounds_v36.py
+          python3 tools/matdog/fix_lf_hip_sequence_test_oracles_v36.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_lf_hip_max_settle_v37.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_full_calibration_v38.py
+          python3 tools/matdog/fix_v38_motion_oracles.py
+          python3 tools/matdog/fix_v38_two_fine_metrology.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_lf_native_v41.py
+          rustfmt --edition 2021 "${files[@]}"
+          rustfmt --edition 2021 --check "${files[@]}"
+          test "$(sha256sum "${files[0]}" | cut -d' ' -f1)" = c9dd9d4a9bd4fa6d2432cbc4c626125e6fb3751b806c01a35d7f8e7ef607b27c
+          test "$(sha256sum "${files[1]}" | cut -d' ' -f1)" = 7f31610243cd1639519ac8794da8648051d27e14991e5d5d31deeb2edb27571e
+          changed=$(git diff --name-only | sort)
+          expected=$(printf '%s\n' "${files[@]}" | sort)
+          test "$changed" = "$expected"
+          git diff --check
+
+      - name: Install native build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler nasm
+
+      - name: Run complete ST3215 suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-output
+          cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
+          grep -Fq 'test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
+
+      - name: Build Station viewer
+        shell: bash
+        working-directory: software/station/clients/station-viewer
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Build Station release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --package station
+
+      - name: Enforce persistent-session, adaptive-metrology and safety contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          grep -Fq 'LF_LEG_NATIVE_V41' "$src"
+          grep -Fq 'async fn run_lf_native_v41(' "$src"
+          grep -Fq 'async fn measure_lf_joint_pair_efficient(' "$src"
+          grep -Fq 'Park LH upper M42 once for the complete LF session' "$src"
+          grep -Fq 'Restore LH upper M42 once at end of LF calibration' "$src"
+          grep -Fq 'ADAPTIVE_FINE_SCOUT_TICKS: u16 = 32' "$src"
+          grep -Fq 'AFFINE_SCALE_MIN_PERMILLE: u16 = 850' "$src"
+          grep -Fq 'AFFINE_SCALE_MAX_PERMILLE: u16 = 1150' "$src"
+          grep -Fq 'v41_adaptive_fine_corridor_accepts_observed_hip_max_plateau_without_moving_guard' "$tests"
+          grep -Fq 'v41_affine_solver_accepts_complete_observed_lf_contact_set' "$tests"
+          grep -Fq 'v41_full_lf_source_is_one_persistent_session_not_six_stage_restarts' "$tests"
+          ! grep -Fq 'execute_contact_stage(' "$src"
+          ! grep -Fq 'EepromRegister' "$src"
+          ! grep -Fq 'RamRegister::Lock' "$src"
+          ! grep -Fq 'reg_write: Some' "$src"
+          ! grep -Fq 'reset: Some' "$src"
+          ! grep -Fq 'reset_calibration: Some' "$src"
+          ! grep -Fq 'freeze_calibration: Some' "$src"
+          ! grep -Fq 'action: Some' "$src"
+
+      - name: Publish V41 review artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            target/release/station \
+            > ci-output/SHA256SUMS
+          cp software/drivers/st3215/src/auto_calibrate/matdog.rs ci-output/matdog.materialized.rs
+          cp software/drivers/st3215/src/auto_calibrate/matdog_test.rs ci-output/matdog_test.materialized.rs
+          cat > ci-output/SUMMARY.env <<'EOF'
+          result=PASS
+          program=LF_LEG_NATIVE_V41
+          architecture=ONE_PERSISTENT_STATE_MACHINE
+          calibrator_recreated_per_endpoint=false
+          initial_neutralization_count=1
+          rear_parking_setup_count=1
+          rear_parking_restore_count=1
+          return_home_between_min_and_max=false
+          per_endpoint_global_torque_off=false
+          upper_min_to_max_direct=true
+          upper_to_lower_geometry_direct=true
+          lower_min_to_max_direct=true
+          lower_to_hip_geometry_direct=true
+          hip_min_to_max_direct=true
+          contacts_total=6
+          coarse_scouts_total=6
+          coarse_measurements_used_for_model_zero=0
+          fine_measurements_total=12
+          adaptive_fine_inner_extension_ticks=32
+          mechanical_guard_extended=false
+          affine_encoder_scale_enabled=true
+          affine_scale_min_permille=850
+          affine_scale_max_permille=1150
+          torque_limit=500
+          goal_speed=160
+          acceleration=8
+          hard_current_abort=200
+          ram_only=true
+          eeprom_written=false
+          goal_position_unsigned=true
+          final_global_torque_off=true
+          hardware_started=false
+          serial_opened=false
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matdog-efficient-lf-native-v41
+          path: ci-output/
+          if-no-files-found: error
