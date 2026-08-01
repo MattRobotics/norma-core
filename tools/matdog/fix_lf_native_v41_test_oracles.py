@@ -21,8 +21,8 @@ text = TESTS.read_text(encoding="utf-8")
 old = '''    // V38 adds one explicitly bounded use for final model-zero placement.
     assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 14);
 '''
-new = '''    // V41 adds bounded startup, persistent-session transition and final affine-home uses.
-    assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 18);
+new = '''    // V41 persistent-session startup, transitions and final affine-home use this bounded tolerance.
+    assert_eq!(source.matches("PROBE_HOME_TOLERANCE_TICKS").count(), 17);
 '''
 count = text.count(old)
 if count != 1:
