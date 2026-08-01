@@ -1,0 +1,168 @@
+name: MATDOG All Legs Full Calibration V40
+
+on:
+  push:
+    branches:
+      - matdog/all-legs-full-calibration-v40
+  pull_request:
+    branches:
+      - matdog/lh-full-calibration-v39
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  all-legs-v40:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify V39 base and V40 transformations
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor c62a540a52811e2c2e30fda5b76d171bb3761115 HEAD
+          test "$(git hash-object tools/matdog/apply_all_legs_full_calibration_v40.py)" = 82c0dbdd1fd0a747c045c8cd5c055d75c48d90b2
+          test "$(git hash-object tools/matdog/fix_v40_home_scope_oracle.py)" = 5780d43301361cf7fad5de4b93a08c21513ec29b
+          python3 -m py_compile \
+            tools/matdog/apply_all_legs_full_calibration_v40.py \
+            tools/matdog/fix_v40_home_scope_oracle.py
+
+      - name: Materialize V34 through V40
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          )
+          python3 tools/matdog/apply_probe_startup_home_settle_v34.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_probe_reverse_recovery_rehome_v35.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_lf_hip_min_max_sequence_v36.py
+          python3 tools/matdog/fix_lf_hip_sequence_startup_bounds_v36.py
+          python3 tools/matdog/fix_lf_hip_sequence_test_oracles_v36.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_lf_hip_max_settle_v37.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_full_calibration_v38.py
+          python3 tools/matdog/fix_v38_motion_oracles.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_lh_full_calibration_v39.py
+          python3 tools/matdog/fix_v39_home_scope_oracle.py
+          rustfmt --edition 2021 "${files[@]}"
+          python3 tools/matdog/apply_all_legs_full_calibration_v40.py
+          python3 tools/matdog/fix_v40_home_scope_oracle.py
+          rustfmt --edition 2021 "${files[@]}"
+          rustfmt --edition 2021 --check "${files[@]}"
+          changed=$(git diff --name-only | sort)
+          expected=$(printf '%s\n' "${files[@]}" | sort)
+          test "$changed" = "$expected"
+          git diff --check
+
+      - name: Install native build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler nasm
+
+      - name: Run complete ST3215 suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-output
+          cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
+          grep -Fq 'test result: ok. 108 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' ci-output/st3215-tests.log
+
+      - name: Build Station viewer
+        shell: bash
+        working-directory: software/station/clients/station-viewer
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Build Station release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --package station
+
+      - name: Enforce V40 order, fail-closed gates and permanent safety
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          grep -Fq 'MATDOG_ALL_LEGS_FULL_V40' "$src"
+          grep -Fq 'async fn run_all_legs_full_calibration(' "$src"
+          grep -Fq 'async fn execute_leg_full_contacts_v40(' "$src"
+          grep -Fq 'async fn require_leg_model_zero_v40(' "$src"
+          grep -Fq 'async fn place_all_legs_at_model_zero_v40(' "$src"
+          grep -Fq 'MODEL_ZERO_INCONSISTENT' "$src"
+          grep -Fq '[0_usize, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]' "$src"
+          grep -Fq '24 contacts, 12 accepted software q=0 targets' "$src"
+          grep -Fq 'TORQUE_LIMIT: u16 = 500' "$src"
+          grep -Fq 'GOAL_SPEED: u16 = 160' "$src"
+          grep -Fq 'ACCELERATION: u8 = 8' "$src"
+          grep -Fq 'HARD_CURRENT_ABORT_RAW: u16 = 200' "$src"
+          grep -Fq 'count(), 16' "$tests"
+          ! grep -Fq 'EepromRegister' "$src"
+          ! grep -Fq 'RamRegister::Lock' "$src"
+          ! grep -Fq 'reg_write: Some' "$src"
+          ! grep -Fq 'reset: Some' "$src"
+          ! grep -Fq 'reset_calibration: Some' "$src"
+          ! grep -Fq 'freeze_calibration: Some' "$src"
+          ! grep -Fq 'action: Some' "$src"
+
+      - name: Publish V40 review artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            target/release/station \
+            > ci-output/SHA256SUMS
+          cp software/drivers/st3215/src/auto_calibrate/matdog.rs ci-output/matdog.materialized.rs
+          cp software/drivers/st3215/src/auto_calibrate/matdog_test.rs ci-output/matdog_test.materialized.rs
+          cat > ci-output/SUMMARY.env <<'EOF'
+          result=PASS
+          program=MATDOG_ALL_LEGS_FULL_V40
+          one_auto_calibrate_click=true
+          canonical_order=LF_RF_RH_LH
+          contacts_total=24
+          model_zero_targets_total=12
+          each_leg_model_zero_required_before_next=true
+          final_home_applied_only_after_all_four_legs=true
+          final_home_order=ALL_HIPS_ALL_UPPERS_ALL_LOWERS
+          lf_uses_hardware_validated_combined_hip_stage=true
+          front_leg_parking_from_profile_table=true
+          rear_leg_front_parking_required=false
+          model_zero_from_both_urdf_endpoints=true
+          model_zero_rejects_inconsistent_contacts=true
+          torque_limit=500
+          goal_speed=160
+          acceleration=8
+          coarse_step_ticks=64
+          fine_step_ticks=8
+          hard_current_abort=200
+          ram_only=true
+          eeprom_written=false
+          goal_position_unsigned=true
+          final_global_torque_off=true
+          hardware_started=false
+          serial_opened=false
+          hardware_eligibility=BLOCKED_UNTIL_LF_V38_AND_LH_V39_PASS
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matdog-all-legs-full-calibration-v40
+          path: ci-output/
+          if-no-files-found: error
