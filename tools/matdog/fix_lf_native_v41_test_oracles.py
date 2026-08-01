@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
-"""Update source-shape oracles for the V41 persistent LF session."""
+"""Finalize V41 source shape and update persistent-session test oracles."""
 
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+SOURCE = ROOT / "software/drivers/st3215/src/auto_calibrate/matdog.rs"
 TESTS = ROOT / "software/drivers/st3215/src/auto_calibrate/matdog_test.rs"
+
+source = SOURCE.read_text(encoding="utf-8")
+start_marker = "async fn execute_contact_stage("
+end_marker = "async fn run_lf_full_calibration("
+if source.count(start_marker) != 1 or source.count(end_marker) != 1:
+    raise SystemExit("V41 legacy-stage cleanup markers are not unique")
+start = source.index(start_marker)
+end = source.index(end_marker, start)
+source = source[:start] + source[end:]
+SOURCE.write_text(source, encoding="utf-8")
 
 text = TESTS.read_text(encoding="utf-8")
 old = '''    // V38 adds one explicitly bounded use for final model-zero placement.
