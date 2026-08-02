@@ -43,12 +43,13 @@ jobs:
       - name: Prepare verification logs
         run: mkdir -p ci-output
 
-      - name: Enforce canonical 24-contact RAM-only contract
+      - name: Enforce canonical 24-contact RAM-only q0-first contract
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY' | tee ci-output/ram-only-contract.log
           from pathlib import Path
+          import re
 
           source_path = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs")
           tests_path = Path("software/drivers/st3215/src/auto_calibrate/matdog_test.rs")
@@ -70,6 +71,7 @@ jobs:
               "action: Some",
               "Offset.address",
               "matdog_v2",
+              "LF_FIXED_SCALE_REJECT",
           )
           forbidden_other = (
               "write.motor_id != 12",
@@ -87,14 +89,18 @@ jobs:
               "global_torque_off_verified",
               "GUARD_OVERSHOOT_TICKS",
               "UPPER_30_DELTA",
-              "UPPER_50_DELTA",
+              "UPPER_85_DELTA",
               "UPPER_90_DELTA",
+              "MATDOG LF Q0 DIAGNOSTIC ONLY",
           )
           required_tests = (
               "profile_table_covers_exactly_24_unique_contacts",
               "front_lower_restore_order_keeps_rear_parking_until_active_leg_is_home",
               "armed_ram_gate_restricts_registers_values_motors_and_goal_windows",
               "canonical_matdog_source_has_no_eeprom_reset_offset_regwrite_action_or_freeze_path",
+              "endpoint_derived_q0_is_diagnostic_only_and_never_a_return_target",
+              "full_lf_final_return_order_uses_saved_q0_for_m13_m11_m12_then_m42",
+              "historical_contacts_keep_endpoint_and_affine_diagnostics_without_replacing_q0",
           )
           required_port = (
               "matdog_command_allowed_with",
@@ -105,6 +111,46 @@ jobs:
               "mod matdog;",
               "matdog_ram_write_allowed_for_arm_value",
           )
+
+          expected_constants = {
+              "HOME_TICK": 2048,
+              "GUARD_OVERSHOOT_TICKS": 64,
+              "UPPER_30_DELTA": 341,
+              "UPPER_85_DELTA": 967,
+              "UPPER_90_DELTA": 1024,
+          }
+          constant_errors = []
+          for name, expected in expected_constants.items():
+              match = re.search(
+                  rf"(?m)^const {name}: [^=]+ = (-?\d+);$",
+                  source,
+              )
+              if match is None:
+                  constant_errors.append(f"missing constant {name}")
+              elif int(match.group(1)) != expected:
+                  constant_errors.append(
+                      f"{name}={match.group(1)} expected {expected}"
+                  )
+
+          return_start = source.find(
+              "self.transition_lf_state(LfSessionState::ReturnHip)"
+          )
+          return_end = source.find(
+              "self.transition_lf_state(LfSessionState::RestoreParking)",
+              return_start,
+          )
+          if return_start < 0 or return_end < 0:
+              constant_errors.append("missing final LF return state-machine section")
+          else:
+              return_body = source[return_start:return_end]
+              if "fixed_scale.estimated_zero_tick" in return_body:
+                  constant_errors.append("derived fixed-scale q0 used as return target")
+              if "affine.estimated_zero_tick" in return_body:
+                  constant_errors.append("derived affine q0 used as return target")
+              if return_body.count("HOME_TICK") != 6:
+                  constant_errors.append(
+                      f"final LF return HOME_TICK uses={return_body.count('HOME_TICK')} expected 6"
+                  )
 
           found = [token for token in forbidden_source if token in source]
           found += [token for token in forbidden_other if token in port or token in module]
@@ -123,14 +169,16 @@ jobs:
           if stale:
               found.extend(str(path) for path in stale)
 
-          if found or missing:
+          if found or missing or constant_errors:
               if found:
                   print(f"forbidden or stale MATDOG source: {found}")
               if missing:
                   print(f"missing MATDOG source requirements: {missing}")
+              if constant_errors:
+                  print(f"MATDOG q0/geometry contract errors: {constant_errors}")
               raise SystemExit(1)
 
-          print("MATDOG canonical 24-contact RAM-only contract: PASS")
+          print("MATDOG canonical 24-contact RAM-only q0-first contract: PASS")
           PY
 
       - name: MATDOG Rust format check
@@ -149,6 +197,14 @@ jobs:
         run: |
           set -o pipefail
           cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
+
+      - name: Headless runner unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 -m unittest -v \
+            tools.matdog.test_matdog_headless_auto_calibrate \
+            2>&1 | tee ci-output/headless-runner-tests.log
 
       - name: Create CI-only Station viewer stub
         shell: bash
