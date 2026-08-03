@@ -8,6 +8,7 @@ on:
       - "tools/matdog/apply_lf_freeze_source_upgrade.py"
       - "tools/matdog/fix_lf_upgrade_transformer_v2.py"
       - "tools/matdog/fix_lf_upgrade_transformer_v3.py"
+      - "tools/matdog/fix_lf_upgrade_tests_v4.py"
       - "tools/matdog/matdog_lf_profile.py"
       - "tools/matdog/test_matdog_lf_profile.py"
       - "software/drivers/st3215/src/bin/matdog_lf_freeze.rs"
@@ -41,6 +42,7 @@ jobs:
           python3 tools/matdog/fix_lf_upgrade_transformer_v2.py
           python3 tools/matdog/fix_lf_upgrade_transformer_v3.py
           python3 tools/matdog/apply_lf_freeze_source_upgrade.py --apply
+          python3 tools/matdog/fix_lf_upgrade_tests_v4.py
           rustfmt --edition 2021 --config skip_children=true \
             software/drivers/st3215/src/port.rs \
             software/drivers/st3215/src/auto_calibrate/matdog.rs \
@@ -56,14 +58,17 @@ jobs:
           port = Path("software/drivers/st3215/src/port.rs").read_text()
           matdog = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs").read_text()
           runner = Path("tools/matdog/matdog_headless_auto_calibrate.py").read_text()
+          runner_tests = Path("tools/matdog/test_matdog_headless_auto_calibrate.py").read_text()
           provisioner = Path("software/drivers/st3215/src/bin/matdog_lf_freeze.rs").read_text()
-          combined = port + matdog + runner + provisioner
+          combined = port + matdog + runner + runner_tests + provisioner
           forbidden = (
               "MATDOG_MAX_TRANSIENTS_PER_MOTOR",
               "MATDOG_MAX_TRANSIENTS_TOTAL",
               "MATDOG_IMMEDIATE_THERMAL_ABORT_C",
               "confirmed_or_budget_exhausted",
               "classify_matdog_temperature_sample",
+              "test_superseded_thermal_fault_cannot_be_hidden_by_latest_normal",
+              "self.assertGreaterEqual(run.max_frames_per_head_drain, 1_001)",
           )
           required = (
               "read_motor_temperature_direct",
@@ -79,6 +84,7 @@ jobs:
               "default=10",
               "default=1.0",
               "m11_last_recorded_stamp_ns",
+              "test_superseded_bulk_temperature_is_replaced_by_confirmed_latest",
               "LF_FREEZE_COMMIT",
               "rollback",
           )
@@ -123,6 +129,7 @@ jobs:
           cp software/drivers/st3215/src/auto_calibrate/matdog.rs lf-freeze-deliverable/source/
           cp software/drivers/st3215/src/auto_calibrate/matdog_test.rs lf-freeze-deliverable/source/
           cp tools/matdog/matdog_headless_auto_calibrate.py lf-freeze-deliverable/source/
+          cp tools/matdog/test_matdog_headless_auto_calibrate.py lf-freeze-deliverable/source/
           cp .github/workflows/matdog-native-calibrator-check.yml lf-freeze-deliverable/source/
           cp target/release/station lf-freeze-deliverable/bin/
           cp target/release/matdog_lf_freeze lf-freeze-deliverable/bin/
