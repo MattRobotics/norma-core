@@ -33,23 +33,24 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           source_path = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs")
           test_path = Path("software/drivers/st3215/src/auto_calibrate/matdog_test.rs")
           source = source_path.read_text()
           tests = test_path.read_text()
 
-          speed_gate = '''            let speed = speed_magnitude(observation.velocity);
-            if speed > LF_HELD_MAX_SPEED_RAW {
-                return Err(format!(
-                    "non-participating M{motor_id} moved unexpectedly: speed={speed}"
-                ));
-            }
-          '''
-          if speed_gate in source:
-              if source.count(speed_gate) != 1:
-                  raise SystemExit(f"unexpected instantaneous speed gate count: {source.count(speed_gate)}")
-              source = source.replace(speed_gate, "", 1)
+          pattern = re.compile(
+              r'''\n[ \t]*let speed = speed_magnitude\(observation\.velocity\);\n'''
+              r'''[ \t]*if speed > LF_HELD_MAX_SPEED_RAW \{\n'''
+              r'''[ \t]*return Err\(format!\(\n'''
+              r'''[ \t]*"non-participating M\{motor_id\} moved unexpectedly: speed=\{speed\}"\n'''
+              r'''[ \t]*\)\);\n'''
+              r'''[ \t]*\}\n'''
+          )
+          source, removed = pattern.subn("\n", source, count=1)
+          if removed not in (0, 1):
+              raise SystemExit(f"unexpected instantaneous speed gate removal count: {removed}")
 
           test_name = "nonparticipating_torque_off_uses_real_position_drift_not_instantaneous_speed"
           if test_name not in tests:
