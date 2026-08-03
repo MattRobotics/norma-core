@@ -80,21 +80,19 @@ jobs:
           cargo build --release --package st3215 --bin matdog_lf_freeze
           rm -rf software/station/clients/station-viewer/dist
 
-      - name: Remove one-time transformation infrastructure
+      - name: Prepare source-only commit
         shell: bash
         run: |
           set -euo pipefail
+          git restore --source=HEAD -- .github/workflows/matdog-native-calibrator-check.yml
           rm -f \
             tools/matdog/apply_lf_freeze_source_upgrade.py \
             tools/matdog/fix_lf_upgrade_transformer_v2.py \
             tools/matdog/fix_lf_upgrade_transformer_v3.py \
-            tools/matdog/fix_lf_upgrade_tests_v4.py \
-            .github/workflows/matdog-lf-freeze-upgrade-check.yml \
-            .github/workflows/matdog-lf-freeze-upgrade-check-v2.yml \
-            .github/workflows/matdog-lf-freeze-materialize.yml
+            tools/matdog/fix_lf_upgrade_tests_v4.py
           git diff --check
 
-      - name: Commit reviewed final source
+      - name: Commit reviewed production source
         shell: bash
         run: |
           set -euo pipefail
