@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: matdog-native-calibrator-${{ github.event.pull_request.number || github.ref }}
@@ -25,10 +25,6 @@ jobs:
     steps:
       - name: Checkout reviewed revision
         uses: actions/checkout@v4
-        with:
-          ref: matdog/lf-q0-contract-v42
-          fetch-depth: 0
-          persist-credentials: true
 
       - name: Setup protoc
         uses: arduino/setup-protoc@v3
@@ -40,19 +36,6 @@ jobs:
         uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt
-
-      - name: Materialize reviewed V23 static-hold and friction correction
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 tools/matdog/materialize_static_hold_friction_fix.py
-          rustfmt --edition 2021 \
-            software/drivers/st3215/src/auto_calibrate/matdog.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
-          rustfmt --edition 2021 --check \
-            software/drivers/st3215/src/auto_calibrate/matdog.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
-          git diff --check
 
       - name: Install Station native build dependency
         run: sudo apt-get update && sudo apt-get install -y nasm
@@ -249,23 +232,6 @@ jobs:
       - name: Remove CI-only viewer stub
         if: always()
         run: rm -rf software/station/clients/station-viewer/dist
-
-      - name: Commit reviewed V23 correction
-        if: success()
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add \
-            software/drivers/st3215/src/auto_calibrate/matdog.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
-          if git diff --cached --quiet; then
-            echo "V23 correction already materialized."
-          else
-            git commit -m "fix(matdog): distinguish friction plateaus from held motion"
-            git push origin HEAD:matdog/lf-q0-contract-v42
-          fi
 
       - name: Upload offline verification logs
         if: always()
