@@ -347,12 +347,8 @@ async fn read_backup(
         return_delay: read_u8(port, motor_id, EepromRegister::ReturnDelay.address()).await?,
         max_temperature: read_u8(port, motor_id, EepromRegister::MaxTemperature.address()).await?,
         max_torque: read_u16(port, motor_id, EepromRegister::MaxTorque.address()).await?,
-        protection_current: read_u16(
-            port,
-            motor_id,
-            EepromRegister::ProtectionCurrent.address(),
-        )
-        .await?,
+        protection_current: read_u16(port, motor_id, EepromRegister::ProtectionCurrent.address())
+            .await?,
         overload_torque: read_u8(port, motor_id, EepromRegister::OverloadTorque.address()).await?,
         lock: read_u8(port, motor_id, RamRegister::Lock.address()).await?,
         present_position: read_u16(port, motor_id, RamRegister::PresentPosition.address()).await?,
@@ -447,10 +443,13 @@ async fn run() -> Result<(), String> {
         ping(&mut port, motor_id).await?;
         let backup = read_backup(&mut port, motor_id).await?;
         if backup.torque_enabled != 0 {
-            return Err(format!("M{motor_id} torque must be OFF before EEPROM freeze"));
+            return Err(format!(
+                "M{motor_id} torque must be OFF before EEPROM freeze"
+            ));
         }
         let stage_motor = stage.motors.get(&motor_id).unwrap().clone();
-        let position_error = circular_distance(backup.present_position, stage_motor.estimated_q0_tick);
+        let position_error =
+            circular_distance(backup.present_position, stage_motor.estimated_q0_tick);
         if position_error > HOME_TOLERANCE_TICKS {
             return Err(format!(
                 "M{motor_id} is not at staged q0: present={}, expected={}, error={} > {}",
@@ -527,10 +526,13 @@ async fn run() -> Result<(), String> {
     for plan in &plans {
         let motor_id = plan.stage.motor_id;
         let offset = read_i16(&mut port, motor_id, EepromRegister::Offset.address()).await?;
-        let position = read_u16(&mut port, motor_id, RamRegister::PresentPosition.address()).await?;
+        let position =
+            read_u16(&mut port, motor_id, RamRegister::PresentPosition.address()).await?;
         let lock = read_u8(&mut port, motor_id, RamRegister::Lock.address()).await?;
         let torque = read_u8(&mut port, motor_id, RamRegister::TorqueEnable.address()).await?;
-        if offset != plan.new_offset || circular_distance(position, HOME_TICK) > HOME_TOLERANCE_TICKS {
+        if offset != plan.new_offset
+            || circular_distance(position, HOME_TICK) > HOME_TOLERANCE_TICKS
+        {
             let rollback_error = rollback(&mut port, &changed).await.err();
             return Err(match rollback_error {
                 Some(rollback) => format!(
@@ -558,10 +560,7 @@ async fn run() -> Result<(), String> {
         ));
         result.push_str(&format!("motor.{motor_id}.position={}\n", position));
         result.push_str(&format!("motor.{motor_id}.lock={}\n", lock));
-        result.push_str(&format!(
-            "motor.{motor_id}.torque_enabled={}\n",
-            torque
-        ));
+        result.push_str(&format!("motor.{motor_id}.torque_enabled={}\n", torque));
     }
     atomic_write(&result_path, &result)?;
     println!("MATDOG_LF_EEPROM_FREEZE=PASS");

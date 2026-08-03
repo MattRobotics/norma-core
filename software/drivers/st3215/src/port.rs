@@ -36,10 +36,9 @@ const LEGACY_MOTOR_IDS: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 const MATDOG_MOTOR_IDS: [u8; 12] = [11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43];
 const MATDOG_EXPECTED_TEMPERATURE_LIMIT_C: u8 = 70;
 const MATDOG_MAX_TEMPERATURE_LIMIT_ADDRESS: usize = 0x0D;
-const MATDOG_IMMEDIATE_THERMAL_ABORT_C: u8 = 85;
+const MATDOG_THERMAL_SAMPLE_PERIOD: Duration = Duration::from_millis(500);
+const MATDOG_THERMAL_CONFIRMATION_DELAY: Duration = Duration::from_millis(50);
 const MATDOG_THERMAL_CONFIRMATION_READS: usize = 3;
-const MATDOG_MAX_TRANSIENTS_PER_MOTOR: u8 = 1;
-const MATDOG_MAX_TRANSIENTS_TOTAL: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatdogThermalDecision {
@@ -49,44 +48,33 @@ enum MatdogThermalDecision {
     InvalidConfiguredLimit,
 }
 
-fn classify_matdog_temperature_sample(
+#[derive(Debug, Default)]
+struct MatdogThermalState {
+    last_direct_read: HashMap<u8, Instant>,
+    last_confirmed: HashMap<u8, u8>,
+}
+
+fn classify_matdog_direct_temperature_samples(
     configured_limit_c: u8,
-    initial_temperature_c: u8,
-    confirmation_temperatures_c: &[u8],
-    prior_motor_transients: u8,
-    prior_total_transients: u8,
+    samples: &[u8],
 ) -> MatdogThermalDecision {
     if configured_limit_c != MATDOG_EXPECTED_TEMPERATURE_LIMIT_C {
         return MatdogThermalDecision::InvalidConfiguredLimit;
     }
-    if initial_temperature_c <= configured_limit_c {
-        return MatdogThermalDecision::Normal;
+    if samples.is_empty() {
+        return MatdogThermalDecision::Transient;
     }
-    if initial_temperature_c >= MATDOG_IMMEDIATE_THERMAL_ABORT_C {
-        return MatdogThermalDecision::Confirmed;
-    }
-    if confirmation_temperatures_c.len() != MATDOG_THERMAL_CONFIRMATION_READS {
-        return MatdogThermalDecision::Confirmed;
-    }
-    if confirmation_temperatures_c
-        .iter()
-        .any(|temperature| *temperature >= MATDOG_IMMEDIATE_THERMAL_ABORT_C)
-    {
-        return MatdogThermalDecision::Confirmed;
-    }
-    let confirmed_over_limit = confirmation_temperatures_c
+    let over_limit = samples
         .iter()
         .filter(|temperature| **temperature > configured_limit_c)
         .count();
-    if confirmed_over_limit >= 2 {
-        return MatdogThermalDecision::Confirmed;
+    if over_limit >= 2 {
+        MatdogThermalDecision::Confirmed
+    } else if over_limit == 0 {
+        MatdogThermalDecision::Normal
+    } else {
+        MatdogThermalDecision::Transient
     }
-    if prior_motor_transients >= MATDOG_MAX_TRANSIENTS_PER_MOTOR
-        || prior_total_transients >= MATDOG_MAX_TRANSIENTS_TOTAL
-    {
-        return MatdogThermalDecision::Confirmed;
-    }
-    MatdogThermalDecision::Transient
 }
 
 fn matdog_command_allowed_with<F>(command: &TxEnvelope, ram_write_allowed: F) -> bool
@@ -275,8 +263,7 @@ impl St3215Port {
     ) {
         let mut last_seen_motors = HashSet::new();
         let mut missing_since: HashMap<u8, Instant> = HashMap::new();
-        let mut matdog_thermal_transients: HashMap<u8, u8> = HashMap::new();
-        let mut matdog_thermal_transient_total = 0_u8;
+        let mut matdog_thermal_state = MatdogThermalState::default();
         let mut interval = tokio::time::interval(Duration::from_millis(20));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -396,8 +383,7 @@ impl St3215Port {
                         &command_waiting,
                         search_for_new,
                         &eeprom_cache,
-                        &mut matdog_thermal_transients,
-                        &mut matdog_thermal_transient_total,
+                        &mut matdog_thermal_state,
                     )
                     .await
                     {
@@ -423,6 +409,48 @@ impl St3215Port {
         combined.freeze()
     }
 
+    fn overwrite_temperature(full_data: Bytes, temperature_c: u8) -> Bytes {
+        let address = protocol::RamRegister::PresentTemperature.address() as usize;
+        if full_data.len() <= address {
+            return full_data;
+        }
+        let mut updated = full_data.to_vec();
+        updated[address] = temperature_c;
+        Bytes::from(updated)
+    }
+
+    async fn read_motor_temperature_direct(
+        port: &mut tokio_serial::SerialStream,
+        motor_id: u8,
+        bus_serial: &str,
+    ) -> Result<u8, protocol::Error> {
+        let request = protocol::ST3215Request::Read {
+            motor: motor_id,
+            address: protocol::RamRegister::PresentTemperature.address(),
+            length: protocol::RamRegister::PresentTemperature.size(),
+        };
+        let started = Instant::now();
+        let result = request.async_readwrite(port, ST3215_TIMEOUT_MS).await;
+        let elapsed_ms = started.elapsed().as_millis();
+        if elapsed_ms >= ST3215_SLOW_READ_WARN_MS {
+            warn!(
+                "ST3215 slow direct temperature read: bus={} motor={} elapsed={}ms",
+                bus_serial, motor_id, elapsed_ms
+            );
+        }
+        match result? {
+            protocol::ST3215Response::Read { data, .. } if data.len() == 1 => Ok(data[0]),
+            protocol::ST3215Response::Read { data, source_bytes } => {
+                Err(protocol::Error::InvalidData {
+                    msg: format!("direct temperature length mismatch: {}", data.len()),
+                    source_packet: request.to_bytes(),
+                    reply_packet: source_bytes,
+                })
+            }
+            _ => unreachable!(),
+        }
+    }
+
     async fn force_matdog_motor_torque_off(
         port: &mut tokio_serial::SerialStream,
         motor_id: u8,
@@ -430,7 +458,7 @@ impl St3215Port {
         reason: &str,
     ) -> Result<(), protocol::Error> {
         warn!(
-            "MATDOG_THERMAL_FAILSAFE_TORQUE_OFF bus={} motor={} reason={}",
+            "MATDOG forcing torque OFF: bus={} motor={} reason={}",
             bus_serial, motor_id, reason
         );
         let request = protocol::ST3215Request::Write {
@@ -441,16 +469,30 @@ impl St3215Port {
         request
             .async_readwrite(port, ST3215_COMMAND_TIMEOUT_MS)
             .await?;
-        Ok(())
+        let verify = protocol::ST3215Request::Read {
+            motor: motor_id,
+            address: protocol::RamRegister::TorqueEnable.address(),
+            length: 1,
+        };
+        match verify.async_readwrite(port, ST3215_TIMEOUT_MS).await? {
+            protocol::ST3215Response::Read { data, .. } if data.as_ref() == [0] => Ok(()),
+            protocol::ST3215Response::Read { data, source_bytes } => {
+                Err(protocol::Error::InvalidData {
+                    msg: format!("M{motor_id} torque-OFF readback mismatch: {data:02x?}"),
+                    source_packet: verify.to_bytes(),
+                    reply_packet: source_bytes,
+                })
+            }
+            _ => unreachable!(),
+        }
     }
 
-    async fn confirm_matdog_temperature_if_needed(
+    async fn apply_matdog_direct_temperature(
         port: &mut tokio_serial::SerialStream,
         motor_id: u8,
         bus_serial: &str,
         full_data: Bytes,
-        matdog_thermal_transients: &mut HashMap<u8, u8>,
-        matdog_thermal_transient_total: &mut u8,
+        thermal: &mut MatdogThermalState,
     ) -> Result<Bytes, protocol::Error> {
         if !crate::auto_calibrate::matdog_calibrator_is_armed()
             || !MATDOG_MOTOR_IDS.contains(&motor_id)
@@ -458,196 +500,97 @@ impl St3215Port {
             return Ok(full_data);
         }
 
-        let ram_start = protocol::RamRegister::TorqueEnable.address() as usize;
-        let required_size = (protocol::RamRegister::PresentCurrent.address()
-            + protocol::RamRegister::PresentCurrent.size()) as usize;
-        if full_data.len() < required_size {
-            warn!(
-                "MATDOG_THERMAL_CONFIRMATION_SKIPPED bus={} motor={} reason=short_state observed={} required={}",
-                bus_serial,
-                motor_id,
-                full_data.len(),
-                required_size
-            );
+        let temperature_address = protocol::RamRegister::PresentTemperature.address() as usize;
+        if full_data.len() <= temperature_address
+            || full_data.len() <= MATDOG_MAX_TEMPERATURE_LIMIT_ADDRESS
+        {
             return Ok(full_data);
         }
-
         let configured_limit_c = full_data[MATDOG_MAX_TEMPERATURE_LIMIT_ADDRESS];
-        let initial_temperature_c =
-            full_data[protocol::RamRegister::PresentTemperature.address() as usize];
-
         if configured_limit_c != MATDOG_EXPECTED_TEMPERATURE_LIMIT_C {
             Self::force_matdog_motor_torque_off(
                 port,
                 motor_id,
                 bus_serial,
-                "configured temperature limit changed",
+                "invalid configured temperature limit",
             )
             .await?;
-            warn!(
-                "MATDOG_THERMAL_CONFIRMED bus={} motor={} kind=invalid_limit present={} configured_limit={} expected_limit={} raw_ram={:02x?}",
-                bus_serial,
-                motor_id,
-                initial_temperature_c,
-                configured_limit_c,
-                MATDOG_EXPECTED_TEMPERATURE_LIMIT_C,
-                &full_data[ram_start..],
-            );
             return Ok(full_data);
         }
 
-        if initial_temperature_c <= configured_limit_c {
-            return Ok(full_data);
-        }
-
-        if initial_temperature_c >= MATDOG_IMMEDIATE_THERMAL_ABORT_C {
-            Self::force_matdog_motor_torque_off(
-                port,
-                motor_id,
-                bus_serial,
-                "immediate thermal threshold",
-            )
-            .await?;
-            warn!(
-                "MATDOG_THERMAL_CONFIRMED bus={} motor={} kind=immediate present={} configured_limit={} raw_ram={:02x?}",
-                bus_serial,
-                motor_id,
-                initial_temperature_c,
-                configured_limit_c,
-                &full_data[ram_start..],
-            );
-            return Ok(full_data);
-        }
-
-        let eeprom_prefix = full_data.slice(..ram_start);
-        let mut confirmation_states = Vec::with_capacity(MATDOG_THERMAL_CONFIRMATION_READS);
-        let mut confirmation_temperatures = Vec::with_capacity(MATDOG_THERMAL_CONFIRMATION_READS);
-
-        for confirmation_index in 0..MATDOG_THERMAL_CONFIRMATION_READS {
-            match Self::read_motor_ram(port, motor_id, bus_serial).await {
-                Ok(ram_data) => {
-                    let confirmed_full =
-                        Self::combine_cached_eeprom_and_ram(&eeprom_prefix, ram_data);
-                    if confirmed_full.len() < required_size {
-                        Self::force_matdog_motor_torque_off(
-                            port,
-                            motor_id,
-                            bus_serial,
-                            "short thermal confirmation state",
-                        )
-                        .await?;
-                        warn!(
-                            "MATDOG_THERMAL_CONFIRMED bus={} motor={} kind=short_confirmation index={} observed={} required={}",
-                            bus_serial,
-                            motor_id,
-                            confirmation_index + 1,
-                            confirmed_full.len(),
-                            required_size
-                        );
-                        return Ok(full_data);
-                    }
-                    let temperature = confirmed_full
-                        [protocol::RamRegister::PresentTemperature.address() as usize];
-                    warn!(
-                        "MATDOG_THERMAL_CONFIRMATION_SAMPLE bus={} motor={} index={} temperature={} raw_ram={:02x?}",
-                        bus_serial,
-                        motor_id,
-                        confirmation_index + 1,
-                        temperature,
-                        &confirmed_full[ram_start..],
-                    );
-                    confirmation_temperatures.push(temperature);
-                    confirmation_states.push(confirmed_full);
-                }
-                Err(error) => {
-                    warn!(
-                        "MATDOG_THERMAL_CONFIRMATION_READ_FAILED bus={} motor={} index={} error={}",
-                        bus_serial,
-                        motor_id,
-                        confirmation_index + 1,
-                        error
-                    );
-                    Self::force_matdog_motor_torque_off(
-                        port,
-                        motor_id,
-                        bus_serial,
-                        "thermal confirmation read failed",
-                    )
-                    .await?;
-                    return Ok(full_data);
-                }
+        let due = thermal
+            .last_direct_read
+            .get(&motor_id)
+            .map(|instant| instant.elapsed() >= MATDOG_THERMAL_SAMPLE_PERIOD)
+            .unwrap_or(true);
+        if !due {
+            if let Some(confirmed) = thermal.last_confirmed.get(&motor_id).copied() {
+                return Ok(Self::overwrite_temperature(full_data, confirmed));
             }
         }
 
-        let prior_motor_transients = *matdog_thermal_transients.get(&motor_id).unwrap_or(&0);
-        let decision = classify_matdog_temperature_sample(
-            configured_limit_c,
-            initial_temperature_c,
-            &confirmation_temperatures,
-            prior_motor_transients,
-            *matdog_thermal_transient_total,
-        );
+        let mut samples = Vec::with_capacity(MATDOG_THERMAL_CONFIRMATION_READS);
+        let first = Self::read_motor_temperature_direct(port, motor_id, bus_serial).await?;
+        samples.push(first);
+        if first > configured_limit_c {
+            for _ in 1..MATDOG_THERMAL_CONFIRMATION_READS {
+                tokio::time::sleep(MATDOG_THERMAL_CONFIRMATION_DELAY).await;
+                samples
+                    .push(Self::read_motor_temperature_direct(port, motor_id, bus_serial).await?);
+            }
+        }
+        thermal.last_direct_read.insert(motor_id, Instant::now());
 
-        match decision {
-            MatdogThermalDecision::Normal => Ok(full_data),
+        match classify_matdog_direct_temperature_samples(configured_limit_c, &samples) {
+            MatdogThermalDecision::Normal => {
+                let confirmed = *samples
+                    .last()
+                    .expect("non-empty direct temperature samples");
+                thermal.last_confirmed.insert(motor_id, confirmed);
+                Ok(Self::overwrite_temperature(full_data, confirmed))
+            }
             MatdogThermalDecision::Transient => {
-                let published = confirmation_states
+                let confirmed = samples
                     .iter()
                     .rev()
-                    .find(|state| {
-                        state[protocol::RamRegister::PresentTemperature.address() as usize]
-                            <= configured_limit_c
-                    })
-                    .cloned()
-                    .unwrap_or_else(|| full_data.clone());
-                let motor_count = matdog_thermal_transients.entry(motor_id).or_insert(0);
-                *motor_count = (*motor_count).saturating_add(1);
-                *matdog_thermal_transient_total =
-                    (*matdog_thermal_transient_total).saturating_add(1);
+                    .copied()
+                    .find(|temperature| *temperature <= configured_limit_c)
+                    .or_else(|| thermal.last_confirmed.get(&motor_id).copied())
+                    .ok_or_else(|| protocol::Error::InvalidData {
+                        msg: format!(
+                            "M{motor_id} thermal transient has no confirmed normal sample: {samples:?}"
+                        ),
+                        source_packet: Bytes::new(),
+                        reply_packet: Bytes::new(),
+                    })?;
+                thermal.last_confirmed.insert(motor_id, confirmed);
                 warn!(
-                    "MATDOG_THERMAL_TRANSIENT bus={} motor={} initial={} confirmations={:?} published={} motor_transients={} total_transients={} initial_raw_ram={:02x?}",
-                    bus_serial,
-                    motor_id,
-                    initial_temperature_c,
-                    confirmation_temperatures,
-                    published[protocol::RamRegister::PresentTemperature.address() as usize],
-                    *motor_count,
-                    *matdog_thermal_transient_total,
-                    &full_data[ram_start..],
+                    "MATDOG_THERMAL_DIRECT_TRANSIENT bus={} motor={} direct_samples={:?} published={}",
+                    bus_serial, motor_id, samples, confirmed
                 );
-                Ok(published)
+                Ok(Self::overwrite_temperature(full_data, confirmed))
             }
-            MatdogThermalDecision::Confirmed | MatdogThermalDecision::InvalidConfiguredLimit => {
-                let confirmed_state = confirmation_states
+            MatdogThermalDecision::Confirmed => {
+                let confirmed = samples
                     .iter()
-                    .rev()
-                    .find(|state| {
-                        state[protocol::RamRegister::PresentTemperature.address() as usize]
-                            > configured_limit_c
-                    })
-                    .cloned()
-                    .unwrap_or_else(|| full_data.clone());
+                    .copied()
+                    .filter(|temperature| *temperature > configured_limit_c)
+                    .max()
+                    .unwrap_or(first);
                 Self::force_matdog_motor_torque_off(
                     port,
                     motor_id,
                     bus_serial,
-                    "confirmed or repeated thermal anomaly",
+                    "direct temperature confirmed over limit",
                 )
                 .await?;
                 warn!(
-                    "MATDOG_THERMAL_CONFIRMED bus={} motor={} kind=confirmed_or_budget_exhausted initial={} confirmations={:?} prior_motor_transients={} prior_total_transients={} published={} initial_raw_ram={:02x?}",
-                    bus_serial,
-                    motor_id,
-                    initial_temperature_c,
-                    confirmation_temperatures,
-                    prior_motor_transients,
-                    *matdog_thermal_transient_total,
-                    confirmed_state
-                        [protocol::RamRegister::PresentTemperature.address() as usize],
-                    &full_data[ram_start..],
+                    "MATDOG_THERMAL_DIRECT_CONFIRMED bus={} motor={} direct_samples={:?} published={}",
+                    bus_serial, motor_id, samples, confirmed
                 );
-                Ok(confirmed_state)
+                Ok(Self::overwrite_temperature(full_data, confirmed))
             }
+            MatdogThermalDecision::InvalidConfiguredLimit => unreachable!(),
         }
     }
 
@@ -660,8 +603,7 @@ impl St3215Port {
         command_waiting: &Arc<AtomicBool>,
         search_for_new: bool,
         eeprom_cache: &Arc<Mutex<HashMap<u8, Bytes>>>,
-        matdog_thermal_transients: &mut HashMap<u8, u8>,
-        matdog_thermal_transient_total: &mut u8,
+        matdog_thermal_state: &mut MatdogThermalState,
     ) -> bool {
         let mut currently_seen_motors = HashSet::new();
         let eeprom_size = protocol::RamRegister::TorqueEnable.address() as usize;
@@ -704,13 +646,12 @@ impl St3215Port {
                         read_data
                     };
 
-                    let final_data = match Self::confirm_matdog_temperature_if_needed(
+                    let final_data = match Self::apply_matdog_direct_temperature(
                         port,
                         motor_id,
                         &bus_info.serial_number,
                         final_data,
-                        matdog_thermal_transients,
-                        matdog_thermal_transient_total,
+                        matdog_thermal_state,
                     )
                     .await
                     {
@@ -1903,37 +1844,35 @@ mod topology_discovery_tests {
     }
 
     #[test]
-    fn matdog_temperature_confirmation_rejects_invalid_limit_and_real_heat() {
+    fn matdog_direct_temperature_rejects_invalid_limit_and_confirms_real_heat() {
         assert_eq!(
-            classify_matdog_temperature_sample(69, 39, &[], 0, 0),
+            classify_matdog_direct_temperature_samples(69, &[39]),
             MatdogThermalDecision::InvalidConfiguredLimit
         );
         assert_eq!(
-            classify_matdog_temperature_sample(70, 85, &[], 0, 0),
+            classify_matdog_direct_temperature_samples(70, &[85]),
+            MatdogThermalDecision::Transient
+        );
+        assert_eq!(
+            classify_matdog_direct_temperature_samples(70, &[85, 84, 39]),
             MatdogThermalDecision::Confirmed
         );
         assert_eq!(
-            classify_matdog_temperature_sample(70, 73, &[72, 39, 74], 0, 0),
+            classify_matdog_direct_temperature_samples(70, &[73, 72, 39]),
             MatdogThermalDecision::Confirmed
         );
     }
 
     #[test]
-    fn matdog_temperature_confirmation_accepts_one_isolated_transient_only() {
+    fn matdog_direct_temperature_never_converts_repeated_false_spikes_to_heat() {
+        for _ in 0..10 {
+            assert_eq!(
+                classify_matdog_direct_temperature_samples(70, &[76, 39, 39]),
+                MatdogThermalDecision::Transient
+            );
+        }
         assert_eq!(
-            classify_matdog_temperature_sample(70, 73, &[39, 40, 39], 0, 0),
-            MatdogThermalDecision::Transient
-        );
-        assert_eq!(
-            classify_matdog_temperature_sample(70, 73, &[39, 40, 39], 1, 1),
-            MatdogThermalDecision::Confirmed
-        );
-        assert_eq!(
-            classify_matdog_temperature_sample(70, 73, &[39, 40, 39], 0, 2),
-            MatdogThermalDecision::Confirmed
-        );
-        assert_eq!(
-            classify_matdog_temperature_sample(70, 40, &[], 0, 0),
+            classify_matdog_direct_temperature_samples(70, &[39]),
             MatdogThermalDecision::Normal
         );
     }

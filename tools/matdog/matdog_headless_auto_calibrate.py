@@ -3,7 +3,7 @@
 
 This process does not open the serial device and does not launch Station.  It
 subscribes to the one already-running headless Station, proves a passive
-source-latest preflight lasting at least 30 seconds, enqueues exactly one
+source-latest preflight using a short consecutive-snapshot gate, enqueues exactly one
 native auto-calibration request, and
 then observes the persistent Rust state machine through a terminal state and
 fresh global torque-OFF readback.
@@ -120,6 +120,25 @@ TERMINAL_STATUSES = frozenset(
         st3215.AutoCalibrationState_Status.STOPPED,
     )
 )
+
+
+
+class LatestOnlyQueue(asyncio.Queue[Any]):
+    """A queue-of-one: newer telemetry atomically supersedes older telemetry."""
+
+    def __init__(self) -> None:
+        super().__init__(maxsize=1)
+
+    def put_nowait(self, item: Any) -> None:
+        if self.full():
+            try:
+                self.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        super().put_nowait(item)
+
+    async def put(self, item: Any) -> None:
+        self.put_nowait(item)
 
 
 class RunnerError(RuntimeError):
@@ -370,6 +389,8 @@ class ThermalSeriesRecorder:
         self.max_jump = {motor_id: 0 for motor_id in EXPECTED_MOTOR_IDS}
         self.max_jump_records: dict[int, dict[str, Any]] = {}
         self.m11_records: list[dict[str, Any]] = []
+        self.m11_last_recorded_stamp_ns = 0
+        self.m11_last_phase = ""
         self.anomalies: list[dict[str, Any]] = []
 
     def observe_frame(
@@ -452,7 +473,15 @@ class ThermalSeriesRecorder:
             )
             self.histograms[motor_id][sample.temperature_c] += 1
             if motor_id == 11:
-                self.m11_records.append(record)
+                phase_changed = phase != self.m11_last_phase
+                period_elapsed = (
+                    sample.monotonic_stamp_ns - self.m11_last_recorded_stamp_ns
+                    >= 250_000_000
+                )
+                if phase_changed or period_elapsed:
+                    self.m11_records.append(record)
+                    self.m11_last_recorded_stamp_ns = sample.monotonic_stamp_ns
+                    self.m11_last_phase = phase
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -1237,7 +1266,7 @@ class HeadlessRun:
         self.preflight_collector = LatestSamplePreflight(self.telemetry)
         self.contract = FrameContract()
         self.client: Any = None
-        self.entries: asyncio.Queue[Any] = asyncio.Queue()
+        self.entries: asyncio.Queue[Any] = LatestOnlyQueue()
         self.stream_errors: asyncio.Queue[Any] | None = None
         self.stop_event = asyncio.Event()
         self.start_attempted = False
@@ -1530,7 +1559,7 @@ class HeadlessRun:
 
     async def resubscribe_after_stream_error(self) -> None:
         await self.client.wait_ready(timeout=min(30.0, self.args.cleanup_timeout))
-        self.entries = asyncio.Queue()
+        self.entries = LatestOnlyQueue()
         self.stream_errors = self.client.follow(INFERENCE_QUEUE, self.entries)
         self.evidence.emit("inference_resubscribed")
 
@@ -1540,6 +1569,12 @@ class HeadlessRun:
         if not self.progress or self.progress[-1] != current:
             self.progress.append(current)
             self.evidence.emit("calibration_progress", **current)
+            print(
+                f"[{calibration.current_step:02d}/{calibration.total_steps:02d}] "
+                f"{calibration.status_name}: {calibration.phase}"
+                + (f" — {calibration.error_message}" if calibration.error_message else ""),
+                flush=True,
+            )
 
     def validate_progress(self, frame: FrameSample) -> None:
         calibration = frame.calibration
@@ -2111,8 +2146,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--server", default="127.0.0.1:8888")
     parser.add_argument("--bus-serial", default=EXPECTED_BUS_SERIAL)
-    parser.add_argument("--preflight-frames", type=int, default=120)
-    parser.add_argument("--preflight-seconds", type=float, default=30.0)
+    parser.add_argument("--preflight-frames", type=int, default=10)
+    parser.add_argument("--preflight-seconds", type=float, default=1.0)
     parser.add_argument("--frame-timeout", type=float, default=10.0)
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument("--cleanup-timeout", type=float, default=90.0)
@@ -2138,10 +2173,10 @@ def parse_args() -> argparse.Namespace:
             "--expected-station-sha256 must be exactly "
             f"{EXPECTED_STATION_SHA256}"
         )
-    if args.preflight_frames < 120:
-        parser.error("--preflight-frames must be at least 120")
-    if args.preflight_seconds < 30.0:
-        parser.error("--preflight-seconds must be at least 30")
+    if args.preflight_frames < 10:
+        parser.error("--preflight-frames must be at least 10")
+    if args.preflight_seconds < 1.0:
+        parser.error("--preflight-seconds must be at least 1.0")
     for name in (
         "frame_timeout",
         "timeout",

@@ -2057,8 +2057,47 @@ fn derive_joint_evidence(spec: JointSpec, contacts: DualContactResult) -> JointC
         affine,
         // Endpoint-derived fixed-scale and affine values are diagnostics only.
         // They never replace the saved canonical HOME_TICK command target.
-        accepted: fixed_scale.accepted,
+        accepted: fixed_scale.accepted && affine.accepted,
     }
+}
+
+fn lf_machine_profile_record(evidence: JointCalibrationEvidence) -> String {
+    let spec = evidence.spec;
+    let fixed = evidence.fixed_scale;
+    let affine = evidence.affine;
+    let minimum =
+        build_profile(Leg::Lf, spec.kind, ContactSide::Min).expect("validated LF MIN profile");
+    let maximum =
+        build_profile(Leg::Lf, spec.kind, ContactSide::Max).expect("validated LF MAX profile");
+    format!(
+        "MATDOG_LF_PROFILE_V1|joint={}|joint_name={}|motor_id={}|direction={}|urdf_min_delta={}|urdf_max_delta={}|urdf_min_tick={}|urdf_max_tick={}|coarse_min={}|coarse_max={}|fine_min_1={}|fine_min_2={}|fine_max_1={}|fine_max_2={}|repeatability_min={}|repeatability_max={}|contact_min={}|contact_max={}|q0_fixed={}|q0_affine={}|endpoint_disagreement={}|q0_shift={}|scale_permille={}|safe_min_tick={}|safe_max_tick={}|accepted={}",
+        spec.kind.label(),
+        spec.name,
+        spec.motor_id,
+        spec.direction,
+        spec.min_delta,
+        spec.max_delta,
+        minimum.urdf_limit_tick,
+        maximum.urdf_limit_tick,
+        evidence.contacts.minimum.coarse_scout_tick,
+        evidence.contacts.maximum.coarse_scout_tick,
+        evidence.contacts.minimum.first_tick,
+        evidence.contacts.minimum.second_tick,
+        evidence.contacts.maximum.first_tick,
+        evidence.contacts.maximum.second_tick,
+        evidence.contacts.minimum.spread_ticks,
+        evidence.contacts.maximum.spread_ticks,
+        fixed.minimum_contact_tick,
+        fixed.maximum_contact_tick,
+        fixed.estimated_zero_tick,
+        affine.estimated_zero_tick,
+        fixed.endpoint_disagreement_ticks,
+        fixed.shift_from_digital_home_ticks,
+        affine.scale_permille,
+        minimum.urdf_limit_tick.min(maximum.urdf_limit_tick),
+        minimum.urdf_limit_tick.max(maximum.urdf_limit_tick),
+        evidence.accepted,
+    )
 }
 
 fn joint_degree_evidence(evidence: JointCalibrationEvidence) -> String {
@@ -2463,9 +2502,10 @@ async fn run_lf_full_calibration(
                 Ok(()) => {
                     for evidence in outcome.joints {
                         info!("MATDOG LF EVIDENCE: {}", joint_degree_evidence(evidence));
+                        info!("{}", lf_machine_profile_record(evidence));
                     }
                     info!(
-                        "MATDOG {} complete: M13_q0_fixed={}, M12_q0_fixed={}, M11_q0_fixed={}, M13_q0_affine={}, M12_q0_affine={}, M11_q0_affine={}, RAM-only=true, EEPROM_written=false",
+                        "MATDOG {} measurement complete: M13_q0_fixed={}, M12_q0_fixed={}, M11_q0_fixed={}, M13_q0_affine={}, M12_q0_affine={}, M11_q0_affine={}, status=LF_STAGED, movement_RAM_only=true, EEPROM_written=false",
                         LF_FULL_SEQUENCE_ARM_VALUE,
                         outcome.joints[0].fixed_scale.estimated_zero_tick,
                         outcome.joints[1].fixed_scale.estimated_zero_tick,
@@ -2889,45 +2929,51 @@ impl MatdogRamOnlyCalibrator {
             })
             .collect::<Vec<_>>();
         if !diagnostic_rejections.is_empty() {
-            info!(
-                "MATDOG LF Q0 DIAGNOSTIC ONLY: {}; canonical saved q0 remains HOME_TICK={} for every commanded return; endpoint consistency reference={} ticks; affine reference={}..={} permille",
+            return Err(format!(
+                "MATDOG LF URDF freeze gate rejected before EEPROM staging: {}; endpoint consistency limit={} ticks; affine scale reference={}..={} permille",
                 diagnostic_rejections.join("; "),
-                HOME_TICK,
                 MODEL_ZERO_ENDPOINT_CONSISTENCY_TICKS,
                 AFFINE_SCALE_MIN_PERMILLE,
                 AFFINE_SCALE_MAX_PERMILLE,
-            );
+            )
+            .into());
         }
+        info!(
+            "MATDOG LF URDF FREEZE GATE: PASS; all three joints accepted for staged q0 positioning"
+        );
 
         self.transition_lf_state(LfSessionState::ReturnHip)?;
-        self.next_phase("Move LF HIP M13 directly from MAX contact to canonical saved q=0")?;
+        self.next_phase("Move LF HIP M13 from MAX contact to URDF-derived staged q=0")?;
         self.profile =
             lf_full_sequence_profile().map_err(|message| -> DynError { message.into() })?;
-        self.move_motor_to(13, HOME_TICK, STATIC_TOLERANCE_TICKS)
+        let hip_staged_q0 = outcome.joints[0].fixed_scale.estimated_zero_tick;
+        self.move_motor_to(13, hip_staged_q0, STATIC_TOLERANCE_TICKS)
             .await?;
         self.upsert_held_target(StaticTarget {
             motor_id: 13,
-            target_tick: HOME_TICK,
+            target_tick: hip_staged_q0,
         })?;
 
         self.transition_lf_state(LfSessionState::ReturnLowerHeld)?;
-        self.next_phase("Move LF LOWER M11 to canonical saved q=0 and keep active hold")?;
+        self.next_phase("Move LF LOWER M11 to URDF-derived staged q=0 and hold")?;
         self.remove_held_target(11);
-        self.move_motor_to(11, HOME_TICK, STATIC_TOLERANCE_TICKS)
+        let lower_staged_q0 = outcome.joints[2].fixed_scale.estimated_zero_tick;
+        self.move_motor_to(11, lower_staged_q0, STATIC_TOLERANCE_TICKS)
             .await?;
         self.upsert_held_target(StaticTarget {
             motor_id: 11,
-            target_tick: HOME_TICK,
+            target_tick: lower_staged_q0,
         })?;
 
         self.transition_lf_state(LfSessionState::ReturnUpper)?;
-        self.next_phase("Move LF UPPER M12 to canonical saved q=0 while M11 remains held")?;
+        self.next_phase("Move LF UPPER M12 to URDF-derived staged q=0 while M11 holds")?;
         self.remove_held_target(12);
-        self.move_motor_to(12, HOME_TICK, STATIC_TOLERANCE_TICKS)
+        let upper_staged_q0 = outcome.joints[1].fixed_scale.estimated_zero_tick;
+        self.move_motor_to(12, upper_staged_q0, STATIC_TOLERANCE_TICKS)
             .await?;
         self.upsert_held_target(StaticTarget {
             motor_id: 12,
-            target_tick: HOME_TICK,
+            target_tick: upper_staged_q0,
         })?;
 
         self.transition_lf_state(LfSessionState::RestoreParking)?;

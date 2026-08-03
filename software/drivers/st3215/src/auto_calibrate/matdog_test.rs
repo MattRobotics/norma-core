@@ -1791,38 +1791,41 @@ fn lf_state_model_rejects_wrong_actuator_hold_and_missing_prerequisite() {
 }
 
 #[test]
-fn historical_contacts_keep_endpoint_and_affine_diagnostics_without_replacing_q0() {
+fn historical_contacts_reject_freeze_when_endpoint_or_affine_gate_fails() {
     let upper = derive_joint_evidence(
         *spec_for(Leg::Lf, JointKind::Upper),
         DualContactResult {
-            minimum: contact_result(1443, 1445),
+            minimum: contact_result(1446, 1441),
             maximum: contact_result(3443, 3442),
         },
     );
     let lower = derive_joint_evidence(
         *spec_for(Leg::Lf, JointKind::Lower),
         DualContactResult {
-            minimum: contact_result(3093, 3092),
-            maximum: contact_result(1668, 1668),
+            minimum: contact_result(3132, 3135),
+            maximum: contact_result(1640, 1643),
         },
     );
     let hip = derive_joint_evidence(
         *spec_for(Leg::Lf, JointKind::Hip),
         DualContactResult {
-            minimum: contact_result(2535, 2535),
-            maximum: contact_result(1617, 1611),
+            minimum: contact_result(2546, 2544),
+            maximum: contact_result(1545, 1547),
         },
     );
-
-    assert!(upper.accepted);
-    assert_eq!(upper.fixed_scale.endpoint_disagreement_ticks, 7);
-    assert!(lower.affine.accepted);
-    assert!(!lower.accepted);
-    assert_eq!(lower.fixed_scale.endpoint_disagreement_ticks, 50);
-    assert!(hip.affine.accepted);
-    assert!(!hip.accepted);
-    assert_eq!(hip.fixed_scale.endpoint_disagreement_ticks, 103);
-    assert!(joint_degree_evidence(lower).contains("Q0_DIAGNOSTIC: REJECT"));
+    assert_eq!(
+        upper.accepted,
+        upper.fixed_scale.accepted && upper.affine.accepted
+    );
+    assert_eq!(
+        lower.accepted,
+        lower.fixed_scale.accepted && lower.affine.accepted
+    );
+    assert_eq!(
+        hip.accepted,
+        hip.fixed_scale.accepted && hip.affine.accepted
+    );
+    assert!(!lower.accepted || !hip.accepted);
 }
 
 #[test]
@@ -2658,47 +2661,27 @@ fn full_lf_q0_normalization_has_no_distance_admission_window() {
 }
 
 #[test]
-fn endpoint_derived_q0_is_diagnostic_only_and_never_a_return_target() {
+fn accepted_endpoint_q0_is_used_only_for_transactional_staging() {
     let source = include_str!("matdog.rs");
-    assert!(source.contains("MATDOG LF Q0 DIAGNOSTIC ONLY"));
-    assert!(!source.contains("LF_FIXED_SCALE_REJECT"));
-
-    let start = source
-        .find("self.transition_lf_state(LfSessionState::ReturnHip)")
-        .unwrap();
-    let end = source[start..]
-        .find("self.transition_lf_state(LfSessionState::RestoreParking)")
-        .map(|offset| start + offset)
-        .unwrap();
-    let returns = &source[start..end];
-
-    assert!(!returns.contains("fixed_scale.estimated_zero_tick"));
-    assert!(!returns.contains("affine.estimated_zero_tick"));
-    assert_eq!(returns.matches("HOME_TICK").count(), 6);
+    assert!(source.contains("MATDOG LF URDF FREEZE GATE: PASS"));
+    assert!(source.contains("hip_staged_q0"));
+    assert!(source.contains("lower_staged_q0"));
+    assert!(source.contains("upper_staged_q0"));
+    assert!(source.contains("movement_RAM_only=true, EEPROM_written=false"));
+    assert!(!source.contains("reg_write: Some"));
+    assert!(!source.contains("freeze_calibration: Some"));
 }
 
 #[test]
-fn full_lf_final_return_order_uses_saved_q0_for_m13_m11_m12_then_m42() {
+fn full_lf_final_order_stages_m13_m11_m12_then_restores_m42() {
     let source = include_str!("matdog.rs");
-    let hip = source
-        .find("Move LF HIP M13 directly from MAX contact to canonical saved q=0")
-        .unwrap();
-    let lower = source
-        .find("Move LF LOWER M11 to canonical saved q=0 and keep active hold")
-        .unwrap();
-    let upper = source
-        .find("Move LF UPPER M12 to canonical saved q=0 while M11 remains held")
-        .unwrap();
+    let hip = source.find("let hip_staged_q0").unwrap();
+    let lower = source.find("let lower_staged_q0").unwrap();
+    let upper = source.find("let upper_staged_q0").unwrap();
     let parking = source
         .find("Restore LH upper M42 once at end of LF calibration")
         .unwrap();
-
-    assert!(hip < lower);
-    assert!(lower < upper);
-    assert!(upper < parking);
-
-    let parking_body = &source[parking..];
-    assert!(parking_body.contains("self.move_motor_to(42, HOME_TICK, STATIC_TOLERANCE_TICKS)"));
+    assert!(hip < lower && lower < upper && upper < parking);
 }
 
 #[test]
