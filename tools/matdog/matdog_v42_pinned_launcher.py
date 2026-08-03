@@ -2,8 +2,9 @@
 """Immutable launcher for the reviewed MATDOG V42 Station artifact.
 
 This module does not create any additional command type.  It verifies the
-reviewed headless runner byte-for-byte, replaces only its Station executable
-SHA-256 pin, and delegates to the existing fail-closed runner.
+reviewed headless runner byte-for-byte, installs the reviewed q0-first phase
+contract, replaces only its Station executable SHA-256 pin, and delegates to
+the existing fail-closed runner.
 """
 
 from __future__ import annotations
@@ -48,7 +49,9 @@ def load_reviewed_runner():
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
     from tools.matdog import matdog_headless_auto_calibrate as runner
+    from tools.matdog import matdog_q0_phase_contract
 
+    matdog_q0_phase_contract.install(runner)
     runner.EXPECTED_STATION_SHA256 = PINNED_STATION_SHA256
     return runner
 
