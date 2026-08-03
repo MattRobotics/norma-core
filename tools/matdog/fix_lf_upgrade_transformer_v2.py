@@ -74,6 +74,12 @@ if text.count(old_emission) != 1:
     raise SystemExit("transformer profile-emission marker is not unique")
 text = text.replace(old_emission, new_emission, 1)
 
+old_top = '        THERMAL_TOP + "fn matdog_command_allowed_with",'
+new_top = '        THERMAL_TOP,'
+if text.count(old_top) != 1:
+    raise SystemExit("transformer command-gate replacement marker is not unique")
+text = text.replace(old_top, new_top, 1)
+
 old_scan = '        THERMAL_IMPL + "    async fn scan_motors(",'
 new_scan = '        THERMAL_IMPL,'
 if text.count(old_scan) != 1:
@@ -134,6 +140,31 @@ new_direct_test = '''        assert_eq!(
 if text.count(old_direct_test) != 1:
     raise SystemExit("transformer direct-temperature test marker is not unique")
 text = text.replace(old_direct_test, new_direct_test, 1)
+
+runner_write_marker = "    RUNNER.write_text(text)\n"
+runner_write_replacement = '''    text = replace_once(
+        text,
+        '    parser.add_argument("--preflight-frames", type=int, default=120)\\n    parser.add_argument("--preflight-seconds", type=float, default=30.0)',
+        '    parser.add_argument("--preflight-frames", type=int, default=10)\\n    parser.add_argument("--preflight-seconds", type=float, default=1.0)',
+        "short preflight defaults",
+    )
+    text = replace_once(
+        text,
+        '        self.m11_records: list[dict[str, Any]] = []\\n        self.anomalies: list[dict[str, Any]] = []',
+        '        self.m11_records: list[dict[str, Any]] = []\\n        self.m11_last_recorded_stamp_ns = 0\\n        self.m11_last_phase = ""\\n        self.anomalies: list[dict[str, Any]] = []',
+        "bounded M11 evidence state",
+    )
+    text = replace_once(
+        text,
+        '            if motor_id == 11:\\n                self.m11_records.append(record)',
+        '            if motor_id == 11:\\n                phase_changed = phase != self.m11_last_phase\\n                period_elapsed = (\\n                    sample.monotonic_stamp_ns - self.m11_last_recorded_stamp_ns\\n                    >= 250_000_000\\n                )\\n                if phase_changed or period_elapsed:\\n                    self.m11_records.append(record)\\n                    self.m11_last_recorded_stamp_ns = sample.monotonic_stamp_ns\\n                    self.m11_last_phase = phase',
+        "decimated M11 evidence",
+    )
+    RUNNER.write_text(text)
+'''
+if text.count(runner_write_marker) != 1:
+    raise SystemExit("transformer runner write marker is not unique")
+text = text.replace(runner_write_marker, runner_write_replacement, 1)
 
 path.write_text(text)
 print("MATDOG_LF_UPGRADE_TRANSFORMER_V2=PASS")
