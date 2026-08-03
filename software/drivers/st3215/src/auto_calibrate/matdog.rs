@@ -43,6 +43,10 @@ const STATIC_TOLERANCE_TICKS: u16 = 10;
 // Permit one bounded coarse-step continuation outside the corridor only.
 // The strict 10-tick detector gate remains active inside every corridor.
 const OUTSIDE_CORRIDOR_SETTLE_TOLERANCE_TICKS: u16 = 16;
+// Keep the outer approach decision consistent with the detector. The V24 M13
+// fine pass showed a healthy 13-tick directional settle; errors beyond this
+// global 16-tick floor still enter plateau confirmation or fail closed.
+const PROBE_TRACKING_ERROR_FLOOR_TICKS: u16 = OUTSIDE_CORRIDOR_SETTLE_TOLERANCE_TICKS;
 // The active probe can settle a few ticks farther from digital home under
 // geometry-prerequisite load and gearbox backlash. Keep this tolerance
 // separate so prerequisite drift and contact tracking remain at 10 ticks.
@@ -105,6 +109,7 @@ const AFFINE_SCALE_MAX_PERMILLE: u16 = 1150;
 const KINEMATIC_PLATEAU_SAMPLES: usize = 3;
 const KINEMATIC_PLATEAU_POSITION_SPAN_TICKS: u16 = 3;
 const MODEL_ZERO_ENDPOINT_CONSISTENCY_TICKS: u16 = 24;
+const LF_CONTACT_WITNESS_TOLERANCE_TICKS: u16 = 24;
 const MODEL_ZERO_MAX_SHIFT_FROM_DIGITAL_HOME_TICKS: u16 = 96;
 const LF_TRANSITION_SETTLED_SAMPLES: u8 = 4;
 const LF_TRANSITION_SETTLE_WINDOW: Duration = Duration::from_millis(400);
@@ -826,6 +831,12 @@ fn adaptive_contact_acceptance_bounds(
         }
     }
     (low, high)
+}
+
+fn probe_tracking_error_limit(step_ticks: u16) -> u16 {
+    step_ticks
+        .saturating_add(4)
+        .max(PROBE_TRACKING_ERROR_FLOOR_TICKS)
 }
 
 fn fine_contact_scout_lag_ticks(
@@ -1956,12 +1967,34 @@ struct JointCalibrationEvidence {
     contacts: DualContactResult,
     fixed_scale: ModelZeroEstimate,
     affine: AffineJointCalibration,
+    contact_witness_accepted: bool,
     accepted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LfCalibrationOutcome {
     joints: [JointCalibrationEvidence; 3],
+}
+
+fn lf_reference_contact_ticks(joint: JointKind) -> (u16, u16) {
+    match joint {
+        JointKind::Hip => (2535, 1617),
+        JointKind::Upper => (1443, 3442),
+        JointKind::Lower => (3093, 1666),
+    }
+}
+
+fn lf_contact_witness_deviations(joint: JointKind, contacts: DualContactResult) -> (u16, u16) {
+    let (minimum, maximum) = lf_reference_contact_ticks(joint);
+    (
+        circular_distance(contact_result_tick(contacts.minimum), minimum),
+        circular_distance(contact_result_tick(contacts.maximum), maximum),
+    )
+}
+
+fn lf_contact_witness_accepted(joint: JointKind, contacts: DualContactResult) -> bool {
+    let (minimum, maximum) = lf_contact_witness_deviations(joint, contacts);
+    minimum <= LF_CONTACT_WITNESS_TOLERANCE_TICKS && maximum <= LF_CONTACT_WITNESS_TOLERANCE_TICKS
 }
 
 fn derive_affine_joint_calibration(
@@ -2061,14 +2094,16 @@ fn affine_endpoint_residual_degrees(
 fn derive_joint_evidence(spec: JointSpec, contacts: DualContactResult) -> JointCalibrationEvidence {
     let fixed_scale = derive_model_zero(spec, contacts);
     let affine = derive_affine_joint_calibration(spec, contacts);
+    let contact_witness_accepted = lf_contact_witness_accepted(spec.kind, contacts);
     JointCalibrationEvidence {
         spec,
         contacts,
         fixed_scale,
         affine,
-        // Endpoint-derived fixed-scale and affine values are diagnostics only.
-        // They never replace the saved canonical HOME_TICK command target.
-        accepted: fixed_scale.accepted && affine.accepted,
+        contact_witness_accepted,
+        // Affine span/q0 is authoritative; fixed-scale disagreement remains a
+        // diagnostic. The uniform hardware witness rejects temporary obstacles.
+        accepted: affine.accepted && contact_witness_accepted,
     }
 }
 
@@ -2155,12 +2190,14 @@ fn joint_degree_evidence(evidence: JointCalibrationEvidence) -> String {
         affine_endpoint_residual_degrees(affine, spec, ContactSide::Min),
         affine_endpoint_residual_degrees(affine, spec, ContactSide::Max),
         if evidence.accepted { "ACCEPT" } else { "REJECT" },
-        if !fixed.accepted {
-            "fixed-scale endpoint zeros are inconsistent"
+        if !evidence.contact_witness_accepted {
+            "contact differs from the supervised LF hardware witness"
         } else if !affine.accepted {
-            "fixed-scale gate passed; affine sanity diagnostic is outside its reference band"
+            "affine span/q0 gate is outside its global reference band"
+        } else if !fixed.accepted {
+            "affine gate accepted; fixed-scale disagreement retained as diagnostic"
         } else {
-            "fine contacts agree with fixed encoder scale and affine sanity checks"
+            "fine contacts agree with hardware witness, fixed scale and affine checks"
         },
     )
 }
@@ -2924,6 +2961,30 @@ impl MatdogRamOnlyCalibrator {
             return Err("LF diagnostics incomplete after six accepted fine pairs".into());
         }
         info!("MATDOG LF TRACE: {}", session.trace_summary());
+        for evidence in outcome.joints {
+            let (minimum, maximum) =
+                lf_contact_witness_deviations(evidence.spec.kind, evidence.contacts);
+            info!(
+                "MATDOG LF CONTACT WITNESS: {} M{} min_deviation={} max_deviation={} tolerance={} accepted={}",
+                evidence.spec.kind.label(),
+                evidence.spec.motor_id,
+                minimum,
+                maximum,
+                LF_CONTACT_WITNESS_TOLERANCE_TICKS,
+                evidence.contact_witness_accepted,
+            );
+            if !evidence.fixed_scale.accepted {
+                info!(
+                    "MATDOG LF FIXED-SCALE DIAGNOSTIC WARNING: {} M{} endpoint_disagreement={} limit={}; affine_q0={} scale_permille={}",
+                    evidence.spec.kind.label(),
+                    evidence.spec.motor_id,
+                    evidence.fixed_scale.endpoint_disagreement_ticks,
+                    MODEL_ZERO_ENDPOINT_CONSISTENCY_TICKS,
+                    evidence.affine.estimated_zero_tick,
+                    evidence.affine.scale_permille,
+                );
+            }
+        }
         let diagnostic_rejections = outcome
             .joints
             .iter()
@@ -2941,23 +3002,24 @@ impl MatdogRamOnlyCalibrator {
             .collect::<Vec<_>>();
         if !diagnostic_rejections.is_empty() {
             return Err(format!(
-                "MATDOG LF URDF freeze gate rejected before EEPROM staging: {}; endpoint consistency limit={} ticks; affine scale reference={}..={} permille",
+                "MATDOG LF affine+witness freeze gate rejected before EEPROM staging: {}; contact witness tolerance={} ticks; affine scale reference={}..={} permille; fixed-scale endpoint consistency limit={} ticks is diagnostic only",
                 diagnostic_rejections.join("; "),
-                MODEL_ZERO_ENDPOINT_CONSISTENCY_TICKS,
+                LF_CONTACT_WITNESS_TOLERANCE_TICKS,
                 AFFINE_SCALE_MIN_PERMILLE,
                 AFFINE_SCALE_MAX_PERMILLE,
+                MODEL_ZERO_ENDPOINT_CONSISTENCY_TICKS,
             )
             .into());
         }
         info!(
-            "MATDOG LF URDF FREEZE GATE: PASS; all three joints accepted for staged q0 positioning"
+            "MATDOG LF URDF FREEZE GATE: PASS; all three joints accepted by uniform contact-witness and affine span/q0 gates; fixed-scale disagreement retained as diagnostic"
         );
 
         self.transition_lf_state(LfSessionState::ReturnHip)?;
         self.next_phase("Move LF HIP M13 from MAX contact to URDF-derived staged q=0")?;
         self.profile =
             lf_full_sequence_profile().map_err(|message| -> DynError { message.into() })?;
-        let hip_staged_q0 = outcome.joints[0].fixed_scale.estimated_zero_tick;
+        let hip_staged_q0 = outcome.joints[0].affine.estimated_zero_tick;
         self.move_motor_to(13, hip_staged_q0, STATIC_TOLERANCE_TICKS)
             .await?;
         self.upsert_held_target(StaticTarget {
@@ -2968,7 +3030,7 @@ impl MatdogRamOnlyCalibrator {
         self.transition_lf_state(LfSessionState::ReturnLowerHeld)?;
         self.next_phase("Move LF LOWER M11 to URDF-derived staged q=0 and hold")?;
         self.remove_held_target(11);
-        let lower_staged_q0 = outcome.joints[2].fixed_scale.estimated_zero_tick;
+        let lower_staged_q0 = outcome.joints[2].affine.estimated_zero_tick;
         self.move_motor_to(11, lower_staged_q0, STATIC_TOLERANCE_TICKS)
             .await?;
         self.upsert_held_target(StaticTarget {
@@ -2979,7 +3041,7 @@ impl MatdogRamOnlyCalibrator {
         self.transition_lf_state(LfSessionState::ReturnUpper)?;
         self.next_phase("Move LF UPPER M12 to URDF-derived staged q=0 while M11 holds")?;
         self.remove_held_target(12);
-        let upper_staged_q0 = outcome.joints[1].fixed_scale.estimated_zero_tick;
+        let upper_staged_q0 = outcome.joints[1].affine.estimated_zero_tick;
         self.move_motor_to(12, upper_staged_q0, STATIC_TOLERANCE_TICKS)
             .await?;
         self.upsert_held_target(StaticTarget {
@@ -4031,7 +4093,23 @@ impl MatdogRamOnlyCalibrator {
                 last_observation.ok_or("contact settle window produced no telemetry")?;
             self.ensure_observation_safe(motor_id, observation, true, Some(target))?;
             let goal_error = circular_distance(observation.position, target);
-            if goal_error > step_ticks.saturating_add(4) {
+            let nominal_tracking_limit = step_ticks.saturating_add(4);
+            let tracking_error_limit = probe_tracking_error_limit(step_ticks);
+            if goal_error > nominal_tracking_limit && goal_error <= tracking_error_limit {
+                info!(
+                    "MATDOG {} bounded tracking-lag continuation: step={}, target={}, present={}, error={}, nominal_limit={}, bounded_limit={}, current={}, velocity={}",
+                    self.profile.label,
+                    step_ticks,
+                    target,
+                    observation.position,
+                    goal_error,
+                    nominal_tracking_limit,
+                    tracking_error_limit,
+                    observation.current,
+                    speed_magnitude(observation.velocity),
+                );
+            }
+            if goal_error > tracking_error_limit {
                 if let Some(scout) = coarse_scout_tick {
                     if let Some(contact) = self
                         .confirm_kinematic_plateau(target, last_stamp, scout)

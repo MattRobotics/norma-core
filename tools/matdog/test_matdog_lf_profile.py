@@ -20,6 +20,7 @@ def machine_record(
     urdf_min_tick: int,
     urdf_max_tick: int,
     q0: int = 2048,
+    q0_affine: int | None = None,
     accepted: bool = True,
 ) -> str:
     values = {
@@ -42,7 +43,7 @@ def machine_record(
         "contact_min": urdf_min_tick,
         "contact_max": urdf_max_tick,
         "q0_fixed": q0,
-        "q0_affine": q0,
+        "q0_affine": q0 if q0_affine is None else q0_affine,
         "endpoint_disagreement": 1,
         "q0_shift": abs(q0 - 2048),
         "scale_permille": 1000,
@@ -99,6 +100,8 @@ class MatdogLfProfileTests(unittest.TestCase):
                         urdf_max_delta=427,
                         urdf_min_tick=3095,
                         urdf_max_tick=1621,
+                        q0=2040,
+                        q0_affine=2055,
                     ),
                 )
             )
@@ -125,6 +128,9 @@ class MatdogLfProfileTests(unittest.TestCase):
         staged = json.loads(stage_json.read_text(encoding="utf-8"))
         self.assertEqual(staged["status"], "LF_STAGED")
         self.assertEqual(set(staged["motors"]), {"11", "12", "13"})
+        plan_text = stage_plan.read_text(encoding="utf-8")
+        self.assertIn("motor.11.estimated_q0_tick=2055", plan_text)
+        self.assertNotIn("motor.11.estimated_q0_tick=2040", plan_text)
 
         freeze = self.root / "freeze.env"
         lines = [

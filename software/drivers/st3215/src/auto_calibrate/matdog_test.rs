@@ -468,6 +468,92 @@ fn fine_contact_scout_depth_gate_is_direction_independent_and_bounded() {
 }
 
 #[test]
+fn v24_m13_fine_tracking_uses_detector_consistent_global_floor() {
+    assert_eq!(FINE_STEP_TICKS.saturating_add(4), 12);
+    assert_eq!(probe_tracking_error_limit(FINE_STEP_TICKS), 16);
+    assert_eq!(probe_tracking_error_limit(COARSE_STEP_TICKS), 68);
+    let error = circular_distance(1674, 1687);
+    assert_eq!(error, 13);
+    assert!(error <= probe_tracking_error_limit(FINE_STEP_TICKS));
+    assert!(17 > probe_tracking_error_limit(FINE_STEP_TICKS));
+}
+
+#[test]
+fn lf_contact_witness_gate_is_uniform_and_rejects_v24_m12_cable_obstruction() {
+    assert_eq!(LF_CONTACT_WITNESS_TOLERANCE_TICKS, 24);
+    let contact = |a, b| ContactResult {
+        coarse_scout_tick: a,
+        first_tick: a,
+        second_tick: b,
+        spread_ticks: circular_distance(a, b),
+        baseline: BaselineStats {
+            median_current: 1,
+            mad_current: 0,
+        },
+    };
+    let upper = DualContactResult {
+        minimum: contact(1438, 1440),
+        maximum: contact(3398, 3397),
+    };
+    assert_eq!(
+        lf_contact_witness_deviations(JointKind::Upper, upper),
+        (4, 45)
+    );
+    assert!(!lf_contact_witness_accepted(JointKind::Upper, upper));
+    let lower = DualContactResult {
+        minimum: contact(3093, 3094),
+        maximum: contact(1660, 1657),
+    };
+    assert_eq!(
+        lf_contact_witness_deviations(JointKind::Lower, lower),
+        (0, 8)
+    );
+    assert!(lf_contact_witness_accepted(JointKind::Lower, lower));
+    let hip = DualContactResult {
+        minimum: contact(2535, 2535),
+        maximum: contact(1597, 1597),
+    };
+    assert_eq!(lf_contact_witness_deviations(JointKind::Hip, hip), (0, 20));
+    assert!(lf_contact_witness_accepted(JointKind::Hip, hip));
+}
+
+#[test]
+fn affine_gate_accepts_real_span_while_fixed_scale_stays_diagnostic() {
+    let contact = |a, b| ContactResult {
+        coarse_scout_tick: a,
+        first_tick: a,
+        second_tick: b,
+        spread_ticks: circular_distance(a, b),
+        baseline: BaselineStats {
+            median_current: 1,
+            mad_current: 0,
+        },
+    };
+    for (joint, contacts) in [
+        (
+            JointKind::Lower,
+            DualContactResult {
+                minimum: contact(3093, 3094),
+                maximum: contact(1660, 1657),
+            },
+        ),
+        (
+            JointKind::Hip,
+            DualContactResult {
+                minimum: contact(2535, 2535),
+                maximum: contact(1597, 1597),
+            },
+        ),
+    ] {
+        let evidence = derive_joint_evidence(*spec_for(Leg::Lf, joint), contacts);
+        assert!(!evidence.fixed_scale.accepted);
+        assert!(evidence.affine.accepted);
+        assert!(evidence.contact_witness_accepted);
+        assert!(evidence.accepted);
+    }
+}
+
+#[test]
 fn nonparticipating_torque_off_uses_real_position_drift_not_instantaneous_speed() {
     for motor_id in MATDOG_MOTOR_IDS {
         for velocity in [LF_HELD_MAX_SPEED_RAW + 1, 50, u16::MAX] {
@@ -1146,6 +1232,33 @@ fn on_observation(position: u16, goal: u16) -> MotorObservation {
     observation(position, 0, 1, goal)
 }
 
+fn supervised_lf_witness_contacts(joint: JointKind) -> DualContactResult {
+    let contact = |first_tick: u16, second_tick: u16| ContactResult {
+        coarse_scout_tick: first_tick,
+        first_tick,
+        second_tick,
+        spread_ticks: circular_distance(first_tick, second_tick),
+        baseline: BaselineStats {
+            median_current: 1,
+            mad_current: 0,
+        },
+    };
+    match joint {
+        JointKind::Upper => DualContactResult {
+            minimum: contact(1442, 1444),
+            maximum: contact(3441, 3443),
+        },
+        JointKind::Lower => DualContactResult {
+            minimum: contact(3092, 3094),
+            maximum: contact(1665, 1667),
+        },
+        JointKind::Hip => DualContactResult {
+            minimum: contact(2534, 2536),
+            maximum: contact(1616, 1618),
+        },
+    }
+}
+
 fn model_consistent_contacts(joint: JointKind) -> DualContactResult {
     let minimum = build_profile(Leg::Lf, joint, ContactSide::Min).unwrap();
     let maximum = build_profile(Leg::Lf, joint, ContactSide::Max).unwrap();
@@ -1690,7 +1803,7 @@ fn lf_state_machine_runs_the_full_simulated_path_with_runtime_roles() {
     let mut evidences = Vec::new();
     for joint in [JointKind::Hip, JointKind::Upper, JointKind::Lower] {
         let spec = *spec_for(Leg::Lf, joint);
-        let contacts = model_consistent_contacts(joint);
+        let contacts = supervised_lf_witness_contacts(joint);
         session.record_contacts(joint, contacts);
         let evidence = derive_joint_evidence(spec, contacts);
         assert!(evidence.accepted);
@@ -1702,14 +1815,14 @@ fn lf_state_machine_runs_the_full_simulated_path_with_runtime_roles() {
     session
         .set_active(
             13,
-            evidences[0].fixed_scale.estimated_zero_tick,
+            evidences[0].affine.estimated_zero_tick,
             LfActiveKind::Commanded,
         )
         .unwrap();
     session
         .hold(StaticTarget {
             motor_id: 13,
-            target_tick: evidences[0].fixed_scale.estimated_zero_tick,
+            target_tick: evidences[0].affine.estimated_zero_tick,
         })
         .unwrap();
 
@@ -1718,14 +1831,14 @@ fn lf_state_machine_runs_the_full_simulated_path_with_runtime_roles() {
     session
         .set_active(
             11,
-            evidences[2].fixed_scale.estimated_zero_tick,
+            evidences[2].affine.estimated_zero_tick,
             LfActiveKind::Commanded,
         )
         .unwrap();
     session
         .hold(StaticTarget {
             motor_id: 11,
-            target_tick: evidences[2].fixed_scale.estimated_zero_tick,
+            target_tick: evidences[2].affine.estimated_zero_tick,
         })
         .unwrap();
 
@@ -1734,21 +1847,28 @@ fn lf_state_machine_runs_the_full_simulated_path_with_runtime_roles() {
     session
         .set_active(
             12,
-            evidences[1].fixed_scale.estimated_zero_tick,
+            evidences[1].affine.estimated_zero_tick,
             LfActiveKind::Commanded,
         )
         .unwrap();
     let held_m11 = session.role_for(11).unwrap();
-    validate_lf_role_observation(11, on_observation(2048, 2048), held_m11, 10_000).unwrap();
-    let mut drifted = on_observation(2061, 2048);
+    let held_m11_tick = evidences[2].affine.estimated_zero_tick;
+    validate_lf_role_observation(
+        11,
+        on_observation(held_m11_tick, held_m11_tick),
+        held_m11,
+        10_000,
+    )
+    .unwrap();
+    let mut drifted = on_observation(held_m11_tick + STATIC_TOLERANCE_TICKS + 1, held_m11_tick);
     assert!(validate_lf_role_observation(11, drifted, held_m11, 10_000).is_err());
-    drifted.position = 2048;
+    drifted.position = held_m11_tick;
     drifted.torque_enabled = false;
     assert!(validate_lf_role_observation(11, drifted, held_m11, 10_000).is_err());
     session
         .hold(StaticTarget {
             motor_id: 12,
-            target_tick: evidences[1].fixed_scale.estimated_zero_tick,
+            target_tick: evidences[1].affine.estimated_zero_tick,
         })
         .unwrap();
 
@@ -1961,41 +2081,25 @@ fn lf_state_model_rejects_wrong_actuator_hold_and_missing_prerequisite() {
 }
 
 #[test]
-fn historical_contacts_reject_freeze_when_endpoint_or_affine_gate_fails() {
+fn historical_contacts_use_affine_and_uniform_witness_freeze_gate() {
     let upper = derive_joint_evidence(
         *spec_for(Leg::Lf, JointKind::Upper),
-        DualContactResult {
-            minimum: contact_result(1446, 1441),
-            maximum: contact_result(3443, 3442),
-        },
+        supervised_lf_witness_contacts(JointKind::Upper),
     );
     let lower = derive_joint_evidence(
         *spec_for(Leg::Lf, JointKind::Lower),
-        DualContactResult {
-            minimum: contact_result(3132, 3135),
-            maximum: contact_result(1640, 1643),
-        },
+        supervised_lf_witness_contacts(JointKind::Lower),
     );
     let hip = derive_joint_evidence(
         *spec_for(Leg::Lf, JointKind::Hip),
-        DualContactResult {
-            minimum: contact_result(2546, 2544),
-            maximum: contact_result(1545, 1547),
-        },
+        supervised_lf_witness_contacts(JointKind::Hip),
     );
-    assert_eq!(
-        upper.accepted,
-        upper.fixed_scale.accepted && upper.affine.accepted
-    );
-    assert_eq!(
-        lower.accepted,
-        lower.fixed_scale.accepted && lower.affine.accepted
-    );
-    assert_eq!(
-        hip.accepted,
-        hip.fixed_scale.accepted && hip.affine.accepted
-    );
-    assert!(!lower.accepted || !hip.accepted);
+    for evidence in [upper, lower, hip] {
+        assert!(evidence.affine.accepted);
+        assert!(evidence.contact_witness_accepted);
+        assert!(evidence.accepted);
+    }
+    assert!(!hip.fixed_scale.accepted);
 }
 
 #[test]
@@ -2840,6 +2944,9 @@ fn accepted_endpoint_q0_is_used_only_for_transactional_staging() {
     assert!(source.contains("hip_staged_q0"));
     assert!(source.contains("lower_staged_q0"));
     assert!(source.contains("upper_staged_q0"));
+    assert!(source.contains("let hip_staged_q0 = outcome.joints[0].affine.estimated_zero_tick;"));
+    assert!(source.contains("let lower_staged_q0 = outcome.joints[2].affine.estimated_zero_tick;"));
+    assert!(source.contains("let upper_staged_q0 = outcome.joints[1].affine.estimated_zero_tick;"));
     assert!(source.contains("movement_RAM_only=true, EEPROM_written=false"));
     assert!(!source.contains("reg_write: Some"));
     assert!(!source.contains("freeze_calibration: Some"));

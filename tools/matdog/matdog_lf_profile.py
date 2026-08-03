@@ -234,7 +234,7 @@ def stage_profile(args: argparse.Namespace) -> None:
         lines.extend(
             [
                 prefix + f"joint_name={record['joint_name']}",
-                prefix + f"estimated_q0_tick={record['q0_fixed']}",
+                prefix + f"estimated_q0_tick={record['q0_affine']}",
                 prefix + "accepted=true",
             ]
         )
