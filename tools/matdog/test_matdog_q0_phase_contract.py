@@ -95,6 +95,13 @@ def initialized_contract():
     return contract
 
 
+def normalized_samples() -> dict[int, runner.MotorSample]:
+    return {
+        motor_id: motor(motor_id, position=2048, goal=2048)
+        for motor_id in runner.EXPECTED_MOTOR_IDS
+    }
+
+
 class Q0PhaseAwareContractTests(unittest.TestCase):
     def test_hardware_replay_accepts_m23_sequential_q0_recovery(self) -> None:
         contract = initialized_contract()
@@ -162,12 +169,73 @@ class Q0PhaseAwareContractTests(unittest.TestCase):
                 )
             )
 
+    def test_hardware_replay_accepts_m42_prime_then_parking_goal(self) -> None:
+        contract = initialized_contract()
+        samples = normalized_samples()
+        samples[42] = motor(
+            42,
+            position=2047,
+            goal=2047,
+            torque=True,
+            torque_limit=500,
+        )
+        contract.validate_running(
+            frame(
+                phase=q0_contract.M42_PARKING_PHASE,
+                step=5,
+                motors=samples,
+            )
+        )
+
+        samples[42] = replace(samples[42], goal_position=2389)
+        contract.validate_running(
+            frame(
+                phase=q0_contract.M42_PARKING_PHASE,
+                step=5,
+                motors=samples,
+            )
+        )
+
+    def test_m42_prime_rejects_goal_below_exact_q0_tolerance(self) -> None:
+        contract = initialized_contract()
+        samples = normalized_samples()
+        samples[42] = motor(
+            42,
+            position=2047,
+            goal=2037,
+            torque=True,
+            torque_limit=500,
+        )
+        with self.assertRaisesRegex(runner.RunnerError, "controlled M42 goal"):
+            contract.validate_running(
+                frame(
+                    phase=q0_contract.M42_PARKING_PHASE,
+                    step=5,
+                    motors=samples,
+                )
+            )
+
+    def test_m42_prime_is_rejected_outside_exact_parking_phase(self) -> None:
+        contract = initialized_contract()
+        samples = normalized_samples()
+        samples[42] = motor(
+            42,
+            position=2047,
+            goal=2047,
+            torque=True,
+            torque_limit=500,
+        )
+        with self.assertRaisesRegex(runner.RunnerError, "controlled M42 goal"):
+            contract.validate_running(
+                frame(
+                    phase="LF_LEG_STATE_MACHINE: Prepare LF UPPER M12 MIN",
+                    step=6,
+                    motors=samples,
+                )
+            )
+
     def test_strict_session_accepts_normalized_nonparticipant(self) -> None:
         contract = initialized_contract()
-        samples = {
-            motor_id: motor(motor_id, position=2048, goal=2048)
-            for motor_id in runner.EXPECTED_MOTOR_IDS
-        }
         contract.validate_running(
             frame(
                 phase=(
@@ -175,16 +243,13 @@ class Q0PhaseAwareContractTests(unittest.TestCase):
                     "verified q=0 session entry"
                 ),
                 step=4,
-                motors=samples,
+                motors=normalized_samples(),
             )
         )
 
     def test_strict_session_rejects_nonparticipant_torque(self) -> None:
         contract = initialized_contract()
-        samples = {
-            motor_id: motor(motor_id, position=2048, goal=2048)
-            for motor_id in runner.EXPECTED_MOTOR_IDS
-        }
+        samples = normalized_samples()
         samples[23] = replace(
             samples[23],
             torque_raw=1,
@@ -194,7 +259,7 @@ class Q0PhaseAwareContractTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "nonparticipant M23"):
             contract.validate_running(
                 frame(
-                    phase="LF_LEG_STATE_MACHINE: Park LH upper M42 once",
+                    phase=q0_contract.M42_PARKING_PHASE,
                     step=6,
                     motors=samples,
                 )
