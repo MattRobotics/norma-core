@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Immutable launcher for the reviewed MATDOG V42 Station artifact.
+"""Immutable launcher for the reviewed MATDOG LF measurement/freeze artifact.
 
 This module creates no register command. It verifies the reviewed headless
 runner and native-authority observer byte-for-byte, installs the observer,
 replaces only the Station executable SHA-256 pin, and delegates to the
-fail-closed runner.
+fail-closed runner. EEPROM provisioning remains a separate post-measurement
+transaction performed only after Station has stopped and released the serial
+adapter.
 """
 
 from __future__ import annotations
@@ -19,18 +21,18 @@ RUNNER_PATH = REPO_ROOT / "tools/matdog/matdog_headless_auto_calibrate.py"
 OBSERVER_PATH = REPO_ROOT / "tools/matdog/matdog_native_observer_contract.py"
 
 EXPECTED_RUNNER_SHA256 = (
-    "85a7a7c993d97c331882a5f8f2e6f63311eb03f310203108fc15e5d1d21206a2"
+    "9eccb4aa88c3496e6d4e986d9de2d5fea3d8185d1bd3ea4855d1d3aaa6945613"
 )
 EXPECTED_OBSERVER_SHA256 = (
     "b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167"
 )
 PINNED_STATION_SHA256 = (
-    "e58c7b28c36a42d99fed8e861c2ab0689a5247b93bceb874384665c8a64b5d43"
+    "0f99a8aa6e4af62aa1ce95cbdf7a786b678d9f3eb6217692f23c36f07a4bc71d"
 )
-PINNED_STATION_SOURCE_COMMIT = "26e743b1e62714b3d09c0fe3a6472bc9e56380b4"
-PINNED_STATION_ARTIFACT_ID = 8855071283
+PINNED_STATION_SOURCE_COMMIT = "b9b76b6c6474172fd0e602b6ec3481bff730d794"
+PINNED_STATION_ARTIFACT_ID = 8863795210
 PINNED_STATION_ARTIFACT_ZIP_SHA256 = (
-    "413df5a3ad97818a3274cdeea21c6314eddf680c94c70ae0335136d5c22cf290"
+    "4b604390e6eb2893028aa7b81a8db9d18e9004a53d59ed5034be6e90dfa5c286"
 )
 
 
