@@ -9,6 +9,7 @@ on:
       - "protobufs/drivers/st3215/**"
       - "software/drivers/st3215/**"
       - "software/station/bin/station/**"
+      - "tools/matdog/**"
   workflow_dispatch:
 
 permissions:
@@ -55,10 +56,12 @@ jobs:
           tests_path = Path("software/drivers/st3215/src/auto_calibrate/matdog_test.rs")
           port_path = Path("software/drivers/st3215/src/port.rs")
           module_path = Path("software/drivers/st3215/src/auto_calibrate/mod.rs")
+          profile_path = Path("tools/matdog/matdog_lf_profile.py")
           source = source_path.read_text()
           tests = tests_path.read_text()
           port = port_path.read_text()
           module = module_path.read_text()
+          profile = profile_path.read_text()
 
           forbidden_source = (
               "EepromRegister",
@@ -91,6 +94,11 @@ jobs:
               "UPPER_30_DELTA",
               "UPPER_85_DELTA",
               "UPPER_90_DELTA",
+              "PROBE_TRACKING_ERROR_FLOOR_TICKS",
+              "LF_CONTACT_WITNESS_TOLERANCE_TICKS",
+              "probe_tracking_error_limit",
+              "MATDOG LF CONTACT WITNESS:",
+              "accepted: affine.accepted && contact_witness_accepted",
               "MATDOG LF URDF FREEZE GATE: PASS",
               "MATDOG_LF_PROFILE_V1|joint=",
           )
@@ -101,7 +109,10 @@ jobs:
               "canonical_matdog_source_has_no_eeprom_reset_offset_regwrite_action_or_freeze_path",
               "accepted_endpoint_q0_is_used_only_for_transactional_staging",
               "full_lf_final_order_stages_m13_m11_m12_then_restores_m42",
-              "historical_contacts_reject_freeze_when_endpoint_or_affine_gate_fails",
+              "historical_contacts_use_affine_and_uniform_witness_freeze_gate",
+              "v24_m13_fine_tracking_uses_detector_consistent_global_floor",
+              "lf_contact_witness_gate_is_uniform_and_rejects_v24_m12_cable_obstruction",
+              "affine_gate_accepts_real_span_while_fixed_scale_stays_diagnostic",
           )
           required_port = (
               "matdog_command_allowed_with",
@@ -112,6 +123,10 @@ jobs:
               "mod matdog;",
               "matdog_ram_write_allowed_for_arm_value",
           )
+          required_profile = (
+              "estimated_q0_tick={record['q0_affine']}",
+              "q0_affine",
+          )
 
           expected_constants = {
               "HOME_TICK": 2048,
@@ -119,6 +134,7 @@ jobs:
               "UPPER_30_DELTA": 341,
               "UPPER_85_DELTA": 967,
               "UPPER_90_DELTA": 1024,
+              "LF_CONTACT_WITNESS_TOLERANCE_TICKS": 24,
           }
           constant_errors = []
           for name, expected in expected_constants.items():
@@ -154,8 +170,10 @@ jobs:
                   constant_errors.append(
                       f"missing transactional staged q0 targets: {missing_staged}"
                   )
-              if "affine.estimated_zero_tick" in return_body:
-                  constant_errors.append("affine diagnostic used as EEPROM staging target")
+              if "affine.estimated_zero_tick" not in return_body:
+                  constant_errors.append("affine q0 is not used as the staging target")
+              if "fixed_scale.estimated_zero_tick" in return_body:
+                  constant_errors.append("fixed-scale diagnostic used as staging target")
 
           found = [token for token in forbidden_source if token in source]
           found += [token for token in forbidden_other if token in port or token in module]
@@ -163,6 +181,7 @@ jobs:
           missing += [token for token in required_tests if token not in tests]
           missing += [token for token in required_port if token not in port]
           missing += [token for token in required_module if token not in module]
+          missing += [token for token in required_profile if token not in profile]
 
           stale = [
               path for path in (
@@ -183,7 +202,7 @@ jobs:
                   print(f"MATDOG q0/geometry contract errors: {constant_errors}")
               raise SystemExit(1)
 
-          print("MATDOG canonical 24-contact RAM-only q0-first contract: PASS")
+          print("MATDOG canonical 24-contact RAM-only affine+witness q0 contract: PASS")
           PY
 
       - name: MATDOG Rust format check
