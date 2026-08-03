@@ -22,9 +22,19 @@ jobs:
   build-and-prove:
     name: Build reviewed Station artifact and run offline gates
     runs-on: ubuntu-24.04
+    env:
+      ARTIFACT_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
-      - name: Checkout reviewed revision
+      - name: Checkout exact reviewed head
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.ARTIFACT_SOURCE_SHA }}
+
+      - name: Prove exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ARTIFACT_SOURCE_SHA"
 
       - name: Setup protoc
         uses: arduino/setup-protoc@v3
@@ -95,6 +105,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ARTIFACT_SOURCE_SHA"
           sha256sum target/release/station | tee ci-output/station.sha256
           git rev-parse HEAD | tee ci-output/source-commit.txt
           file target/release/station | tee ci-output/station.file.txt
@@ -112,7 +123,7 @@ jobs:
       - name: Upload immutable Station artifact
         uses: actions/upload-artifact@v4
         with:
-          name: matdog-v42-station-${{ github.sha }}
+          name: matdog-v42-station-${{ env.ARTIFACT_SOURCE_SHA }}
           path: |
             target/release/station
             ci-output/station.sha256
@@ -127,7 +138,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: matdog-v42-verification-${{ github.sha }}
+          name: matdog-v42-verification-${{ env.ARTIFACT_SOURCE_SHA }}
           path: ci-output/
           if-no-files-found: error
           retention-days: 30
