@@ -139,8 +139,12 @@ jobs:
       - name: Format and test complete ST3215 package
         run: |
           set -euo pipefail
-          cargo fmt --all
-          cargo fmt --all -- --check
+          rustfmt --edition 2021 \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          rustfmt --edition 2021 --check \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
           git diff --check
           cargo test --package st3215
 
