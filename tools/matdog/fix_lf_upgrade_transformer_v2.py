@@ -73,5 +73,61 @@ if text.count(old_emission) != 1:
     raise SystemExit("transformer profile-emission marker is not unique")
 text = text.replace(old_emission, new_emission, 1)
 
+old_scan = '        THERMAL_IMPL + "    async fn scan_motors(",'
+new_scan = '        THERMAL_IMPL,'
+if text.count(old_scan) != 1:
+    raise SystemExit("transformer scan-motors replacement marker is not unique")
+text = text.replace(old_scan, new_scan, 1)
+
+immediate_constant = "const MATDOG_IMMEDIATE_THERMAL_ABORT_C: u8 = 85;\\n"
+if text.count(immediate_constant) != 1:
+    raise SystemExit("transformer immediate thermal constant marker is not unique")
+text = text.replace(immediate_constant, "", 1)
+
+immediate_classifier = '''    if samples
+        .iter()
+        .any(|temperature| *temperature >= MATDOG_IMMEDIATE_THERMAL_ABORT_C)
+    {
+        return MatdogThermalDecision::Confirmed;
+    }
+'''
+if text.count(immediate_classifier) != 1:
+    raise SystemExit("transformer immediate thermal classifier marker is not unique")
+text = text.replace(immediate_classifier, "", 1)
+
+old_confirmation_condition = (
+    "        if first > configured_limit_c && first < MATDOG_IMMEDIATE_THERMAL_ABORT_C {"
+)
+new_confirmation_condition = "        if first > configured_limit_c {"
+if text.count(old_confirmation_condition) != 1:
+    raise SystemExit("transformer thermal confirmation condition is not unique")
+text = text.replace(old_confirmation_condition, new_confirmation_condition, 1)
+
+old_direct_test = '''        assert_eq!(
+            classify_matdog_direct_temperature_samples(70, &[85]),
+            MatdogThermalDecision::Confirmed
+        );
+        assert_eq!(
+            classify_matdog_direct_temperature_samples(70, &[73, 72, 39]),
+            MatdogThermalDecision::Confirmed
+        );
+'''
+new_direct_test = '''        assert_eq!(
+            classify_matdog_direct_temperature_samples(70, &[85]),
+            MatdogThermalDecision::Transient
+        );
+        assert_eq!(
+            classify_matdog_direct_temperature_samples(70, &[85, 84, 39]),
+            MatdogThermalDecision::Confirmed
+        );
+        assert_eq!(
+            classify_matdog_direct_temperature_samples(70, &[73, 72, 39]),
+            MatdogThermalDecision::Confirmed
+        );
+'''
+if text.count(old_direct_test) != 1:
+    raise SystemExit("transformer direct-temperature test marker is not unique")
+text = text.replace(old_direct_test, new_direct_test, 1)
+
 path.write_text(text)
 print("MATDOG_LF_UPGRADE_TRANSFORMER_V2=PASS")
