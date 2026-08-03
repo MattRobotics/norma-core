@@ -1,0 +1,68 @@
+name: MATDOG Q0 Phase Observer Check
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/matdog-q0-phase-observer-check.yml"
+      - "tools/matdog/matdog_q0_phase_contract.py"
+      - "tools/matdog/matdog_v42_pinned_launcher.py"
+      - "tools/matdog/test_matdog_q0_phase_contract.py"
+      - "tools/matdog/test_matdog_v42_pinned_launcher.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matdog-q0-phase-observer-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  observer-contract:
+    name: Replay q0 startup and enforce strict LF transition
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact reviewed head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prove exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Enforce phase-aware source contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          adapter = Path("tools/matdog/matdog_q0_phase_contract.py").read_text()
+          launcher = Path("tools/matdog/matdog_v42_pinned_launcher.py").read_text()
+          required = (
+              "Q0_NORMALIZATION_PHASE",
+              "STARTUP_HOME_RECOVERY_LIMIT_TICKS = 64",
+              "len(enabled) > 1",
+              "sample.goal_position != HOME_TICK",
+              "sample.torque_limit != runner.EXPECTED_ACTIVE_TORQUE_LIMIT",
+              "sample.goal_position not in {initial_goal, HOME_TICK}",
+              "home_distance > runner.MAX_NONPARTICIPANT_DRIFT",
+          )
+          missing = [token for token in required if token not in adapter]
+          if missing:
+              raise SystemExit(f"missing q0 observer requirements: {missing}")
+          if "matdog_q0_phase_contract.install(runner)" not in launcher:
+              raise SystemExit("pinned launcher does not install q0 phase contract")
+          print("MATDOG phase-aware q0 observer source contract: PASS")
+          PY
+
+      - name: Replay hardware fault and negative cases
+        run: |
+          python3 -m unittest -v \
+            tools.matdog.test_matdog_q0_phase_contract \
+            tools.matdog.test_matdog_v42_pinned_launcher
