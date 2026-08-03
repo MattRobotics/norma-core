@@ -353,6 +353,61 @@ fn lf_upper_m12_max_profile_matches_reviewed_geometry() {
 }
 
 #[test]
+fn nonparticipating_torque_off_uses_real_position_drift_not_instantaneous_speed() {
+    for motor_id in MATDOG_MOTOR_IDS {
+        for velocity in [LF_HELD_MAX_SPEED_RAW + 1, 50, u16::MAX] {
+            let mut observed = off_observation(HOME_TICK + 1);
+            observed.velocity = velocity;
+            let now_ns = observed.monotonic_stamp_ns + 1;
+            assert!(validate_lf_role_observation(
+                motor_id,
+                observed,
+                LfMotorRole::NonParticipatingTorqueOff {
+                    entry_tick: HOME_TICK,
+                },
+                now_ns,
+            )
+            .is_ok());
+        }
+    }
+}
+
+#[test]
+fn nonparticipating_torque_off_remains_fail_closed_on_torque_or_real_drift() {
+    for motor_id in MATDOG_MOTOR_IDS {
+        let mut torque_on = off_observation(HOME_TICK);
+        torque_on.torque_enabled = true;
+        let torque_now_ns = torque_on.monotonic_stamp_ns + 1;
+        let torque_error = validate_lf_role_observation(
+            motor_id,
+            torque_on,
+            LfMotorRole::NonParticipatingTorqueOff {
+                entry_tick: HOME_TICK,
+            },
+            torque_now_ns,
+        )
+        .unwrap_err();
+        assert!(torque_error.contains("unexpectedly torque ON"));
+
+        let drifted_tick = HOME_TICK + NON_PARTICIPATING_MAX_DRIFT_TICKS + 1;
+        let mut drifted = off_observation(drifted_tick);
+        drifted.velocity = 0;
+        let drift_now_ns = drifted.monotonic_stamp_ns + 1;
+        let drift_error = validate_lf_role_observation(
+            motor_id,
+            drifted,
+            LfMotorRole::NonParticipatingTorqueOff {
+                entry_tick: HOME_TICK,
+            },
+            drift_now_ns,
+        )
+        .unwrap_err();
+        assert!(drift_error.contains("moved unexpectedly"));
+        assert!(drift_error.contains("drift=17"));
+    }
+}
+
+#[test]
 fn startup_home_goal_gate_is_global_and_exact_home_only_for_non_profile_joints() {
     let profile = profile_for_arm_value(LF_FULL_SEQUENCE_ARM_VALUE).unwrap();
     let non_profile_joints = [21_u8, 22, 23, 31, 32, 33, 41, 43];

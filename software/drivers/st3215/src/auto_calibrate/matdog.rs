@@ -1416,12 +1416,6 @@ fn validate_lf_role_observation(
                     observation.position
                 ));
             }
-            let speed = speed_magnitude(observation.velocity);
-            if speed > LF_HELD_MAX_SPEED_RAW {
-                return Err(format!(
-                    "non-participating M{motor_id} moved unexpectedly: speed={speed}"
-                ));
-            }
             Ok(())
         }
     }
