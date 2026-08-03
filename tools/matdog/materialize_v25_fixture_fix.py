@@ -58,6 +58,28 @@ if section.count(old) != 1:
 section = section.replace(old, "let contacts = supervised_lf_witness_contacts(joint);", 1)
 # The production code stages affine q0. Keep the state-machine replay aligned.
 section = section.replace(".fixed_scale.estimated_zero_tick", ".affine.estimated_zero_tick")
+old_replay = """    let held_m11 = session.role_for(11).unwrap();
+    validate_lf_role_observation(11, on_observation(2048, 2048), held_m11, 10_000).unwrap();
+    let mut drifted = on_observation(2061, 2048);
+    assert!(validate_lf_role_observation(11, drifted, held_m11, 10_000).is_err());
+    drifted.position = 2048;
+"""
+new_replay = """    let held_m11 = session.role_for(11).unwrap();
+    let held_m11_tick = evidences[2].affine.estimated_zero_tick;
+    validate_lf_role_observation(
+        11,
+        on_observation(held_m11_tick, held_m11_tick),
+        held_m11,
+        10_000,
+    )
+    .unwrap();
+    let mut drifted = on_observation(held_m11_tick + STATIC_TOLERANCE_TICKS + 1, held_m11_tick);
+    assert!(validate_lf_role_observation(11, drifted, held_m11, 10_000).is_err());
+    drifted.position = held_m11_tick;
+"""
+if old_replay not in section:
+    raise SystemExit("state-machine affine replay marker missing")
+section = section.replace(old_replay, new_replay, 1)
 text = text[:function_start] + section + text[function_end:]
 
 historical_start = text.index("fn historical_contacts_use_affine_and_uniform_witness_freeze_gate()")
@@ -85,6 +107,7 @@ for token in (
     "supervised_lf_witness_contacts(joint)",
     "supervised_lf_witness_contacts(JointKind::Upper)",
     "evidences[0].affine.estimated_zero_tick",
+    "let held_m11_tick = evidences[2].affine.estimated_zero_tick;",
 ):
     if token not in text:
         raise SystemExit(f"required V25 fixture token missing: {token}")
