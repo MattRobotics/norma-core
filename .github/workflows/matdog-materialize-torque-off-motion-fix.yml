@@ -41,7 +41,6 @@ jobs:
                           ));
                       }
           '''
-          # Keep this fallback because rustfmt indentation in the reviewed source is 12 spaces.
           canonical_speed_gate = '''            let speed = speed_magnitude(observation.velocity);
             if speed > LF_HELD_MAX_SPEED_RAW {
                 return Err(format!(
@@ -179,3 +178,5 @@ jobs:
           fi
           git commit -m "fix(matdog): validate torque-off motion by real drift"
           git push origin HEAD:matdog/lf-q0-contract-v42
+
+# Triggered after workflow registration; no source logic is encoded in this comment.
