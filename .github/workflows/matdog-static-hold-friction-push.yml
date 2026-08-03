@@ -1,0 +1,76 @@
+name: MATDOG Apply Static-Hold Friction Fix
+
+on:
+  push:
+    branches:
+      - matdog/lf-q0-contract-v42
+
+permissions:
+  contents: write
+
+concurrency:
+  group: matdog-apply-static-hold-friction-fix
+  cancel-in-progress: false
+
+jobs:
+  patch-test-and-commit:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: matdog/lf-q0-contract-v42
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Apply reviewed correction
+        run: |
+          set -euo pipefail
+          python3 tools/matdog/materialize_static_hold_friction_fix.py
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: '29.3'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format MATDOG sources
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2021 \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          rustfmt --edition 2021 --check \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          git diff --check
+
+      - name: Run complete ST3215 suite
+        run: cargo test --package st3215
+
+      - name: Run MATDOG Python contracts
+        run: |
+          python3 -m unittest -v \
+            tools.matdog.test_matdog_headless_auto_calibrate \
+            tools.matdog.test_matdog_native_observer_contract \
+            tools.matdog.test_matdog_lf_profile \
+            tools.matdog.test_matdog_v42_pinned_launcher
+
+      - name: Commit reviewed source and tests
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          if git diff --cached --quiet; then
+            echo "Correction already materialized."
+            exit 0
+          fi
+          git commit -m "fix(matdog): distinguish friction plateaus from held motion"
+          git push origin HEAD:matdog/lf-q0-contract-v42
