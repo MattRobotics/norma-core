@@ -25,7 +25,9 @@ jobs:
           persist-credentials: true
 
       - name: Apply reviewed V25 correction
-        run: python3 tools/matdog/materialize_v25_final_lf_fix.py
+        run: |
+          python3 tools/matdog/materialize_v25_final_lf_fix.py
+          python3 tools/matdog/materialize_v25_fixture_fix.py
 
       - name: Setup protoc
         uses: arduino/setup-protoc@v3
