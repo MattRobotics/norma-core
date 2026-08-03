@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 import unittest
 
 from tools.matdog import matdog_v42_pinned_launcher as launcher
@@ -21,11 +20,14 @@ class MatdogV42PinnedLauncherTests(unittest.TestCase):
         )
         self.assertGreater(launcher.PINNED_STATION_ARTIFACT_ID, 0)
 
-    def test_launcher_replaces_only_station_hash_pin(self) -> None:
+    def test_launcher_installs_phase_contract_and_station_pin(self) -> None:
         runner = launcher.load_reviewed_runner()
         self.assertEqual(
             runner.EXPECTED_STATION_SHA256,
             launcher.PINNED_STATION_SHA256,
+        )
+        self.assertTrue(
+            getattr(runner.FrameContract, "_matdog_q0_phase_aware", False)
         )
         self.assertEqual(runner.EXPECTED_BUS_SERIAL, "5B14114953")
         self.assertEqual(runner.EXPECTED_FULL_TOTAL_STEPS, 58)
