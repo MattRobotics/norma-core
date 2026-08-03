@@ -73,4 +73,6 @@ jobs:
             exit 0
           fi
           git commit -m "fix(matdog): distinguish friction plateaus from held motion"
+          git fetch origin matdog/lf-q0-contract-v42
+          git rebase origin/matdog/lf-q0-contract-v42
           git push origin HEAD:matdog/lf-q0-contract-v42
