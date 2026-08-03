@@ -4,6 +4,28 @@ from pathlib import Path
 path = Path(__file__).with_name("apply_lf_freeze_source_upgrade.py")
 text = path.read_text()
 
+old_helper = '''def replace_test_function(text: str, name: str, replacement: str) -> str:
+    pattern = re.compile(
+        rf"(?ms)^    #\\[test\\]\\n    fn {re.escape(name)}\\(\\) \\{{.*?^    \\}}\\n"
+    )
+    updated, count = pattern.subn(replacement.rstrip() + "\\n", text)
+    if count != 1:
+        raise RuntimeError(f"test {name}: expected one function, found {count}")
+    return updated
+'''
+new_helper = '''def replace_test_function(text: str, name: str, replacement: str) -> str:
+    pattern = re.compile(
+        rf"(?ms)^(?P<indent>[ \\t]*)#\\[test\\]\\n(?P=indent)fn {re.escape(name)}\\(\\) \\{{.*?^(?P=indent)\\}}\\n"
+    )
+    updated, count = pattern.subn(replacement.rstrip() + "\\n", text)
+    if count != 1:
+        raise RuntimeError(f"test {name}: expected one function, found {count}")
+    return updated
+'''
+if text.count(old_helper) != 1:
+    raise SystemExit("transformer test-function helper marker is not unique")
+text = text.replace(old_helper, new_helper, 1)
+
 old_worker = '''    old_worker_args = "&mut matdog_thermal_transients,\\n                                &mut matdog_thermal_transient_total,"
     if text.count(old_worker_args) != 1:
         raise RuntimeError("worker thermal arguments: marker mismatch")
