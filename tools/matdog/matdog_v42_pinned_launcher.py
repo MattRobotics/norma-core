@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Immutable launcher for the reviewed MATDOG V42 Station artifact.
 
-This module does not create any additional command type.  It verifies the
-reviewed headless runner byte-for-byte, installs the reviewed q0-first phase
-contract, replaces only its Station executable SHA-256 pin, and delegates to
-the existing fail-closed runner.
+This module creates no register command. It verifies the reviewed headless
+runner and native-authority observer byte-for-byte, installs the observer,
+replaces only the Station executable SHA-256 pin, and delegates to the
+fail-closed runner.
 """
 
 from __future__ import annotations
@@ -16,9 +16,13 @@ import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER_PATH = REPO_ROOT / "tools/matdog/matdog_headless_auto_calibrate.py"
+OBSERVER_PATH = REPO_ROOT / "tools/matdog/matdog_native_observer_contract.py"
 
 EXPECTED_RUNNER_SHA256 = (
     "85a7a7c993d97c331882a5f8f2e6f63311eb03f310203108fc15e5d1d21206a2"
+)
+EXPECTED_OBSERVER_SHA256 = (
+    "b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167"
 )
 PINNED_STATION_SHA256 = (
     "17b4da6eb46f63711a0ece52a6b71311e49afb4e639733f164f7a8e699baa1be"
@@ -38,20 +42,25 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_reviewed_runner():
-    actual = sha256_file(RUNNER_PATH)
-    if actual != EXPECTED_RUNNER_SHA256:
+def require_reviewed_file(path: Path, expected_sha256: str, label: str) -> None:
+    actual = sha256_file(path)
+    if actual != expected_sha256:
         raise RuntimeError(
-            "refusing to launch an unreviewed MATDOG runner: "
-            f"actual={actual}, expected={EXPECTED_RUNNER_SHA256}"
+            f"refusing to launch an unreviewed MATDOG {label}: "
+            f"actual={actual}, expected={expected_sha256}"
         )
+
+
+def load_reviewed_runner():
+    require_reviewed_file(RUNNER_PATH, EXPECTED_RUNNER_SHA256, "runner")
+    require_reviewed_file(OBSERVER_PATH, EXPECTED_OBSERVER_SHA256, "observer")
 
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
     from tools.matdog import matdog_headless_auto_calibrate as runner
-    from tools.matdog import matdog_q0_phase_contract
+    from tools.matdog import matdog_native_observer_contract
 
-    matdog_q0_phase_contract.install(runner)
+    matdog_native_observer_contract.install(runner)
     runner.EXPECTED_STATION_SHA256 = PINNED_STATION_SHA256
     return runner
 
