@@ -84,9 +84,11 @@ jobs:
       - name: ST3215 tests
         run: cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
 
-      - name: Headless runner tests
+      - name: Headless runner and pin tests
         run: |
-          python3 -m unittest -v tools.matdog.test_matdog_headless_auto_calibrate \
+          python3 -m unittest -v \
+            tools.matdog.test_matdog_headless_auto_calibrate \
+            tools.matdog.test_matdog_v42_pinned_launcher \
             2>&1 | tee ci-output/headless-runner-tests.log
 
       - name: Create CI-only Station viewer stub
