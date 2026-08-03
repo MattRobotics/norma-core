@@ -2,10 +2,9 @@
 """Phase-aware runtime contract for the MATDOG q0-first LF runner.
 
 The reviewed Rust state machine normalizes every canonical joint to saved q0
-before assigning strict LF session roles.  The base observer predates that
-ordering and treats the eight non-LF-session motors as permanently passive.
-This adapter preserves every base payload/freshness check while admitting only
-the exact, sequential q0 recovery envelope during the named startup phase.
+before assigning strict LF session roles. The observer must also tolerate the
+bounded telemetry transition produced when M42 is primed at its settled q0
+readback immediately before the +30 degree parking goal is published.
 """
 
 from __future__ import annotations
@@ -16,9 +15,13 @@ from typing import Any
 HOME_TICK = 2048
 STARTUP_HOME_RECOVERY_LIMIT_TICKS = 64
 STARTUP_HOME_POSITION_MARGIN_TICKS = 16
+M42_Q0_PRIME_TOLERANCE_TICKS = 10
 Q0_NORMALIZATION_PHASE = (
     "LF_LEG_STATE_MACHINE: Normalize every displaced MATDOG joint to q=0 "
     "with one uniform rule"
+)
+M42_PARKING_PHASE = (
+    "LF_LEG_STATE_MACHINE: Park LH upper M42 once for the complete LF session"
 )
 
 
@@ -108,6 +111,30 @@ def build_phase_aware_contract(runner: Any):
                         f"speed={sample.speed_raw}"
                     )
 
+        def _m42_parking_prime_transition_allowed(
+            self,
+            frame: Any,
+            sample: Any,
+        ) -> bool:
+            if frame.calibration.phase != M42_PARKING_PHASE:
+                return False
+            if frame.calibration.current_step != 5:
+                return False
+            if sample.motor_id != 42 or not sample.torque_enabled:
+                return False
+            goal_distance = runner.circular_distance(
+                sample.goal_position,
+                HOME_TICK,
+            )
+            position_distance = runner.circular_distance(
+                sample.position,
+                HOME_TICK,
+            )
+            return (
+                goal_distance <= M42_Q0_PRIME_TOLERANCE_TICKS
+                and position_distance <= M42_Q0_PRIME_TOLERANCE_TICKS
+            )
+
         def _validate_strict_lf_session(self, frame: Any) -> None:
             self.validate_common(frame)
             for motor_id in runner.CONTROLLED_MOTOR_IDS:
@@ -128,7 +155,16 @@ def build_phase_aware_contract(runner: Any):
                             f"outside {position_low}..={position_high}"
                         )
                     goal_low, goal_high = runner.CONTROLLED_GOAL_CORRIDORS[motor_id]
-                    if not goal_low <= sample.goal_position <= goal_high:
+                    goal_in_normal_corridor = (
+                        goal_low <= sample.goal_position <= goal_high
+                    )
+                    if not goal_in_normal_corridor and not (
+                        motor_id == 42
+                        and self._m42_parking_prime_transition_allowed(
+                            frame,
+                            sample,
+                        )
+                    ):
                         raise runner.RunnerError(
                             f"controlled M{motor_id} goal {sample.goal_position} "
                             f"outside {goal_low}..={goal_high}"
