@@ -637,7 +637,14 @@ fn lf_full_sequence_goal_allowed(motor_id: u8, target: u16) -> bool {
         let Ok(parking) = static_target(Leg::Lh, JointKind::Upper, UPPER_30_DELTA) else {
             return false;
         };
-        let low = HOME_TICK.min(parking.target_tick);
+        // q=0 normalization accepts a settled readback within the static
+        // tolerance. prepare_motor() then primes the torque-OFF servo at that
+        // observed tick before enabling torque. Admit only that same bounded
+        // q=0 priming band; the parking target and mechanical corridor remain
+        // unchanged.
+        let low = HOME_TICK
+            .min(parking.target_tick)
+            .saturating_sub(STATIC_TOLERANCE_TICKS);
         let high = HOME_TICK
             .max(parking.target_tick)
             .min(protocol::MAX_ANGLE_STEP);

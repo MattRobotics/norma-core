@@ -925,7 +925,13 @@ fn lf_full_sequence_is_one_explicit_hardware_arm_with_union_goal_gate() {
     }
     assert!(lf_full_sequence_goal_allowed(42, 2389));
     assert!(!lf_full_sequence_goal_allowed(42, 2390));
-    assert!(!lf_full_sequence_goal_allowed(42, 2047));
+    // A torque-OFF M42 that settled one tick below q0 must be primeable
+    // before the bounded +30-degree parking move.
+    assert!(lf_full_sequence_goal_allowed(42, 2047));
+    assert!(!lf_full_sequence_goal_allowed(
+        42,
+        HOME_TICK.saturating_sub(STATIC_TOLERANCE_TICKS + 1)
+    ));
     assert!(!lf_full_sequence_goal_allowed(23, HOME_TICK));
     assert!(!lf_full_sequence_goal_allowed(23, HOME_TICK + 65));
     assert!(!lf_full_sequence_goal_allowed(99, HOME_TICK));
@@ -2693,4 +2699,31 @@ fn full_lf_final_return_order_uses_saved_q0_for_m13_m11_m12_then_m42() {
 
     let parking_body = &source[parking..];
     assert!(parking_body.contains("self.move_motor_to(42, HOME_TICK, STATIC_TOLERANCE_TICKS)"));
+}
+
+#[test]
+fn lf_parking_goal_gate_accepts_q0_settle_priming_without_widening_beyond_static_tolerance() {
+    let profile = profile_for_arm_value(LF_FULL_SEQUENCE_ARM_VALUE).unwrap();
+    let parking = static_target(Leg::Lh, JointKind::Upper, UPPER_30_DELTA).unwrap();
+    let lowest_q0_prime = HOME_TICK.saturating_sub(STATIC_TOLERANCE_TICKS);
+
+    for target in lowest_q0_prime..=HOME_TICK {
+        assert!(
+            armed_goal_target_allowed(&profile, 42, target),
+            "M42 q0-settled prime target {target} must be admitted"
+        );
+        assert!(ram_write_allowed_for_profile(
+            &profile,
+            42,
+            RamRegister::GoalPosition.address() as u32,
+            &target.to_le_bytes(),
+        ));
+    }
+
+    assert!(armed_goal_target_allowed(&profile, 42, parking.target_tick));
+    assert!(!armed_goal_target_allowed(
+        &profile,
+        42,
+        lowest_q0_prime.saturating_sub(1)
+    ));
 }
