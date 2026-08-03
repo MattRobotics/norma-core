@@ -1,0 +1,181 @@
+name: MATDOG Materialize Torque-Off Motion Fix
+
+on:
+  push:
+    branches:
+      - matdog/lf-q0-contract-v42
+
+permissions:
+  contents: write
+
+concurrency:
+  group: matdog-materialize-torque-off-motion-fix
+  cancel-in-progress: false
+
+jobs:
+  patch-test-and-commit:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: matdog/lf-q0-contract-v42
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Apply general torque-off motion rule and tests
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source_path = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs")
+          test_path = Path("software/drivers/st3215/src/auto_calibrate/matdog_test.rs")
+          source = source_path.read_text()
+          tests = test_path.read_text()
+
+          obsolete_speed_gate = '''            let speed = speed_magnitude(observation.velocity);
+                      if speed > LF_HELD_MAX_SPEED_RAW {
+                          return Err(format!(
+                              "non-participating M{motor_id} moved unexpectedly: speed={speed}"
+                          ));
+                      }
+          '''
+          # Keep this fallback because rustfmt indentation in the reviewed source is 12 spaces.
+          canonical_speed_gate = '''            let speed = speed_magnitude(observation.velocity);
+            if speed > LF_HELD_MAX_SPEED_RAW {
+                return Err(format!(
+                    "non-participating M{motor_id} moved unexpectedly: speed={speed}"
+                ));
+            }
+          '''
+
+          matched = 0
+          for block in (canonical_speed_gate, obsolete_speed_gate):
+              if block in source:
+                  if source.count(block) != 1:
+                      raise SystemExit(f"unexpected torque-off speed gate count: {source.count(block)}")
+                  source = source.replace(block, "", 1)
+                  matched += 1
+          if matched > 1:
+              raise SystemExit("multiple torque-off speed gate variants matched")
+
+          test_name = "nonparticipating_torque_off_uses_real_position_drift_not_instantaneous_speed"
+          if test_name not in tests:
+              marker = '''#[test]
+          fn startup_home_goal_gate_is_global_and_exact_home_only_for_non_profile_joints() {
+          '''
+              if marker not in tests:
+                  raise SystemExit("test insertion marker not found")
+              addition = r'''#[test]
+          fn nonparticipating_torque_off_uses_real_position_drift_not_instantaneous_speed() {
+              for motor_id in MATDOG_MOTOR_IDS {
+                  for velocity in [LF_HELD_MAX_SPEED_RAW + 1, 50, u16::MAX] {
+                      let mut observed = off_observation(HOME_TICK + 1);
+                      observed.velocity = velocity;
+                      let now_ns = observed.monotonic_stamp_ns + 1;
+                      assert!(validate_lf_role_observation(
+                          motor_id,
+                          observed,
+                          LfMotorRole::NonParticipatingTorqueOff {
+                              entry_tick: HOME_TICK,
+                          },
+                          now_ns,
+                      )
+                      .is_ok());
+                  }
+              }
+          }
+
+          #[test]
+          fn nonparticipating_torque_off_remains_fail_closed_on_torque_or_real_drift() {
+              for motor_id in MATDOG_MOTOR_IDS {
+                  let mut torque_on = off_observation(HOME_TICK);
+                  torque_on.torque_enabled = true;
+                  let torque_now_ns = torque_on.monotonic_stamp_ns + 1;
+                  let torque_error = validate_lf_role_observation(
+                      motor_id,
+                      torque_on,
+                      LfMotorRole::NonParticipatingTorqueOff {
+                          entry_tick: HOME_TICK,
+                      },
+                      torque_now_ns,
+                  )
+                  .unwrap_err();
+                  assert!(torque_error.contains("unexpectedly torque ON"));
+
+                  let drifted_tick = HOME_TICK + NON_PARTICIPATING_MAX_DRIFT_TICKS + 1;
+                  let mut drifted = off_observation(drifted_tick);
+                  drifted.velocity = 0;
+                  let drift_now_ns = drifted.monotonic_stamp_ns + 1;
+                  let drift_error = validate_lf_role_observation(
+                      motor_id,
+                      drifted,
+                      LfMotorRole::NonParticipatingTorqueOff {
+                          entry_tick: HOME_TICK,
+                      },
+                      drift_now_ns,
+                  )
+                  .unwrap_err();
+                  assert!(drift_error.contains("moved unexpectedly"));
+                  assert!(drift_error.contains("drift=17"));
+              }
+          }
+
+          '''
+              tests = tests.replace(marker, addition + marker, 1)
+
+          if "non-participating M{motor_id} moved unexpectedly: speed={speed}" in source:
+              raise SystemExit("obsolete instantaneous speed abort remains")
+          if test_name not in tests:
+              raise SystemExit("general torque-off regression test missing")
+
+          source_path.write_text(source)
+          test_path.write_text(tests)
+          PY
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: '29.3'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format exact Rust sources
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          git diff --check
+
+      - name: Run complete ST3215 suite
+        run: |
+          set -euo pipefail
+          cargo test --package st3215
+
+      - name: Run MATDOG Python suites
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v \
+            tools.matdog.test_matdog_headless_auto_calibrate \
+            tools.matdog.test_matdog_native_observer_contract \
+            tools.matdog.test_matdog_lf_profile \
+            tools.matdog.test_matdog_v42_pinned_launcher
+
+      - name: Commit only reviewed source and tests
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          if git diff --cached --quiet; then
+            echo "General torque-off motion rule already materialized."
+            exit 0
+          fi
+          git commit -m "fix(matdog): validate torque-off motion by real drift"
+          git push origin HEAD:matdog/lf-q0-contract-v42
