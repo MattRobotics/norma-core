@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""One-shot source materializer for the reviewed MATDOG V23 hardware findings."""
+"""Materialize the general MATDOG V23 static-hold and friction correction."""
 
 from pathlib import Path
-
 
 SOURCE_PATH = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs")
 TEST_PATH = Path("software/drivers/st3215/src/auto_calibrate/matdog_test.rs")
@@ -47,11 +46,9 @@ def main() -> None:
             source,
             "const ADAPTIVE_FINE_SCOUT_TICKS: u16 = 32;\n",
             '''const ADAPTIVE_FINE_SCOUT_TICKS: u16 = 32;
-// A fine pass may settle a few ticks before the coarse scout because its
-// command increments are smaller. More than one fine step of lag is treated
-// as a friction/chamfer plateau: keep advancing in bounded FINE_STEP_TICKS
-// until the scout depth is reproduced, a true contact is found, or the
-// unchanged model guard stops the pass.
+// Fine approaches use smaller increments and may settle slightly before the
+// coarse scout. A lag greater than one fine step is treated as a bounded
+// friction/chamfer plateau, not as the final mechanical endpoint.
 const FINE_CONTACT_SCOUT_LAG_TOLERANCE_TICKS: u16 = FINE_STEP_TICKS;
 ''',
             "fine scout lag constant",
@@ -137,7 +134,7 @@ fn position_inside_adaptive_contact_acceptance(
                         }
                         info!(
 ''',
-            "detector friction bypass",
+            "persistent-contact friction bypass",
         )
 
     if "adaptive friction plateau bypass" not in source:
@@ -173,7 +170,7 @@ fn position_inside_adaptive_contact_acceptance(
                         info!(
                             "MATDOG {} adaptive kinematic contact: step={}, target={}, present={}, error={}, current={}, scout={}",
 ''',
-            "adaptive plateau friction bypass",
+            "adaptive-contact friction bypass",
         )
 
     if "actively_held_static_role_uses_position_error_not_instantaneous_speed" not in tests:
@@ -184,26 +181,29 @@ fn nonparticipating_torque_off_uses_real_position_drift_not_instantaneous_speed(
 ''',
             r'''#[test]
 fn actively_held_static_role_uses_position_error_not_instantaneous_speed() {
-    for motor_id in MATDOG_MOTOR_IDS {
+    // These are all motors that can own an ActivelyHeld role in the LF state
+    // machine. The other eight canonical motors are covered by the separate
+    // NonParticipatingTorqueOff tests below.
+    for motor_id in [11_u8, 12, 13, 42] {
         for velocity in [LF_HELD_MAX_SPEED_RAW + 1, 50, u16::MAX] {
             let observed = observation(HOME_TICK + 1, velocity, 0, HOME_TICK);
             let now_ns = observed.monotonic_stamp_ns + 1;
-            assert!(validate_lf_role_observation(
+            let result = validate_lf_role_observation(
                 motor_id,
                 observed,
                 LfMotorRole::ActivelyHeld {
                     target_tick: HOME_TICK,
                 },
                 now_ns,
-            )
-            .is_ok());
+            );
+            assert!(result.is_ok(), "M{motor_id} velocity={velocity}: {result:?}");
         }
     }
 }
 
 #[test]
 fn actively_held_static_role_remains_fail_closed_on_real_state_errors() {
-    for motor_id in MATDOG_MOTOR_IDS {
+    for motor_id in [11_u8, 12, 13, 42] {
         let mut torque_off = observation(HOME_TICK, 0, 0, HOME_TICK);
         torque_off.torque_enabled = false;
         let torque_now_ns = torque_off.monotonic_stamp_ns + 1;
@@ -247,8 +247,8 @@ fn actively_held_static_role_remains_fail_closed_on_real_state_errors() {
             drift_now_ns,
         )
         .unwrap_err();
-        assert!(error.contains("actively-held"));
-        assert!(error.contains("drifted"));
+        assert!(error.contains("actively-held"), "M{motor_id}: {error}");
+        assert!(error.contains("drifted"), "M{motor_id}: {error}");
     }
 }
 
@@ -256,7 +256,6 @@ fn actively_held_static_role_remains_fail_closed_on_real_state_errors() {
 fn fine_contact_scout_depth_gate_is_direction_independent_and_bounded() {
     for probe_sign in [-1_i8, 1_i8] {
         let scout = 2000_u16;
-        let at_scout = scout;
         let one_step_before = if probe_sign > 0 {
             scout - FINE_STEP_TICKS
         } else {
@@ -269,11 +268,7 @@ fn fine_contact_scout_depth_gate_is_direction_independent_and_bounded() {
         };
         let beyond_scout = if probe_sign > 0 { scout + 4 } else { scout - 4 };
 
-        assert!(fine_contact_reproduces_coarse_depth(
-            at_scout,
-            scout,
-            probe_sign
-        ));
+        assert!(fine_contact_reproduces_coarse_depth(scout, scout, probe_sign));
         assert!(fine_contact_reproduces_coarse_depth(
             one_step_before,
             scout,
@@ -291,9 +286,13 @@ fn fine_contact_scout_depth_gate_is_direction_independent_and_bounded() {
         ));
     }
 
+    // Normal V23 fine/coarse offsets remain valid.
     assert!(fine_contact_reproduces_coarse_depth(1438, 1434, -1));
     assert!(fine_contact_reproduces_coarse_depth(3443, 3446, 1));
     assert!(fine_contact_reproduces_coarse_depth(3093, 3097, 1));
+
+    // V23 M11 MAX: 1666 is 14 ticks before the deeper 1652 scout and must be
+    // traversed as a friction/chamfer plateau rather than frozen as endpoint.
     assert!(!fine_contact_reproduces_coarse_depth(1666, 1652, -1));
 }
 
@@ -303,9 +302,6 @@ fn nonparticipating_torque_off_uses_real_position_drift_not_instantaneous_speed(
             "new regression tests",
         )
 
-    # Update the historical simulation that previously expected a speed-only
-    # held-role failure. It must now prove that speed alone passes while real
-    # position drift still fails.
     old_simulation = '''    bad_goal.goal_position = 2081;
     bad_goal.velocity = LF_HELD_MAX_SPEED_RAW + 1;
     assert!(validate_lf_role_observation(11, bad_goal, held, 10_000).is_err());
@@ -324,7 +320,7 @@ fn nonparticipating_torque_off_uses_real_position_drift_not_instantaneous_speed(
             tests,
             old_simulation,
             new_simulation,
-            "historical held speed simulation",
+            "historical held-speed simulation",
         )
 
     for token in (
@@ -333,6 +329,7 @@ fn nonparticipating_torque_off_uses_real_position_drift_not_instantaneous_speed(
     ):
         if token in source:
             raise SystemExit(f"obsolete instantaneous static-speed abort remains: {token}")
+
     for token in (
         "friction plateau bypass",
         "fine_contact_reproduces_coarse_depth",
