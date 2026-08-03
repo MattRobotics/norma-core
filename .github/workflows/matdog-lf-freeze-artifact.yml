@@ -32,14 +32,16 @@ jobs:
     steps:
       - name: Checkout exact reviewed revision
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Record exact source revision
         run: |
           set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
           mkdir -p ci-output package/bin package/source package/metadata
           git rev-parse HEAD | tee ci-output/source-commit.txt package/metadata/source-commit.txt
           git status --short --branch | tee ci-output/git-status.txt
-          test -z "$(git status --porcelain --untracked-files=all)"
 
       - name: Setup protoc
         uses: arduino/setup-protoc@v3
@@ -52,7 +54,7 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Install Station build dependency
+      - name: Install Station native build dependency
         run: sudo apt-get update && sudo apt-get install -y nasm
 
       - name: Architecture boundary gate
