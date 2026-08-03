@@ -1,6 +1,11 @@
 name: MATDOG LF Freeze Materialize
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/matdog-lf-freeze-materialize.yml"
   push:
     branches:
       - matdog/lf-q0-contract-v42
@@ -19,6 +24,8 @@ jobs:
   materialize:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
+    env:
+      EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - name: Checkout exact branch
         uses: actions/checkout@v4
@@ -45,7 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
           python3 tools/matdog/fix_lf_upgrade_transformer_v2.py
           python3 tools/matdog/fix_lf_upgrade_transformer_v3.py
           python3 tools/matdog/apply_lf_freeze_source_upgrade.py --apply
