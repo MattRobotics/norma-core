@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import re
 
 path = Path(__file__).with_name("apply_lf_freeze_source_upgrade.py")
 text = path.read_text()
@@ -79,10 +80,15 @@ if text.count(old_scan) != 1:
     raise SystemExit("transformer scan-motors replacement marker is not unique")
 text = text.replace(old_scan, new_scan, 1)
 
-immediate_constant = "const MATDOG_IMMEDIATE_THERMAL_ABORT_C: u8 = 85;\\n"
-if text.count(immediate_constant) != 1:
-    raise SystemExit("transformer immediate thermal constant marker is not unique")
-text = text.replace(immediate_constant, "", 1)
+immediate_pattern = re.compile(
+    r"^const MATDOG_IMMEDIATE_THERMAL_ABORT_C: u8 = 85;\n",
+    re.MULTILINE,
+)
+text, immediate_count = immediate_pattern.subn("", text, count=1)
+if immediate_count != 1:
+    raise SystemExit(
+        f"transformer immediate thermal constant: expected one marker, found {immediate_count}"
+    )
 
 immediate_classifier = '''    if samples
         .iter()
