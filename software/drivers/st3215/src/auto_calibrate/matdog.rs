@@ -96,6 +96,10 @@ const CONTACT_ACCEPTANCE_INNER_TICKS: u16 = 64;
 const LF_HIP_SEQUENCE_ARM_VALUE: &str = "LF_HIP_M13_MIN_MAX";
 const LF_FULL_SEQUENCE_ARM_VALUE: &str = "LF_LEG_STATE_MACHINE";
 const ADAPTIVE_FINE_SCOUT_TICKS: u16 = 32;
+// Fine approaches use smaller increments and may settle slightly before the
+// coarse scout. A lag greater than one fine step is treated as a bounded
+// friction/chamfer plateau, not as the final mechanical endpoint.
+const FINE_CONTACT_SCOUT_LAG_TOLERANCE_TICKS: u16 = FINE_STEP_TICKS;
 const AFFINE_SCALE_MIN_PERMILLE: u16 = 850;
 const AFFINE_SCALE_MAX_PERMILLE: u16 = 1150;
 const KINEMATIC_PLATEAU_SAMPLES: usize = 3;
@@ -824,6 +828,25 @@ fn adaptive_contact_acceptance_bounds(
     (low, high)
 }
 
+fn fine_contact_scout_lag_ticks(
+    candidate_tick: u16,
+    coarse_scout_tick: u16,
+    probe_sign: i8,
+) -> u16 {
+    let signed_lag =
+        i32::from(signed_tick_delta(coarse_scout_tick, candidate_tick)) * i32::from(probe_sign);
+    signed_lag.max(0).min(i32::from(u16::MAX)) as u16
+}
+
+fn fine_contact_reproduces_coarse_depth(
+    candidate_tick: u16,
+    coarse_scout_tick: u16,
+    probe_sign: i8,
+) -> bool {
+    fine_contact_scout_lag_ticks(candidate_tick, coarse_scout_tick, probe_sign)
+        <= FINE_CONTACT_SCOUT_LAG_TOLERANCE_TICKS
+}
+
 #[cfg(test)]
 fn position_inside_adaptive_contact_acceptance(
     profile: &ContactProfile,
@@ -1381,12 +1404,6 @@ fn validate_lf_role_observation(
                 return Err(format!(
                     "actively-held M{motor_id} drifted: target={target_tick}, present={}, error={error}",
                     observation.position
-                ));
-            }
-            let speed = speed_magnitude(observation.velocity);
-            if speed > LF_HELD_MAX_SPEED_RAW {
-                return Err(format!(
-                    "actively-held M{motor_id} moving: speed={speed}, limit={LF_HELD_MAX_SPEED_RAW}"
                 ));
             }
             Ok(())
@@ -3548,15 +3565,6 @@ impl MatdogRamOnlyCalibrator {
                     format!("M{motor_id} startup-home normalization expected torque OFF").into(),
                 );
             }
-            if speed_magnitude(observation.velocity) > LF_HELD_MAX_SPEED_RAW {
-                return Err(format!(
-                    "M{motor_id} moved during startup-home normalization: speed={}, limit={}",
-                    speed_magnitude(observation.velocity),
-                    LF_HELD_MAX_SPEED_RAW
-                )
-                .into());
-            }
-
             let distance = circular_distance(observation.position, HOME_TICK);
             if home_ready_motors.contains(&motor_id) {
                 if distance > STATIC_TOLERANCE_TICKS {
@@ -3907,7 +3915,7 @@ impl MatdogRamOnlyCalibrator {
         let mut target = start.position;
         let mut last_stamp = start.monotonic_stamp_ns;
 
-        loop {
+        'approach_steps: loop {
             self.check_stop()?;
             let next_target = advance_tick(target, self.profile.probe_sign, step_ticks)?;
             if passed_guard(
@@ -3943,6 +3951,32 @@ impl MatdogRamOnlyCalibrator {
                 match detector.observe(observation, target) {
                     ContactState::FreeMotion | ContactState::ContactSuspected => {}
                     ContactState::ContactConfirmed => {
+                        if let Some(scout) = coarse_scout_tick {
+                            let scout_lag = fine_contact_scout_lag_ticks(
+                                observation.position,
+                                scout,
+                                self.profile.probe_sign,
+                            );
+                            if !fine_contact_reproduces_coarse_depth(
+                                observation.position,
+                                scout,
+                                self.profile.probe_sign,
+                            ) {
+                                info!(
+                                    "MATDOG {} friction plateau bypass: target={}, present={}, coarse_scout={}, scout_lag={}, allowed_lag={}, current={}, threshold={}, velocity={}",
+                                    self.profile.label,
+                                    target,
+                                    observation.position,
+                                    scout,
+                                    scout_lag,
+                                    FINE_CONTACT_SCOUT_LAG_TOLERANCE_TICKS,
+                                    observation.current,
+                                    baseline.contact_threshold(),
+                                    speed_magnitude(observation.velocity),
+                                );
+                                continue 'approach_steps;
+                            }
+                        }
                         info!(
                             "MATDOG {} contact: step={}, target={}, present={}, error={}, current={}, threshold={}, velocity={}, scout={:?}",
                             self.profile.label,
@@ -4003,6 +4037,28 @@ impl MatdogRamOnlyCalibrator {
                         .confirm_kinematic_plateau(target, last_stamp, scout)
                         .await?
                     {
+                        let scout_lag = fine_contact_scout_lag_ticks(
+                            contact.position,
+                            scout,
+                            self.profile.probe_sign,
+                        );
+                        if !fine_contact_reproduces_coarse_depth(
+                            contact.position,
+                            scout,
+                            self.profile.probe_sign,
+                        ) {
+                            info!(
+                                "MATDOG {} adaptive friction plateau bypass: target={}, present={}, coarse_scout={}, scout_lag={}, allowed_lag={}, current={}",
+                                self.profile.label,
+                                target,
+                                contact.position,
+                                scout,
+                                scout_lag,
+                                FINE_CONTACT_SCOUT_LAG_TOLERANCE_TICKS,
+                                contact.current,
+                            );
+                            continue 'approach_steps;
+                        }
                         info!(
                             "MATDOG {} adaptive kinematic contact: step={}, target={}, present={}, error={}, current={}, scout={}",
                             self.profile.label,

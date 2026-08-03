@@ -353,6 +353,121 @@ fn lf_upper_m12_max_profile_matches_reviewed_geometry() {
 }
 
 #[test]
+fn actively_held_static_role_uses_position_error_not_instantaneous_speed() {
+    // These are all motors that can own an ActivelyHeld role in the LF state
+    // machine. The other eight canonical motors are covered by the separate
+    // NonParticipatingTorqueOff tests below.
+    for motor_id in [11_u8, 12, 13, 42] {
+        for velocity in [LF_HELD_MAX_SPEED_RAW + 1, 50, u16::MAX] {
+            let observed = observation(HOME_TICK + 1, velocity, 0, HOME_TICK);
+            let now_ns = observed.monotonic_stamp_ns + 1;
+            let result = validate_lf_role_observation(
+                motor_id,
+                observed,
+                LfMotorRole::ActivelyHeld {
+                    target_tick: HOME_TICK,
+                },
+                now_ns,
+            );
+            assert!(
+                result.is_ok(),
+                "M{motor_id} velocity={velocity}: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn actively_held_static_role_remains_fail_closed_on_real_state_errors() {
+    for motor_id in [11_u8, 12, 13, 42] {
+        let mut torque_off = observation(HOME_TICK, 0, 0, HOME_TICK);
+        torque_off.torque_enabled = false;
+        let torque_now_ns = torque_off.monotonic_stamp_ns + 1;
+        assert!(validate_lf_role_observation(
+            motor_id,
+            torque_off,
+            LfMotorRole::ActivelyHeld {
+                target_tick: HOME_TICK,
+            },
+            torque_now_ns,
+        )
+        .unwrap_err()
+        .contains("torque unexpectedly OFF"));
+
+        let wrong_goal = observation(HOME_TICK, 0, 0, HOME_TICK + 1);
+        let goal_now_ns = wrong_goal.monotonic_stamp_ns + 1;
+        assert!(validate_lf_role_observation(
+            motor_id,
+            wrong_goal,
+            LfMotorRole::ActivelyHeld {
+                target_tick: HOME_TICK,
+            },
+            goal_now_ns,
+        )
+        .unwrap_err()
+        .contains("goal changed"));
+
+        let drifted = observation(HOME_TICK + STATIC_TOLERANCE_TICKS + 1, 0, 0, HOME_TICK);
+        let drift_now_ns = drifted.monotonic_stamp_ns + 1;
+        let error = validate_lf_role_observation(
+            motor_id,
+            drifted,
+            LfMotorRole::ActivelyHeld {
+                target_tick: HOME_TICK,
+            },
+            drift_now_ns,
+        )
+        .unwrap_err();
+        assert!(error.contains("actively-held"), "M{motor_id}: {error}");
+        assert!(error.contains("drifted"), "M{motor_id}: {error}");
+    }
+}
+
+#[test]
+fn fine_contact_scout_depth_gate_is_direction_independent_and_bounded() {
+    for probe_sign in [-1_i8, 1_i8] {
+        let scout = 2000_u16;
+        let one_step_before = if probe_sign > 0 {
+            scout - FINE_STEP_TICKS
+        } else {
+            scout + FINE_STEP_TICKS
+        };
+        let too_early = if probe_sign > 0 {
+            scout - FINE_STEP_TICKS - 1
+        } else {
+            scout + FINE_STEP_TICKS + 1
+        };
+        let beyond_scout = if probe_sign > 0 { scout + 4 } else { scout - 4 };
+
+        assert!(fine_contact_reproduces_coarse_depth(
+            scout, scout, probe_sign
+        ));
+        assert!(fine_contact_reproduces_coarse_depth(
+            one_step_before,
+            scout,
+            probe_sign
+        ));
+        assert!(!fine_contact_reproduces_coarse_depth(
+            too_early, scout, probe_sign
+        ));
+        assert!(fine_contact_reproduces_coarse_depth(
+            beyond_scout,
+            scout,
+            probe_sign
+        ));
+    }
+
+    // Normal V23 fine/coarse offsets remain valid.
+    assert!(fine_contact_reproduces_coarse_depth(1438, 1434, -1));
+    assert!(fine_contact_reproduces_coarse_depth(3443, 3446, 1));
+    assert!(fine_contact_reproduces_coarse_depth(3093, 3097, 1));
+
+    // V23 M11 MAX: 1666 is 14 ticks before the deeper 1652 scout and must be
+    // traversed as a friction/chamfer plateau rather than frozen as endpoint.
+    assert!(!fine_contact_reproduces_coarse_depth(1666, 1652, -1));
+}
+
+#[test]
 fn nonparticipating_torque_off_uses_real_position_drift_not_instantaneous_speed() {
     for motor_id in MATDOG_MOTOR_IDS {
         for velocity in [LF_HELD_MAX_SPEED_RAW + 1, 50, u16::MAX] {
@@ -2137,7 +2252,10 @@ fn non_participating_and_held_role_failures_are_detected_from_simulated_telemetr
     assert!(validate_lf_role_observation(11, bad_goal, held, 10_000).is_err());
     bad_goal.goal_position = 2081;
     bad_goal.velocity = LF_HELD_MAX_SPEED_RAW + 1;
+    assert!(validate_lf_role_observation(11, bad_goal, held, 10_000).is_ok());
+    bad_goal.position = 2081 + STATIC_TOLERANCE_TICKS + 1;
     assert!(validate_lf_role_observation(11, bad_goal, held, 10_000).is_err());
+    bad_goal.position = 2081;
     bad_goal.velocity = 0;
     bad_goal.temperature = bad_goal.temperature_limit + 1;
     assert!(validate_lf_role_observation(11, bad_goal, held, 10_000).is_err());
