@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - ".github/workflows/matdog-native-observer-check.yml"
+      - "software/station/examples/arm2dog-py/**"
       - "tools/matdog/matdog_native_observer_contract.py"
       - "tools/matdog/matdog_v42_pinned_launcher.py"
       - "tools/matdog/test_matdog_native_observer_contract.py"
