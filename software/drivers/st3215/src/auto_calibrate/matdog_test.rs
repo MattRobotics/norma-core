@@ -3042,7 +3042,7 @@ fn rf_state_machine_reuses_one_persistent_engine() {
         .collect();
     let mut session = LfSessionStateMachine::new_for_leg(Leg::Rf, entries).unwrap();
     assert_eq!(session.participant_ids().unwrap(), RF_ALLOWED);
-    assert_eq!(session.parking_motor_id(), 32);
+    assert_eq!(session.parking_motor_id(), Ok(32));
     assert_eq!(session.joint_motor_id(JointKind::Upper), 22);
     assert_eq!(session.joint_motor_id(JointKind::Lower), 21);
     assert_eq!(session.joint_motor_id(JointKind::Hip), 23);
