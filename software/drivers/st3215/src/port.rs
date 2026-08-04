@@ -34,19 +34,81 @@ pub const MAX_MOTORS_CNT: u8 = 8;
 // only extend automatic bus discovery.
 const LEGACY_MOTOR_IDS: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 const MATDOG_MOTOR_IDS: [u8; 12] = [11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43];
+const MATDOG_EXPECTED_TEMPERATURE_LIMIT_C: u8 = 70;
+const MATDOG_MAX_TEMPERATURE_LIMIT_ADDRESS: usize = 0x0D;
+const MATDOG_THERMAL_SAMPLE_PERIOD: Duration = Duration::from_millis(500);
+const MATDOG_THERMAL_CONFIRMATION_DELAY: Duration = Duration::from_millis(50);
+const MATDOG_THERMAL_CONFIRMATION_READS: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatdogThermalDecision {
+    Normal,
+    Transient,
+    Confirmed,
+    InvalidConfiguredLimit,
+}
+
+#[derive(Debug, Default)]
+struct MatdogThermalState {
+    last_direct_read: HashMap<u8, Instant>,
+    last_confirmed: HashMap<u8, u8>,
+}
+
+fn classify_matdog_direct_temperature_samples(
+    configured_limit_c: u8,
+    samples: &[u8],
+) -> MatdogThermalDecision {
+    if configured_limit_c != MATDOG_EXPECTED_TEMPERATURE_LIMIT_C {
+        return MatdogThermalDecision::InvalidConfiguredLimit;
+    }
+    if samples.is_empty() {
+        return MatdogThermalDecision::Transient;
+    }
+    let over_limit = samples
+        .iter()
+        .filter(|temperature| **temperature > configured_limit_c)
+        .count();
+    if over_limit >= 2 {
+        MatdogThermalDecision::Confirmed
+    } else if over_limit == 0 {
+        MatdogThermalDecision::Normal
+    } else {
+        MatdogThermalDecision::Transient
+    }
+}
 
 fn matdog_command_allowed_with<F>(command: &TxEnvelope, ram_write_allowed: F) -> bool
 where
     F: Fn(u8, u32, &[u8]) -> bool,
 {
-    if command
-        .auto_calibrate
-        .as_ref()
-        .map(|value| value.calibrate)
-        .unwrap_or(false)
-        || command.stop_auto_calibrate.is_some()
-    {
-        return true;
+    // TxEnvelope command variants are independent optional protobuf fields,
+    // not a `oneof`. Reject a multi-populated envelope before inspecting any
+    // allowed variant so START/STOP can never smuggle a write, reset,
+    // RegWrite, Action, freeze, or any other second operation through the
+    // armed MATDOG gate.
+    let populated_variants = [
+        command.write.is_some(),
+        command.reg_write.is_some(),
+        command.action.is_some(),
+        command.reset.is_some(),
+        command.reset_calibration.is_some(),
+        command.freeze_calibration.is_some(),
+        command.sync_write.is_some(),
+        command.auto_calibrate.is_some(),
+        command.stop_auto_calibrate.is_some(),
+    ]
+    .into_iter()
+    .filter(|populated| *populated)
+    .count();
+    if populated_variants != 1 {
+        return false;
+    }
+
+    if let Some(auto_calibrate) = &command.auto_calibrate {
+        return auto_calibrate.calibrate;
+    }
+    if let Some(stop_auto_calibrate) = &command.stop_auto_calibrate {
+        return stop_auto_calibrate.stop;
     }
 
     if let Some(write) = &command.write {
@@ -65,9 +127,12 @@ where
 
         let mut ids = HashSet::new();
         for motor in &sync_write.motors {
-            if !MATDOG_MOTOR_IDS.contains(&(motor.motor_id as u8))
+            let Ok(motor_id) = u8::try_from(motor.motor_id) else {
+                return false;
+            };
+            if !MATDOG_MOTOR_IDS.contains(&motor_id)
                 || motor.value.as_ref() != [0_u8]
-                || !ids.insert(motor.motor_id as u8)
+                || !ids.insert(motor_id)
             {
                 return false;
             }
@@ -198,6 +263,7 @@ impl St3215Port {
     ) {
         let mut last_seen_motors = HashSet::new();
         let mut missing_since: HashMap<u8, Instant> = HashMap::new();
+        let mut matdog_thermal_state = MatdogThermalState::default();
         let mut interval = tokio::time::interval(Duration::from_millis(20));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -308,7 +374,19 @@ impl St3215Port {
                         last_search_time = Instant::now();
                     }
 
-                    if !Self::scan_motors(&mut port, &com, &bus_info, &mut last_seen_motors, &mut missing_since, &command_waiting, search_for_new, &eeprom_cache).await {
+                    if !Self::scan_motors(
+                        &mut port,
+                        &com,
+                        &bus_info,
+                        &mut last_seen_motors,
+                        &mut missing_since,
+                        &command_waiting,
+                        search_for_new,
+                        &eeprom_cache,
+                        &mut matdog_thermal_state,
+                    )
+                    .await
+                    {
                         log::warn!("ST3215 port disconnected: {}", bus_info.port_name);
                         break;
                     }
@@ -324,6 +402,198 @@ impl St3215Port {
         drop(done_tx.send(Ok(())));
     }
 
+    fn combine_cached_eeprom_and_ram(eeprom_prefix: &Bytes, ram_data: Bytes) -> Bytes {
+        let mut combined = BytesMut::with_capacity(eeprom_prefix.len() + ram_data.len());
+        combined.extend_from_slice(eeprom_prefix);
+        combined.extend_from_slice(&ram_data);
+        combined.freeze()
+    }
+
+    fn overwrite_temperature(full_data: Bytes, temperature_c: u8) -> Bytes {
+        let address = protocol::RamRegister::PresentTemperature.address() as usize;
+        if full_data.len() <= address {
+            return full_data;
+        }
+        let mut updated = full_data.to_vec();
+        updated[address] = temperature_c;
+        Bytes::from(updated)
+    }
+
+    async fn read_motor_temperature_direct(
+        port: &mut tokio_serial::SerialStream,
+        motor_id: u8,
+        bus_serial: &str,
+    ) -> Result<u8, protocol::Error> {
+        let request = protocol::ST3215Request::Read {
+            motor: motor_id,
+            address: protocol::RamRegister::PresentTemperature.address(),
+            length: protocol::RamRegister::PresentTemperature.size(),
+        };
+        let started = Instant::now();
+        let result = request.async_readwrite(port, ST3215_TIMEOUT_MS).await;
+        let elapsed_ms = started.elapsed().as_millis();
+        if elapsed_ms >= ST3215_SLOW_READ_WARN_MS {
+            warn!(
+                "ST3215 slow direct temperature read: bus={} motor={} elapsed={}ms",
+                bus_serial, motor_id, elapsed_ms
+            );
+        }
+        match result? {
+            protocol::ST3215Response::Read { data, .. } if data.len() == 1 => Ok(data[0]),
+            protocol::ST3215Response::Read { data, source_bytes } => {
+                Err(protocol::Error::InvalidData {
+                    msg: format!("direct temperature length mismatch: {}", data.len()),
+                    source_packet: request.to_bytes(),
+                    reply_packet: source_bytes,
+                })
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    async fn force_matdog_motor_torque_off(
+        port: &mut tokio_serial::SerialStream,
+        motor_id: u8,
+        bus_serial: &str,
+        reason: &str,
+    ) -> Result<(), protocol::Error> {
+        warn!(
+            "MATDOG forcing torque OFF: bus={} motor={} reason={}",
+            bus_serial, motor_id, reason
+        );
+        let request = protocol::ST3215Request::Write {
+            motor: motor_id,
+            address: protocol::RamRegister::TorqueEnable.address(),
+            data: Bytes::from_static(&[0]),
+        };
+        request
+            .async_readwrite(port, ST3215_COMMAND_TIMEOUT_MS)
+            .await?;
+        let verify = protocol::ST3215Request::Read {
+            motor: motor_id,
+            address: protocol::RamRegister::TorqueEnable.address(),
+            length: 1,
+        };
+        match verify.async_readwrite(port, ST3215_TIMEOUT_MS).await? {
+            protocol::ST3215Response::Read { data, .. } if data.as_ref() == [0] => Ok(()),
+            protocol::ST3215Response::Read { data, source_bytes } => {
+                Err(protocol::Error::InvalidData {
+                    msg: format!("M{motor_id} torque-OFF readback mismatch: {data:02x?}"),
+                    source_packet: verify.to_bytes(),
+                    reply_packet: source_bytes,
+                })
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    async fn apply_matdog_direct_temperature(
+        port: &mut tokio_serial::SerialStream,
+        motor_id: u8,
+        bus_serial: &str,
+        full_data: Bytes,
+        thermal: &mut MatdogThermalState,
+    ) -> Result<Bytes, protocol::Error> {
+        if !crate::auto_calibrate::matdog_calibrator_is_armed()
+            || !MATDOG_MOTOR_IDS.contains(&motor_id)
+        {
+            return Ok(full_data);
+        }
+
+        let temperature_address = protocol::RamRegister::PresentTemperature.address() as usize;
+        if full_data.len() <= temperature_address
+            || full_data.len() <= MATDOG_MAX_TEMPERATURE_LIMIT_ADDRESS
+        {
+            return Ok(full_data);
+        }
+        let configured_limit_c = full_data[MATDOG_MAX_TEMPERATURE_LIMIT_ADDRESS];
+        if configured_limit_c != MATDOG_EXPECTED_TEMPERATURE_LIMIT_C {
+            Self::force_matdog_motor_torque_off(
+                port,
+                motor_id,
+                bus_serial,
+                "invalid configured temperature limit",
+            )
+            .await?;
+            return Ok(full_data);
+        }
+
+        let due = thermal
+            .last_direct_read
+            .get(&motor_id)
+            .map(|instant| instant.elapsed() >= MATDOG_THERMAL_SAMPLE_PERIOD)
+            .unwrap_or(true);
+        if !due {
+            if let Some(confirmed) = thermal.last_confirmed.get(&motor_id).copied() {
+                return Ok(Self::overwrite_temperature(full_data, confirmed));
+            }
+        }
+
+        let mut samples = Vec::with_capacity(MATDOG_THERMAL_CONFIRMATION_READS);
+        let first = Self::read_motor_temperature_direct(port, motor_id, bus_serial).await?;
+        samples.push(first);
+        if first > configured_limit_c {
+            for _ in 1..MATDOG_THERMAL_CONFIRMATION_READS {
+                tokio::time::sleep(MATDOG_THERMAL_CONFIRMATION_DELAY).await;
+                samples
+                    .push(Self::read_motor_temperature_direct(port, motor_id, bus_serial).await?);
+            }
+        }
+        thermal.last_direct_read.insert(motor_id, Instant::now());
+
+        match classify_matdog_direct_temperature_samples(configured_limit_c, &samples) {
+            MatdogThermalDecision::Normal => {
+                let confirmed = *samples
+                    .last()
+                    .expect("non-empty direct temperature samples");
+                thermal.last_confirmed.insert(motor_id, confirmed);
+                Ok(Self::overwrite_temperature(full_data, confirmed))
+            }
+            MatdogThermalDecision::Transient => {
+                let confirmed = samples
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|temperature| *temperature <= configured_limit_c)
+                    .or_else(|| thermal.last_confirmed.get(&motor_id).copied())
+                    .ok_or_else(|| protocol::Error::InvalidData {
+                        msg: format!(
+                            "M{motor_id} thermal transient has no confirmed normal sample: {samples:?}"
+                        ),
+                        source_packet: Bytes::new(),
+                        reply_packet: Bytes::new(),
+                    })?;
+                thermal.last_confirmed.insert(motor_id, confirmed);
+                warn!(
+                    "MATDOG_THERMAL_DIRECT_TRANSIENT bus={} motor={} direct_samples={:?} published={}",
+                    bus_serial, motor_id, samples, confirmed
+                );
+                Ok(Self::overwrite_temperature(full_data, confirmed))
+            }
+            MatdogThermalDecision::Confirmed => {
+                let confirmed = samples
+                    .iter()
+                    .copied()
+                    .filter(|temperature| *temperature > configured_limit_c)
+                    .max()
+                    .unwrap_or(first);
+                Self::force_matdog_motor_torque_off(
+                    port,
+                    motor_id,
+                    bus_serial,
+                    "direct temperature confirmed over limit",
+                )
+                .await?;
+                warn!(
+                    "MATDOG_THERMAL_DIRECT_CONFIRMED bus={} motor={} direct_samples={:?} published={}",
+                    bus_serial, motor_id, samples, confirmed
+                );
+                Ok(Self::overwrite_temperature(full_data, confirmed))
+            }
+            MatdogThermalDecision::InvalidConfiguredLimit => unreachable!(),
+        }
+    }
+
     async fn scan_motors(
         port: &mut tokio_serial::SerialStream,
         com: &Arc<ST3215BusCommunicator>,
@@ -333,6 +603,7 @@ impl St3215Port {
         command_waiting: &Arc<AtomicBool>,
         search_for_new: bool,
         eeprom_cache: &Arc<Mutex<HashMap<u8, Bytes>>>,
+        matdog_thermal_state: &mut MatdogThermalState,
     ) -> bool {
         let mut currently_seen_motors = HashSet::new();
         let eeprom_size = protocol::RamRegister::TorqueEnable.address() as usize;
@@ -373,6 +644,26 @@ impl St3215Port {
                                 .insert(motor_id, read_data.slice(..eeprom_size));
                         }
                         read_data
+                    };
+
+                    let final_data = match Self::apply_matdog_direct_temperature(
+                        port,
+                        motor_id,
+                        &bus_info.serial_number,
+                        final_data,
+                        matdog_thermal_state,
+                    )
+                    .await
+                    {
+                        Ok(data) => data,
+                        Err(error) => {
+                            enqueue_error(com, bus_info, motor_id as u16, &error);
+                            error!(
+                                "MATDOG thermal confirmation failed on bus={} motor={}: {}",
+                                bus_info.serial_number, motor_id, error
+                            );
+                            return false;
+                        }
                     };
 
                     if Self::send_drive_state_envelope(com, bus_info, motor_id, final_data).is_err()
@@ -1553,6 +1844,40 @@ mod topology_discovery_tests {
     }
 
     #[test]
+    fn matdog_direct_temperature_rejects_invalid_limit_and_confirms_real_heat() {
+        assert_eq!(
+            classify_matdog_direct_temperature_samples(69, &[39]),
+            MatdogThermalDecision::InvalidConfiguredLimit
+        );
+        assert_eq!(
+            classify_matdog_direct_temperature_samples(70, &[85]),
+            MatdogThermalDecision::Transient
+        );
+        assert_eq!(
+            classify_matdog_direct_temperature_samples(70, &[85, 84, 39]),
+            MatdogThermalDecision::Confirmed
+        );
+        assert_eq!(
+            classify_matdog_direct_temperature_samples(70, &[73, 72, 39]),
+            MatdogThermalDecision::Confirmed
+        );
+    }
+
+    #[test]
+    fn matdog_direct_temperature_never_converts_repeated_false_spikes_to_heat() {
+        for _ in 0..10 {
+            assert_eq!(
+                classify_matdog_direct_temperature_samples(70, &[76, 39, 39]),
+                MatdogThermalDecision::Transient
+            );
+        }
+        assert_eq!(
+            classify_matdog_direct_temperature_samples(70, &[39]),
+            MatdogThermalDecision::Normal
+        );
+    }
+
+    #[test]
     fn cold_boot_probes_only_supported_topologies() {
         let candidates = discovery_candidates(&HashSet::new());
         assert_eq!(
@@ -1612,7 +1937,112 @@ mod topology_discovery_tests {
     }
 
     #[test]
-    fn matdog_runtime_gate_allows_only_armed_profile_ram_and_global_torque_off() {
+    fn matdog_runtime_gate_rejects_multi_variant_smuggling_and_false_triggers() {
+        let allowed = |command: &TxEnvelope| {
+            matdog_command_allowed_with(command, |motor_id, address, value| {
+                crate::auto_calibrate::matdog_ram_write_allowed_for_arm_value(
+                    "LF_LEG_STATE_MACHINE",
+                    motor_id,
+                    address,
+                    value,
+                )
+            })
+        };
+
+        assert!(!allowed(&TxEnvelope::default()));
+        assert!(!allowed(&TxEnvelope {
+            auto_calibrate: Some(crate::st3215_proto::AutoCalibrateCommand { calibrate: false }),
+            ..Default::default()
+        }));
+        assert!(!allowed(&TxEnvelope {
+            stop_auto_calibrate: Some(crate::st3215_proto::StopAutoCalibrateCommand {
+                stop: false
+            }),
+            ..Default::default()
+        }));
+        assert!(!allowed(&TxEnvelope {
+            auto_calibrate: Some(crate::st3215_proto::AutoCalibrateCommand { calibrate: true }),
+            stop_auto_calibrate: Some(crate::st3215_proto::StopAutoCalibrateCommand { stop: true }),
+            ..Default::default()
+        }));
+
+        let forbidden_variants = vec![
+            TxEnvelope {
+                write: Some(crate::st3215_proto::St3215WriteCommand {
+                    motor_id: 12,
+                    address: protocol::EepromRegister::Offset.address() as u32,
+                    value: Bytes::copy_from_slice(&0_i16.to_le_bytes()),
+                }),
+                ..Default::default()
+            },
+            TxEnvelope {
+                reg_write: Some(crate::st3215_proto::St3215RegWriteCommand::default()),
+                ..Default::default()
+            },
+            TxEnvelope {
+                action: Some(crate::st3215_proto::St3215ActionCommand::default()),
+                ..Default::default()
+            },
+            TxEnvelope {
+                reset: Some(crate::st3215_proto::St3215ResetCommand::default()),
+                ..Default::default()
+            },
+            TxEnvelope {
+                reset_calibration: Some(crate::st3215_proto::ResetCalibrationCommand::default()),
+                ..Default::default()
+            },
+            TxEnvelope {
+                freeze_calibration: Some(crate::st3215_proto::FreezeCalibrationCommand::default()),
+                ..Default::default()
+            },
+        ];
+
+        for forbidden in forbidden_variants {
+            assert!(!allowed(&forbidden));
+
+            let mut with_start = forbidden.clone();
+            with_start.auto_calibrate =
+                Some(crate::st3215_proto::AutoCalibrateCommand { calibrate: true });
+            assert!(!allowed(&with_start));
+
+            let mut with_stop = forbidden;
+            with_stop.stop_auto_calibrate =
+                Some(crate::st3215_proto::StopAutoCalibrateCommand { stop: true });
+            assert!(!allowed(&with_stop));
+        }
+
+        let allowed_ram_write = crate::st3215_proto::St3215WriteCommand {
+            motor_id: 12,
+            address: protocol::RamRegister::GoalPosition.address() as u32,
+            value: Bytes::copy_from_slice(&2048_u16.to_le_bytes()),
+        };
+        assert!(!allowed(&TxEnvelope {
+            write: Some(allowed_ram_write),
+            auto_calibrate: Some(crate::st3215_proto::AutoCalibrateCommand { calibrate: true }),
+            ..Default::default()
+        }));
+
+        let mut aliased_ids = MATDOG_MOTOR_IDS
+            .iter()
+            .map(
+                |motor_id| crate::st3215_proto::st3215_sync_write_command::MotorWrite {
+                    motor_id: *motor_id as u32,
+                    value: Bytes::from_static(&[0]),
+                },
+            )
+            .collect::<Vec<_>>();
+        aliased_ids[0].motor_id = u32::from(MATDOG_MOTOR_IDS[0]) + 256;
+        assert!(!allowed(&TxEnvelope {
+            sync_write: Some(crate::st3215_proto::St3215SyncWriteCommand {
+                address: protocol::RamRegister::TorqueEnable.address() as u32,
+                motors: aliased_ids,
+            }),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn matdog_runtime_gate_allows_profile_motion_bounded_home_recovery_and_global_torque_off() {
         let allowed = |command: &TxEnvelope| {
             matdog_command_allowed_with(command, |motor_id, address, value| {
                 crate::auto_calibrate::matdog_ram_write_allowed_for_arm_value(
@@ -1640,7 +2070,7 @@ mod topology_discovery_tests {
         };
         assert!(allowed(&goal_position));
 
-        let wrong_motor = TxEnvelope {
+        let non_profile_home_recovery = TxEnvelope {
             write: Some(crate::st3215_proto::St3215WriteCommand {
                 motor_id: 21,
                 address: protocol::RamRegister::GoalPosition.address() as u32,
@@ -1648,7 +2078,17 @@ mod topology_discovery_tests {
             }),
             ..Default::default()
         };
-        assert!(!allowed(&wrong_motor));
+        assert!(allowed(&non_profile_home_recovery));
+
+        let non_profile_outside_home_window = TxEnvelope {
+            write: Some(crate::st3215_proto::St3215WriteCommand {
+                motor_id: 21,
+                address: protocol::RamRegister::GoalPosition.address() as u32,
+                value: Bytes::copy_from_slice(&2200_u16.to_le_bytes()),
+            }),
+            ..Default::default()
+        };
+        assert!(!allowed(&non_profile_outside_home_window));
 
         let torque_off = TxEnvelope {
             sync_write: Some(crate::st3215_proto::St3215SyncWriteCommand {

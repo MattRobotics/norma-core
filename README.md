@@ -8,6 +8,9 @@
 
 To fully realize the potential of this approach, we had to build a lot from scratch, rethinking traditional solutions from a practical perspective. This includes not just software, but complete hardware systems like our **7+1 DoF robotic arm** with a **parallel jaw gripper** - tools designed to open up a whole new dimension of applications for home and research robotics without significant cost or investment.
 
+> [!NOTE]
+> This `MattRobotics/norma-core` fork contains the MATDOG ST3215 integration used by the custom quadruped project. The validated LF V25 calibrator performs native Station-mediated contact measurement, affine URDF alignment, transactional EEPROM provisioning and persistent-profile generation. The exact reviewed source is frozen on `release/matdog-lf-calibrator-v25`; operational details are documented in [`tools/matdog/README.md`](tools/matdog/README.md).
+
 ## What's inside
 
 | Project | Path | Description |
@@ -15,6 +18,7 @@ To fully realize the potential of this approach, we had to build a lot from scra
 | **ElRobot** | [`hardware/elrobot/`](hardware/elrobot/) | Fully 3D-printed 7+1 DoF robotic arm for imitation learning |
 | **Parallel Jaw Gripper** | [`hardware/pgripper/`](hardware/pgripper/) | Modular gripper for the SO-101 arm |
 | **Station** | [`software/station/bin/station/`](software/station/bin/station/) | Real-time robotics platform — data collection, inference, control. Single binary, web UI |
+| **MATDOG LF calibrator** | [`tools/matdog/`](tools/matdog/) | Native LF end-stop measurement, affine q0 staging, EEPROM freeze and persistent calibration profile |
 | **SmolVLA fine-tune** | [`software/ai/smolvla_py/`](software/ai/smolvla_py/) | Train + deploy a [SmolVLA](https://huggingface.co/docs/lerobot/smolvla) policy on the SO-101 arm |
 | **Gremlin** | [`shared/gremlin_go/`](shared/gremlin_go/) · [`shared/gremlin_py/`](shared/gremlin_py/) | High-performance Protobuf SDK for Go and Python — used across the station + drivers stack |
 
