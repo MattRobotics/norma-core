@@ -1,0 +1,118 @@
+name: MATDOG RF Development Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/matdog-rf-development-gate.yml"
+      - "software/drivers/st3215/**"
+      - "software/station/bin/station/**"
+      - "tools/matdog/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matdog-rf-development-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rf-offline-gate:
+    name: RF source snapshot and offline baseline
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact reviewed head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prove exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt,clippy
+
+      - name: Install Station native build dependency
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Create exact RF source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-output
+          git rev-parse HEAD > ci-output/HEAD.txt
+          tar -czf ci-output/matdog-rf-source.tgz \
+            Cargo.toml Cargo.lock \
+            protobufs/drivers/st3215 \
+            software/drivers/st3215 \
+            software/station/bin/station \
+            tools/matdog \
+            .github/workflows/matdog-native-calibrator-check.yml \
+            .github/workflows/matdog-native-observer-check.yml \
+            .github/workflows/matdog-rf-development-gate.yml
+          sha256sum ci-output/matdog-rf-source.tgz > ci-output/SHA256SUMS.txt
+
+      - name: Rust format check
+        shell: bash
+        run: |
+          set -o pipefail
+          rustfmt --edition 2021 --check --config skip_children=true \
+            software/drivers/st3215/src/port.rs \
+            software/drivers/st3215/src/auto_calibrate/mod.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            software/drivers/st3215/src/bin/matdog_lf_freeze.rs \
+            2>&1 | tee ci-output/rustfmt.log
+
+      - name: ST3215 unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
+
+      - name: ST3215 clippy
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo clippy --package st3215 --all-targets -- -D warnings \
+            2>&1 | tee ci-output/st3215-clippy.log
+
+      - name: Create CI-only Station viewer stub
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset=software/station/clients/station-viewer/dist/index.html
+          test ! -e "$asset"
+          mkdir -p "$(dirname "$asset")"
+          printf '<!doctype html><title>MATDOG RF offline build gate</title>\n' > "$asset"
+
+      - name: Station release build
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release --package station 2>&1 | tee ci-output/station-build.log
+
+      - name: Remove CI-only viewer stub
+        if: always()
+        run: rm -rf software/station/clients/station-viewer/dist
+
+      - name: Upload RF development evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matdog-rf-development-evidence
+          path: ci-output/
+          if-no-files-found: error
