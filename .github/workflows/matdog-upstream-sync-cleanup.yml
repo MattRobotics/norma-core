@@ -1,0 +1,50 @@
+name: MATDOG Upstream Sync Branch Cleanup
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/matdog-upstream-sync-cleanup.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: matdog-upstream-sync-branch-cleanup
+  cancel-in-progress: false
+
+jobs:
+  delete-temporary-branches:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout synchronized main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Verify synchronized state and immutable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main release/matdog-lf-calibrator-v25
+          test "$(git rev-parse origin/main)" = "$(git rev-parse HEAD)"
+          test "$(git rev-parse origin/release/matdog-lf-calibrator-v25)" = "f87dd1fbc7e8100d275c74f9af448642f3429680"
+          git merge-base --is-ancestor 78f4bc9678a1db3bc3c63f2ebc1ac175b98c9206 HEAD
+          test -f software/station/examples/arm2dog-py/README.md
+          test -f tools/matdog/UPSTREAM_SYNC_2026-08-04.md
+
+      - name: Delete reviewed temporary branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          for branch in \
+            sync/upstream-arm2dog-20260804 \
+            sync/upstream-arm2dog-20260804-review \
+            chore/finalize-upstream-sync-cleanup
+          do
+            if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null 2>&1; then
+              git push origin --delete "$branch"
+            fi
+          done
