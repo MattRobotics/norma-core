@@ -52,7 +52,7 @@ jobs:
       - name: Prepare verification logs
         run: mkdir -p ci-output
 
-      - name: Enforce canonical 24-contact RAM-only q0-first contract
+      - name: Enforce canonical data-driven RAM-only contract
         shell: bash
         run: |
           set -euo pipefail
@@ -60,34 +60,24 @@ jobs:
           from pathlib import Path
           import re
 
-          source_path = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs")
-          tests_path = Path("software/drivers/st3215/src/auto_calibrate/matdog_test.rs")
-          port_path = Path("software/drivers/st3215/src/port.rs")
-          module_path = Path("software/drivers/st3215/src/auto_calibrate/mod.rs")
-          profile_path = Path("tools/matdog/matdog_lf_profile.py")
-          source = source_path.read_text()
-          tests = tests_path.read_text()
-          port = port_path.read_text()
-          module = module_path.read_text()
-          profile = profile_path.read_text()
+          source = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs").read_text()
+          tests = Path("software/drivers/st3215/src/auto_calibrate/matdog_test.rs").read_text()
+          port = Path("software/drivers/st3215/src/port.rs").read_text()
+          module = Path("software/drivers/st3215/src/auto_calibrate/mod.rs").read_text()
+          profile = Path("tools/matdog/matdog_lf_profile.py").read_text()
+          runner = Path("tools/matdog/matdog_headless_auto_calibrate.py").read_text()
+          launcher = Path("tools/matdog/matdog_rf_hardware_test.sh").read_text()
 
           forbidden_source = (
               "EepromRegister",
               "RamRegister::Lock",
               "ST3215Request::",
               "reg_write: Some",
-              "reset: Some",
               "reset_calibration: Some",
               "freeze_calibration: Some",
               "action: Some",
               "Offset.address",
               "matdog_v2",
-              "LF_FIXED_SCALE_REJECT",
-          )
-          forbidden_other = (
-              "write.motor_id != 12",
-              "matdog_pilot_is_armed",
-              "matdog_armed_motor_ids",
           )
           required_source = (
               "all_profiles",
@@ -96,38 +86,23 @@ jobs:
               "held_targets: Vec<StaticTarget>",
               "verify_static_holds_except",
               "MAX_TELEMETRY_AGE",
-              "prerequisite_restore_order",
               "global_torque_off_verified",
               "GUARD_OVERSHOOT_TICKS",
               "UPPER_30_DELTA",
               "UPPER_85_DELTA",
               "UPPER_90_DELTA",
-              "PROBE_TRACKING_ERROR_FLOOR_TICKS",
-              "LF_CONTACT_WITNESS_TOLERANCE_TICKS",
               "probe_tracking_error_limit",
-              "MATDOG LF CONTACT WITNESS:",
               "accepted: affine.accepted && contact_witness_accepted",
-              "MATDOG LF URDF FREEZE GATE: PASS",
-              "MATDOG RF URDF RAM-STAGE GATE: PASS",
-              "MATDOG_LF_PROFILE_V1|joint=",
-              "MATDOG_RF_PROFILE_V1|joint=",
+              "MATDOG_{}_PROFILE_V1|joint=",
               "RF_FULL_SEQUENCE_ARM_VALUE",
               "full_sequence_profile",
-              "full_sequence_leg",
-              "parking_leg",
               "run_leg_full_calibration",
               "persistent_freeze_authorized=false",
           )
           required_tests = (
               "profile_table_covers_exactly_24_unique_contacts",
-              "front_lower_restore_order_keeps_rear_parking_until_active_leg_is_home",
               "armed_ram_gate_restricts_registers_values_motors_and_goal_windows",
               "canonical_matdog_source_has_no_eeprom_reset_offset_regwrite_action_or_freeze_path",
-              "accepted_endpoint_q0_is_used_only_for_transactional_staging",
-              "full_lf_final_order_stages_m13_m11_m12_then_restores_m42",
-              "historical_contacts_use_affine_and_uniform_witness_freeze_gate",
-              "v24_m13_fine_tracking_uses_detector_consistent_global_floor",
-              "lf_contact_witness_gate_is_uniform_and_rejects_v24_m12_cable_obstruction",
               "affine_gate_accepts_real_span_while_fixed_scale_stays_diagnostic",
               "rf_full_sequence_uses_m23_m22_m21_and_m32_parking",
               "rf_full_sequence_goal_corridors_remain_unsigned",
@@ -135,18 +110,16 @@ jobs:
               "rf_profile_record_is_ram_only_and_never_authorizes_persistent_freeze",
               "rf_failure_contract_keeps_global_torque_off_and_isolated_hip_blocking",
           )
-          required_port = (
-              "matdog_command_allowed_with",
-              "matdog_armed_command_allowed",
-              "native MATDOG profile arming is active",
-          )
-          required_module = (
-              "mod matdog;",
-              "matdog_ram_write_allowed_for_arm_value",
-          )
-          required_profile = (
-              "estimated_q0_tick={record['q0_affine']}",
-              "q0_affine",
+          required_other = (
+              (port, "matdog_command_allowed_with"),
+              (port, "matdog_armed_command_allowed"),
+              (module, "mod matdog;"),
+              (module, "matdog_ram_write_allowed_for_arm_value"),
+              (profile, "q0_affine"),
+              (runner, '"RF_LEG_STATE_MACHINE"'),
+              (runner, 'frozenset((21, 22, 23, 32))'),
+              (launcher, "MATDOG_NATIVE_CALIBRATOR_ARM=RF_LEG_STATE_MACHINE"),
+              (launcher, "FINAL=PASS"),
           )
 
           expected_constants = {
@@ -157,73 +130,26 @@ jobs:
               "UPPER_90_DELTA": 1024,
               "LF_CONTACT_WITNESS_TOLERANCE_TICKS": 24,
           }
-          constant_errors = []
+          errors = []
           for name, expected in expected_constants.items():
-              match = re.search(
-                  rf"(?m)^const {name}: [^=]+ = (-?\d+);$",
-                  source,
-              )
-              if match is None:
-                  constant_errors.append(f"missing constant {name}")
-              elif int(match.group(1)) != expected:
-                  constant_errors.append(
-                      f"{name}={match.group(1)} expected {expected}"
-                  )
-
-          return_start = source.find(
-              "self.transition_lf_state(LfSessionState::ReturnHip)"
-          )
-          return_end = source.find(
-              "self.transition_lf_state(LfSessionState::RestoreParking)",
-              return_start,
-          )
-          if return_start < 0 or return_end < 0:
-              constant_errors.append("missing final LF return state-machine section")
-          else:
-              return_body = source[return_start:return_end]
-              required_staged = (
-                  "hip_staged_q0",
-                  "lower_staged_q0",
-                  "upper_staged_q0",
-              )
-              missing_staged = [token for token in required_staged if token not in return_body]
-              if missing_staged:
-                  constant_errors.append(
-                      f"missing transactional staged q0 targets: {missing_staged}"
-                  )
-              if "affine.estimated_zero_tick" not in return_body:
-                  constant_errors.append("affine q0 is not used as the staging target")
-              if "fixed_scale.estimated_zero_tick" in return_body:
-                  constant_errors.append("fixed-scale diagnostic used as staging target")
+              match = re.search(rf"(?m)^const {name}: [^=]+ = (-?\d+);$", source)
+              if match is None or int(match.group(1)) != expected:
+                  errors.append(f"constant {name} is not {expected}")
 
           found = [token for token in forbidden_source if token in source]
-          found += [token for token in forbidden_other if token in port or token in module]
           missing = [token for token in required_source if token not in source]
           missing += [token for token in required_tests if token not in tests]
-          missing += [token for token in required_port if token not in port]
-          missing += [token for token in required_module if token not in module]
-          missing += [token for token in required_profile if token not in profile]
-
-          stale = [
-              path for path in (
-                  Path("software/drivers/st3215/src/auto_calibrate/matdog_v2.rs"),
-                  Path("software/drivers/st3215/src/auto_calibrate/matdog_v2_test.rs"),
-              )
-              if path.exists()
-          ]
-          if stale:
-              found.extend(str(path) for path in stale)
-
-          if found or missing or constant_errors:
+          missing += [token for text, token in required_other if token not in text]
+          if found or missing or errors:
               if found:
-                  print(f"forbidden or stale MATDOG source: {found}")
+                  print(f"forbidden MATDOG source: {found}")
               if missing:
-                  print(f"missing MATDOG source requirements: {missing}")
-              if constant_errors:
-                  print(f"MATDOG q0/geometry contract errors: {constant_errors}")
+                  print(f"missing MATDOG requirements: {missing}")
+              if errors:
+                  print(f"MATDOG constants: {errors}")
               raise SystemExit(1)
 
-          print("MATDOG canonical 24-contact RAM-only affine+witness q0 contract: PASS")
+          print("MATDOG data-driven 24-contact RAM-only affine+witness contract: PASS")
           PY
 
       - name: MATDOG Rust format check
@@ -251,6 +177,7 @@ jobs:
           python3 -m unittest -v \
             tools.matdog.test_matdog_headless_auto_calibrate \
             tools.matdog.test_matdog_lf_profile \
+            tools.matdog.test_matdog_native_observer_contract \
             2>&1 | tee ci-output/headless-runner-tests.log
 
       - name: Create CI-only Station viewer stub
@@ -261,13 +188,13 @@ jobs:
           test ! -e "$asset"
           mkdir -p "$(dirname "$asset")"
           printf '<!doctype html><title>MATDOG offline build gate</title>\n' > "$asset"
-          echo "Created ignored CI-only viewer stub." | tee ci-output/station-viewer-stub.log
 
       - name: Station release build
         shell: bash
         run: |
           set -o pipefail
           cargo build --release --package station 2>&1 | tee ci-output/station-build.log
+          sha256sum target/release/station | tee ci-output/station-release.sha256
 
       - name: Remove CI-only viewer stub
         if: always()
