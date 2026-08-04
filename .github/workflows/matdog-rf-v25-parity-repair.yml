@@ -1,0 +1,89 @@
+name: MATDOG RF V25 Parity Repair
+
+on:
+  pull_request:
+    branches: [main]
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.event.pull_request.head.ref == 'matdog/rf-native-calibrator'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout RF branch
+        uses: actions/checkout@v4
+        with:
+          ref: matdog/rf-native-calibrator
+          fetch-depth: 0
+
+      - name: Apply exact V25-parity RF self-test repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          runner_path = Path('tools/matdog/matdog_headless_auto_calibrate.py')
+          tests_path = Path('tools/matdog/test_matdog_headless_auto_calibrate.py')
+          runner = runner_path.read_text()
+          tests = tests_path.read_text()
+
+          old_corridors = '''    assert CONTROLLED_POSITION_CORRIDORS[42] == (2016, 2421)\n    assert CONTROLLED_GOAL_CORRIDORS[42] == (2048, 2389)\n'''
+          new_corridors = '''    expected_parking_contract = {\n        "LF": (42, (2016, 2421), (2048, 2389)),\n        "RF": (32, (1675, 2080), (1697, 2048)),\n    }\n    (\n        parking_motor_id,\n        expected_position_corridor,\n        expected_goal_corridor,\n    ) = expected_parking_contract[ACTIVE_LEG]\n    assert (\n        CONTROLLED_POSITION_CORRIDORS[parking_motor_id]\n        == expected_position_corridor\n    )\n    assert CONTROLLED_GOAL_CORRIDORS[parking_motor_id] == expected_goal_corridor\n'''
+          old_focus = '''    assert len(parsed.motors[11].raw_ram_0x28_0x46_hex) == (\n        MIN_STATE_LENGTH - TORQUE_ENABLE\n    ) * 2\n'''
+          new_focus = '''    assert len(parsed.motors[EVIDENCE_MOTOR_ID].raw_ram_0x28_0x46_hex) == (\n        MIN_STATE_LENGTH - TORQUE_ENABLE\n    ) * 2\n'''
+          test_anchor = '''    def test_unsupported_leg_fails_closed(self) -> None:\n'''
+          new_test = '''    def test_builtin_self_test_passes_for_lf_and_rf(self) -> None:\n        for leg in ("LF", "RF"):\n            with self.subTest(leg=leg):\n                runner.configure_leg(leg)\n                runner.self_test()\n\n'''
+
+          changed = False
+          if old_corridors in runner:
+              runner = runner.replace(old_corridors, new_corridors, 1)
+              changed = True
+          elif new_corridors not in runner:
+              raise SystemExit('expected LF-only corridor self-test block not found')
+
+          if old_focus in runner:
+              runner = runner.replace(old_focus, new_focus, 1)
+              changed = True
+          elif new_focus not in runner:
+              raise SystemExit('expected LF-only focus-motor self-test block not found')
+
+          if new_test not in tests:
+              if test_anchor not in tests:
+                  raise SystemExit('RF test insertion anchor not found')
+              tests = tests.replace(test_anchor, new_test + test_anchor, 1)
+              changed = True
+
+          runner_path.write_text(runner)
+          tests_path.write_text(tests)
+          print(f'changed={changed}')
+          PY
+
+      - name: Run exact launcher self-tests for LF and RF
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test
+          python3 -m unittest tools/matdog/test_matdog_headless_auto_calibrate.py
+
+      - name: Commit repaired sources only
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- \
+            tools/matdog/matdog_headless_auto_calibrate.py \
+            tools/matdog/test_matdog_headless_auto_calibrate.py; then
+            echo 'No source changes required.'
+            exit 0
+          fi
+          git config user.name 'MattRobotics CI'
+          git config user.email 'actions@github.com'
+          git add \
+            tools/matdog/matdog_headless_auto_calibrate.py \
+            tools/matdog/test_matdog_headless_auto_calibrate.py
+          git commit -m 'fix(matdog): make RF self-test preserve V25 behavior'
+          git push origin HEAD:matdog/rf-native-calibrator
