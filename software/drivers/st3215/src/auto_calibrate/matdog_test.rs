@@ -2958,9 +2958,7 @@ fn full_lf_final_order_stages_m13_m11_m12_then_restores_m42() {
     let hip = source.find("let hip_staged_q0").unwrap();
     let lower = source.find("let lower_staged_q0").unwrap();
     let upper = source.find("let upper_staged_q0").unwrap();
-    let parking = source
-        .find("self.remove_held_target(parking_id);")
-        .unwrap();
+    let parking = source.find("self.remove_held_target(parking_id);").unwrap();
     assert!(hip < lower && lower < upper && upper < parking);
 }
 
@@ -3083,11 +3081,7 @@ fn rf_profile_record_is_ram_only_and_never_authorizes_persistent_freeze() {
             },
         },
     };
-    let evidence = derive_leg_joint_evidence(
-        Leg::Rf,
-        *spec_for(Leg::Rf, JointKind::Hip),
-        contacts,
-    );
+    let evidence = derive_leg_joint_evidence(Leg::Rf, *spec_for(Leg::Rf, JointKind::Hip), contacts);
     assert!(evidence.affine.accepted);
     assert!(evidence.accepted);
     let record = leg_machine_profile_record(Leg::Rf, evidence);
