@@ -1,0 +1,50 @@
+name: MATDOG RF Rustfmt Fix
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/matdog-rf-rustfmt-fix.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rustfmt-fix:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.ref == 'matdog/rf-native-calibrator'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout RF branch
+        uses: actions/checkout@v4
+        with:
+          ref: matdog/rf-native-calibrator
+          fetch-depth: 0
+
+      - name: Setup exact Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
+      - name: Format only reviewed Rust sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = "matdog/rf-native-calibrator"
+          rustfmt --edition 2021 --config skip_children=true \
+            software/drivers/st3215/src/port.rs \
+            software/drivers/st3215/src/auto_calibrate/mod.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            software/drivers/st3215/src/bin/matdog_lf_freeze.rs
+          changed="$(git diff --name-only)"
+          test -n "$changed"
+          forbidden="$(printf '%s\n' "$changed" | grep -vE '^software/drivers/st3215/src/.*\.rs$' || true)"
+          test -z "$forbidden"
+          git diff --check
+          git config user.name "MattRobotics RF CI"
+          git config user.email "actions@users.noreply.github.com"
+          git add software/drivers/st3215/src
+          git commit -m "style(matdog): format RF native calibrator"
+          git push origin HEAD:matdog/rf-native-calibrator
