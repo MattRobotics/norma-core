@@ -1,1 +1,1 @@
-temporary trigger; removed after clean-port workflow
+execute clean V25 RF port gate; remove after success
