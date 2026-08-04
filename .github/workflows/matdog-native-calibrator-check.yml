@@ -24,8 +24,16 @@ jobs:
     name: 24 profiles, RAM-only contract, Rust tests, Station build
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout reviewed revision
+      - name: Checkout exact reviewed revision
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prove exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
 
       - name: Setup protoc
         uses: arduino/setup-protoc@v3
@@ -100,7 +108,15 @@ jobs:
               "MATDOG LF CONTACT WITNESS:",
               "accepted: affine.accepted && contact_witness_accepted",
               "MATDOG LF URDF FREEZE GATE: PASS",
+              "MATDOG RF URDF RAM-STAGE GATE: PASS",
               "MATDOG_LF_PROFILE_V1|joint=",
+              "MATDOG_RF_PROFILE_V1|joint=",
+              "RF_FULL_SEQUENCE_ARM_VALUE",
+              "full_sequence_profile",
+              "full_sequence_leg",
+              "parking_leg",
+              "run_leg_full_calibration",
+              "persistent_freeze_authorized=false",
           )
           required_tests = (
               "profile_table_covers_exactly_24_unique_contacts",
@@ -113,6 +129,11 @@ jobs:
               "v24_m13_fine_tracking_uses_detector_consistent_global_floor",
               "lf_contact_witness_gate_is_uniform_and_rejects_v24_m12_cable_obstruction",
               "affine_gate_accepts_real_span_while_fixed_scale_stays_diagnostic",
+              "rf_full_sequence_uses_m23_m22_m21_and_m32_parking",
+              "rf_full_sequence_goal_corridors_remain_unsigned",
+              "rf_state_machine_reuses_one_persistent_engine",
+              "rf_profile_record_is_ram_only_and_never_authorizes_persistent_freeze",
+              "rf_failure_contract_keeps_global_torque_off_and_isolated_hip_blocking",
           )
           required_port = (
               "matdog_command_allowed_with",
