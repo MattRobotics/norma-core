@@ -20,8 +20,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  offline-verification:
-    name: V25 LF regression and data-driven RF package certification
+  certify-rf-package:
+    name: V25 LF regression and RF hardware package certification
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout exact reviewed revision
@@ -29,7 +29,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: Prove clean canonical workflow set
+      - name: Prove clean canonical repository state
         shell: bash
         run: |
           set -euo pipefail
@@ -56,16 +56,18 @@ jobs:
       - name: Install Station native dependency
         run: sudo apt-get update && sudo apt-get install -y nasm
 
-      - name: Enforce canonical V25 authority boundary
+      - name: Enforce V25 authority boundary and clean RF data port
         shell: bash
         run: |
           set -euo pipefail
           echo 'b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167  tools/matdog/matdog_native_observer_contract.py' | sha256sum -c -
           python3 - <<'PY'
           from pathlib import Path
+
           observer = Path('tools/matdog/matdog_native_observer_contract.py').read_text()
           launcher = Path('tools/matdog/matdog_v42_pinned_launcher.py').read_text()
           rust = Path('software/drivers/st3215/src/auto_calibrate/matdog.rs').read_text()
+
           required = (
               '_matdog_native_authority_observer = True',
               'matdog_native_observer_contract.install(runner)',
@@ -78,28 +80,32 @@ jobs:
           )
           combined = observer + launcher + rust
           missing = [token for token in required if token not in combined]
+
           forbidden_observer = (
               'M32', 'M42', 'HOME_TICK', 'current_step',
               'calibration.phase', 'CONTROLLED_GOAL_CORRIDORS',
               'CONTROLLED_POSITION_CORRIDORS', 'NONPARTICIPATING_MOTOR_IDS',
           )
-          found = [token for token in forbidden_observer if token in observer]
-          dead = [
+          observer_conflicts = [token for token in forbidden_observer if token in observer]
+
+          dead_adapters = (
               'fn lf_full_joint_corridor(',
               'fn lf_parking_corridor(',
               'fn lf_participant_corridor(',
               'fn lf_machine_profile_record(',
               'fn joint_degree_evidence(',
-          ]
-          present_dead = [token for token in dead if token in rust]
-          if missing or found or present_dead:
+          )
+          dead_found = [token for token in dead_adapters if token in rust]
+
+          if missing or observer_conflicts or dead_found:
               raise SystemExit(
-                  f'missing={missing}; observer_conflicts={found}; dead_adapters={present_dead}'
+                  f'missing={missing}; observer_conflicts={observer_conflicts}; '
+                  f'dead_adapters={dead_found}'
               )
           print('V25 authority boundary and clean RF data port: PASS')
           PY
 
-      - name: Warning-free Rust tests and format
+      - name: Warning-free Rust tests and formatting
         shell: bash
         run: |
           set -o pipefail
@@ -126,7 +132,7 @@ jobs:
             tools.matdog.test_matdog_v42_pinned_launcher \
             2>&1 | tee ci-output/python-tests.log
 
-      - name: Warning-free Station release build
+      - name: Build warning-free Station release
         shell: bash
         run: |
           set -o pipefail
@@ -143,7 +149,7 @@ jobs:
             | tee ci-output/station-release.sha256
           target/release/station --version | tee ci-output/station-version.txt
 
-      - name: Build one-command hardware package
+      - name: Build and self-test one-command RF hardware package
         shell: bash
         env:
           CERTIFIED_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -174,7 +180,7 @@ jobs:
           set -Eeuo pipefail
 
           PACKAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          REPO="/home/matteo-manicardi/norma-core"
+          REPO="${MATDOG_REPO:-/home/matteo-manicardi/norma-core}"
           BRANCH="matdog/rf-native-calibrator"
           SERVER="127.0.0.1:8888"
           BUS_SERIAL="5B14114953"
@@ -187,6 +193,7 @@ jobs:
 
           block() { printf 'BLOCKED  %s\n' "$*" >&2; exit 2; }
           pass() { printf 'PASS     %s\n' "$*"; }
+
           cleanup() {
             local rc=$?
             set +e
@@ -196,7 +203,9 @@ jobs:
                 kill -0 "$STATION_PID" 2>/dev/null || break
                 sleep 0.25
               done
-              kill -0 "$STATION_PID" 2>/dev/null && kill -KILL "$STATION_PID" 2>/dev/null
+              if kill -0 "$STATION_PID" 2>/dev/null; then
+                kill -KILL "$STATION_PID" 2>/dev/null
+              fi
               wait "$STATION_PID" 2>/dev/null
             fi
             exit "$rc"
@@ -204,102 +213,139 @@ jobs:
           trap cleanup EXIT INT TERM
 
           [[ -d "$REPO/.git" ]] || block "repository missing: $REPO"
-          cd "$REPO"
+          [[ -f "$MANIFEST" ]] || block "manifest missing"
+          [[ -x "$STATION" ]] || block "precompiled Station missing"
+
           mapfile -t META < <(python3 - "$MANIFEST" <<'PY'
           import json, sys
-          data=json.load(open(sys.argv[1], encoding='utf-8'))
-          for key in ('certified_commit','station_sha256','runner_sha256','observer_sha256'):
+          data = json.load(open(sys.argv[1], encoding='utf-8'))
+          for key in ('certified_commit', 'station_sha256', 'runner_sha256', 'observer_sha256'):
               print(data[key])
-          assert data['leg']=='RF'
-          assert data['arm_value']=='RF_LEG_STATE_MACHINE'
-          assert data['total_steps']==58
+          assert data['leg'] == 'RF'
+          assert data['arm_value'] == 'RF_LEG_STATE_MACHINE'
+          assert data['total_steps'] == 58
           assert data['persistent_freeze_authorized'] is False
           PY
           )
-          COMMIT="${META[0]}"; STATION_SHA="${META[1]}"; RUNNER_SHA="${META[2]}"; OBSERVER_SHA="${META[3]}"
+          COMMIT="${META[0]}"
+          STATION_SHA="${META[1]}"
+          RUNNER_SHA="${META[2]}"
+          OBSERVER_SHA="${META[3]}"
+
+          cd "$REPO"
+          [[ "$(sha256sum "$STATION" | awk '{print $1}')" == "$STATION_SHA" ]] || block "Station SHA mismatch"
+          [[ "$(sha256sum tools/matdog/matdog_headless_auto_calibrate.py | awk '{print $1}')" == "$RUNNER_SHA" ]] || block "runner SHA mismatch"
+          [[ "$(sha256sum tools/matdog/matdog_native_observer_contract.py | awk '{print $1}')" == "$OBSERVER_SHA" ]] || block "observer SHA mismatch"
+          [[ "$OBSERVER_SHA" == "b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167" ]] || block "observer is not LF V25 canonical"
+
+          if [[ "${1:-}" == "--self-test" ]]; then
+            python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test
+            python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test
+            printf 'PACKAGE_SELF_TEST=PASS\n'
+            trap - EXIT INT TERM
+            exit 0
+          fi
 
           git fetch origin "$BRANCH"
           [[ "$(git branch --show-current)" == "$BRANCH" ]] || block "active branch is not $BRANCH"
           git merge --ff-only "origin/$BRANCH"
           [[ "$(git rev-parse HEAD)" == "$COMMIT" ]] || block "HEAD is not certified commit $COMMIT"
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || block "working tree is not clean"
-          [[ "$(sha256sum "$STATION" | awk '{print $1}')" == "$STATION_SHA" ]] || block "Station SHA mismatch"
-          [[ "$(sha256sum tools/matdog/matdog_headless_auto_calibrate.py | awk '{print $1}')" == "$RUNNER_SHA" ]] || block "runner SHA mismatch"
-          [[ "$(sha256sum tools/matdog/matdog_native_observer_contract.py | awk '{print $1}')" == "$OBSERVER_SHA" ]] || block "observer SHA mismatch"
-          [[ "$OBSERVER_SHA" == "b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167" ]] || block "observer is not LF V25 canonical"
-          [[ -f "$CONFIG" ]] || block "Station config missing"
+          [[ -f "$CONFIG" ]] || block "Station configuration missing"
 
-          if [[ "${1:-}" == "--self-test" ]]; then
-            python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test
-            python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test
-            echo "PACKAGE_SELF_TEST=PASS"
-            trap - EXIT INT TERM
-            exit 0
+          if pgrep -af '(^|/)(station)( |$)' >/dev/null; then
+            block "Station is already running"
           fi
-
-          pgrep -af '(^|/)(station)( |$)' >/dev/null && block "Station is already running"
           shopt -s nullglob
           SERIALS=(/dev/serial/by-id/* /dev/ttyACM* /dev/ttyUSB*)
           shopt -u nullglob
           for dev in "${SERIALS[@]}"; do
-            command -v lsof >/dev/null 2>&1 && lsof "$dev" >/dev/null 2>&1 && block "serial already owned: $dev"
-            command -v fuser >/dev/null 2>&1 && fuser "$dev" >/dev/null 2>&1 && block "serial already owned: $dev"
+            if command -v lsof >/dev/null 2>&1 && lsof "$dev" >/dev/null 2>&1; then
+              block "serial already owned: $dev"
+            fi
+            if command -v fuser >/dev/null 2>&1 && fuser "$dev" >/dev/null 2>&1; then
+              block "serial already owned: $dev"
+            fi
           done
 
           mkdir -p "$OUT/station-data" "$OUT/runner"
           MATDOG_NATIVE_CALIBRATOR_ARM=RF_LEG_STATE_MACHINE \
           RUST_LOG="${RUST_LOG:-info}" \
-          "$STATION" --config "$CONFIG" --tcp "$SERVER" --normfs-base-folder "$OUT/station-data" \
+          "$STATION" \
+            --config "$CONFIG" \
+            --tcp "$SERVER" \
+            --normfs-base-folder "$OUT/station-data" \
             > "$OUT/station.log" 2>&1 &
           STATION_PID=$!
 
           python3 - "$SERVER" "$STATION_PID" <<'PY'
           import os, socket, sys, time
-          host, port=sys.argv[1].rsplit(':',1); pid=int(sys.argv[2]); deadline=time.monotonic()+30
-          while time.monotonic()<deadline:
-              try: os.kill(pid,0)
-              except ProcessLookupError: raise SystemExit('Station exited before readiness')
+          host, port = sys.argv[1].rsplit(':', 1)
+          pid = int(sys.argv[2])
+          deadline = time.monotonic() + 30.0
+          while time.monotonic() < deadline:
               try:
-                  with socket.create_connection((host,int(port)),timeout=.5): raise SystemExit(0)
-              except OSError: time.sleep(.25)
+                  os.kill(pid, 0)
+              except ProcessLookupError:
+                  raise SystemExit('Station exited before readiness')
+              try:
+                  with socket.create_connection((host, int(port)), timeout=0.5):
+                      raise SystemExit(0)
+              except OSError:
+                  time.sleep(0.25)
           raise SystemExit('Station readiness timeout')
           PY
+
           sleep 10
           kill -0 "$STATION_PID" 2>/dev/null || block "Station exited during discovery"
 
           set +e
           python3 tools/matdog/matdog_v42_pinned_launcher.py \
-            --leg RF --server "$SERVER" --bus-serial "$BUS_SERIAL" \
-            --station-pid "$STATION_PID" --expected-station-sha256 "$STATION_SHA" \
-            --output-dir "$OUT/runner" 2>&1 | tee "$OUT/runner-console.log"
+            --leg RF \
+            --server "$SERVER" \
+            --bus-serial "$BUS_SERIAL" \
+            --station-pid "$STATION_PID" \
+            --expected-station-sha256 "$STATION_SHA" \
+            --output-dir "$OUT/runner" \
+            2>&1 | tee "$OUT/runner-console.log"
           RC=${PIPESTATUS[0]}
           set -e
-          for _ in $(seq 1 120); do kill -0 "$STATION_PID" 2>/dev/null || break; sleep .25; done
+
+          for _ in $(seq 1 120); do
+            kill -0 "$STATION_PID" 2>/dev/null || break
+            sleep 0.25
+          done
           kill -0 "$STATION_PID" 2>/dev/null && block "Station still running after launcher"
           STATION_PID=""
           [[ "$RC" -eq 0 ]] || block "RF launcher exit code $RC"
 
           REPORT="$OUT/runner/headless-report.json"
+          [[ -f "$REPORT" ]] || block "hardware report missing"
           python3 - "$REPORT" <<'PY'
-          import json,sys
-          r=json.load(open(sys.argv[1],encoding='utf-8')); t=r.get('terminal') or {}; s=r.get('station_shutdown') or {}
-          assert r.get('result')=='PASS', r.get('faults')
-          assert r.get('schema')=='matdog.rf.headless_auto_calibrate.v1'
-          assert r.get('global_torque_off_verified') is True
-          assert r.get('eeprom_writes_sent') is False
-          assert r.get('register_writes_sent_by_runner') is False
-          assert t.get('current_step')==58 and t.get('total_steps')==58
-          assert t.get('phase')=='RF_LEG_STATE_MACHINE: completed'
-          assert s.get('stopped') is True
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding='utf-8'))
+          terminal = report.get('terminal') or {}
+          shutdown = report.get('station_shutdown') or {}
+          assert report.get('result') == 'PASS', report.get('faults')
+          assert report.get('schema') == 'matdog.rf.headless_auto_calibrate.v1'
+          assert report.get('global_torque_off_verified') is True
+          assert report.get('eeprom_writes_sent') is False
+          assert report.get('register_writes_sent_by_runner') is False
+          assert terminal.get('current_step') == 58
+          assert terminal.get('total_steps') == 58
+          assert terminal.get('phase') == 'RF_LEG_STATE_MACHINE: completed'
+          assert shutdown.get('stopped') is True
           PY
+
           sha256sum "$REPORT" "$OUT/station.log" "$OUT/runner-console.log" > "$OUT/SHA256SUMS.txt"
           pass "RF V25 hardware calibration completed"
           printf 'REPORT=%s\nEVIDENCE=%s\nFINAL=PASS\n' "$REPORT" "$OUT"
           trap - EXIT INT TERM
           SCRIPT
+
           chmod 755 "$ROOT/run_matdog_rf_v25.sh"
           bash -n "$ROOT/run_matdog_rf_v25.sh"
-          "$ROOT/run_matdog_rf_v25.sh" --self-test
+          MATDOG_REPO="$GITHUB_WORKSPACE" "$ROOT/run_matdog_rf_v25.sh" --self-test
 
           tar -C package -czf ci-output/MATDOG_RF_V25_HARDWARE_PACKAGE.tar.gz MATDOG_RF_V25_HARDWARE_PACKAGE
           sha256sum ci-output/MATDOG_RF_V25_HARDWARE_PACKAGE.tar.gz \
