@@ -163,10 +163,14 @@ jobs:
           set -o pipefail
           cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
 
-      - name: Headless LF regression and RF contract tests
+      - name: Exact LF and RF launcher self-tests plus headless regressions
         shell: bash
         run: |
           set -o pipefail
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test \
+            2>&1 | tee ci-output/lf-launcher-self-test.log
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test \
+            2>&1 | tee ci-output/rf-launcher-self-test.log
           python3 -m unittest -v \
             tools.matdog.test_matdog_headless_auto_calibrate \
             tools.matdog.test_matdog_lf_profile \
