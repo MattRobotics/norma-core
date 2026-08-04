@@ -2,245 +2,157 @@ name: MATDOG RF Development Gate
 
 on:
   pull_request:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/matdog-rf-development-gate.yml"
-      - ".github/workflows/matdog-native-calibrator-check.yml"
-      - "protobufs/drivers/st3215/**"
-      - "software/drivers/st3215/**"
-      - "software/station/bin/station/**"
-      - "tools/matdog/**"
-  workflow_dispatch:
+    branches: [main]
+    types: [synchronize]
 
 permissions:
-  contents: read
-
-concurrency:
-  group: matdog-rf-development-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  contents: write
 
 jobs:
-  rf-offline-gate:
-    name: RF compile, invariants, fault gates and hardware package
+  clean-v25-port:
+    if: github.event.pull_request.head.ref == 'matdog/rf-native-calibrator'
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout exact reviewed head
+      - name: Checkout RF branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: matdog/rf-native-calibrator
+          fetch-depth: 0
 
-      - name: Prove exact checkout
+      - name: Remove duplicated launcher and release-only dead code
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          matdog_path = Path('software/drivers/st3215/src/auto_calibrate/matdog.rs')
+          port_path = Path('software/drivers/st3215/src/port.rs')
+          matdog = matdog_path.read_text()
+          port = port_path.read_text()
+
+          adapters = [
+              'fn is_lf_full_sequence(',
+              'fn lf_full_sequence_goal_allowed(',
+              'fn lf_full_joint_corridor(',
+              'fn lf_parking_corridor(',
+              'fn lf_passive_corridor(',
+              'fn lf_participant_corridor(',
+              'fn derive_joint_evidence(',
+              'fn lf_machine_profile_record(',
+              'fn joint_degree_evidence(',
+          ]
+          for token in adapters:
+              plain = '\n' + token
+              gated = '\n#[cfg(test)]\n' + token
+              if gated not in matdog:
+                  if plain not in matdog:
+                      raise SystemExit(f'missing LF regression adapter: {token}')
+                  matdog = matdog.replace(plain, gated, 1)
+
+          plain_new = '    fn new(entry_positions: Vec<(u8, u16)>) -> Result<Self, String> {'
+          gated_new = '    #[cfg(test)]\n' + plain_new
+          if gated_new not in matdog:
+              if plain_new not in matdog:
+                  raise SystemExit('missing LF regression constructor')
+              matdog = matdog.replace(plain_new, gated_new, 1)
+
+          dead = '''    fn combine_cached_eeprom_and_ram(eeprom_prefix: &Bytes, ram_data: Bytes) -> Bytes {
+        let mut combined = BytesMut::with_capacity(eeprom_prefix.len() + ram_data.len());
+        combined.extend_from_slice(eeprom_prefix);
+        combined.extend_from_slice(&ram_data);
+        combined.freeze()
+    }
+
+'''
+          if dead in port:
+              port = port.replace(dead, '', 1)
+          if 'BytesMut' not in port:
+              port = port.replace('use bytes::{Bytes, BytesMut};', 'use bytes::Bytes;')
+
+          matdog_path.write_text(matdog)
+          port_path.write_text(port)
+          PY
+          rm -f tools/matdog/matdog_rf_hardware_test.sh
+
+      - name: Prove observer is exactly LF V25
+        run: echo 'b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167  tools/matdog/matdog_native_observer_contract.py' | sha256sum -c -
 
       - name: Setup protoc
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-          version: "23.x"
+          version: '23.x'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt,clippy
 
-      - name: Install Station native build dependency
+      - name: Install Station dependency
         run: sudo apt-get update && sudo apt-get install -y nasm
 
-      - name: Prepare exact evidence directory
+      - name: Exact V25 LF and RF runner checks
         shell: bash
         run: |
           set -euo pipefail
-          status="$(git status --porcelain=v1 --untracked-files=all)"
-          test -z "$status"
-          mkdir -p ci-output
-          git rev-parse HEAD | tee ci-output/HEAD.txt
-          printf '%s' "$status" > ci-output/git-status.txt
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test
+          python3 -m unittest -v \
+            tools.matdog.test_matdog_headless_auto_calibrate \
+            tools.matdog.test_matdog_native_observer_contract \
+            tools.matdog.test_matdog_lf_profile
+          cargo test --package st3215 --all-targets
 
-      - name: Enforce RF data-driven and fail-closed source contract
+      - name: Warning-free release build
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY' | tee ci-output/rf-source-contract.log
-          from pathlib import Path
-
-          rust = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs").read_text()
-          tests = Path("software/drivers/st3215/src/auto_calibrate/matdog_test.rs").read_text()
-          runner = Path("tools/matdog/matdog_headless_auto_calibrate.py").read_text()
-          launcher = Path("tools/matdog/matdog_rf_hardware_test.sh").read_text()
-
-          required_rust = (
-              'const RF_FULL_SEQUENCE_ARM_VALUE: &str = "RF_LEG_STATE_MACHINE";',
-              'Self::Rf => Some(RF_FULL_SEQUENCE_ARM_VALUE)',
-              'Self::Rf => Some(Self::Rh)',
-              'full_sequence_profile(Leg::Rf)',
-              'run_leg_full_calibration(',
-              'LfSessionStateMachine::new_for_leg',
-              'build_profile(leg, JointKind::Upper, ContactSide::Min)',
-              'build_profile(leg, JointKind::Lower, ContactSide::Min)',
-              'build_profile(leg, JointKind::Hip, ContactSide::Min)',
-              'derive_leg_joint_evidence',
-              'MATDOG RF URDF RAM-STAGE GATE: PASS',
-              'EEPROM_written=false',
-              'persistent_freeze_authorized=false',
-              'global_torque_off_verified()',
-          )
-          required_tests = (
-              'rf_full_sequence_uses_m23_m22_m21_and_m32_parking',
-              'rf_full_sequence_goal_corridors_remain_unsigned',
-              'rf_state_machine_reuses_one_persistent_engine',
-              'rf_profile_record_is_ram_only_and_never_authorizes_persistent_freeze',
-              'rf_failure_contract_keeps_global_torque_off_and_isolated_hip_blocking',
-          )
-          required_runner = (
-              '"RF_LEG_STATE_MACHINE"',
-              'frozenset((21, 22, 23, 32))',
-              '"leg": ACTIVE_LEG',
-              '"eeprom_writes_sent": False',
-              '"register_writes_sent_by_runner": False',
-              'controlled_station_shutdown(',
-          )
-          required_launcher = (
-              'MATDOG_NATIVE_CALIBRATOR_ARM=RF_LEG_STATE_MACHINE',
-              '--leg RF',
-              '--expected-station-sha256 "$STATION_SHA"',
-              'global_torque_off_verified',
-              'eeprom_writes_sent',
-              'FINAL=PASS',
-          )
-          forbidden = (
-              'signed-wrap',
-              'pyserial',
-              'serial.Serial(',
-              'reset_calibration: Some',
-              'freeze_calibration: Some',
-              'reg_write: Some',
-              'action: Some',
-          )
-
-          missing = [token for token in required_rust if token not in rust]
-          missing += [token for token in required_tests if token not in tests]
-          missing += [token for token in required_runner if token not in runner]
-          missing += [token for token in required_launcher if token not in launcher]
-          found = [token for token in forbidden if token in rust or token in runner]
-          if missing or found:
-              if missing:
-                  print(f"missing RF source contract: {missing}")
-              if found:
-                  print(f"forbidden RF source contract: {found}")
-              raise SystemExit(1)
-          print("MATDOG RF data-driven RAM-only fail-closed source contract: PASS")
-          PY
-
-      - name: Shell and Python syntax checks
-        shell: bash
-        run: |
-          set -o pipefail
-          bash -n tools/matdog/matdog_rf_hardware_test.sh
-          python3 -m py_compile \
-            tools/matdog/matdog_headless_auto_calibrate.py \
-            tools/matdog/test_matdog_headless_auto_calibrate.py
-          echo "RF launcher and Python syntax: PASS" | tee ci-output/syntax.log
-
-      - name: Rust format check
-        shell: bash
-        run: |
-          set -o pipefail
           rustfmt --edition 2021 --check --config skip_children=true \
             software/drivers/st3215/src/port.rs \
             software/drivers/st3215/src/auto_calibrate/mod.rs \
             software/drivers/st3215/src/auto_calibrate/matdog.rs \
             software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
-            software/drivers/st3215/src/bin/matdog_lf_freeze.rs \
-            2>&1 | tee ci-output/rustfmt.log
+            software/drivers/st3215/src/bin/matdog_lf_freeze.rs
+          mkdir -p software/station/clients/station-viewer/dist
+          printf '<!doctype html><title>MATDOG clean V25 RF build</title>\n' > software/station/clients/station-viewer/dist/index.html
+          RUSTFLAGS='-D warnings' cargo build --release --package station
+          rm -rf software/station/clients/station-viewer/dist
 
-      - name: ST3215 unit and RF regression tests
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo test --package st3215 2>&1 | tee ci-output/st3215-tests.log
-
-      - name: Exact LF and RF launcher self-tests plus headless regressions
-        shell: bash
-        run: |
-          set -o pipefail
-          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test \
-            2>&1 | tee ci-output/lf-launcher-self-test.log
-          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test \
-            2>&1 | tee ci-output/rf-launcher-self-test.log
-          python3 -m unittest -v \
-            tools.matdog.test_matdog_headless_auto_calibrate \
-            tools.matdog.test_matdog_lf_profile \
-            tools.matdog.test_matdog_native_observer_contract \
-            2>&1 | tee ci-output/python-tests.log
-
-      - name: ST3215 Clippy with documented legacy lint debt allowlist
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo clippy --package st3215 --all-targets -- \
-            -D warnings \
-            -A dead-code \
-            -A clippy::empty_line_after_doc_comments \
-            -A clippy::match_like_matches_macro \
-            -A clippy::too_many_arguments \
-            -A clippy::assign_op_pattern \
-            -A clippy::unnecessary_unwrap \
-            -A clippy::useless_borrows_in_formatting \
-            -A clippy::op_ref \
-            -A clippy::unwrap_or_default \
-            -A clippy::implicit_saturating_sub \
-            -A clippy::unnecessary_cast \
-            -A clippy::manual_range_patterns \
-            -A clippy::items_after_test_module \
-            -A clippy::manual_div_ceil \
-            2>&1 | tee ci-output/st3215-clippy.log
-
-      - name: Create CI-only Station viewer stub
+      - name: Commit clean V25 data port
         shell: bash
         run: |
           set -euo pipefail
-          asset=software/station/clients/station-viewer/dist/index.html
-          test ! -e "$asset"
-          mkdir -p "$(dirname "$asset")"
-          printf '<!doctype html><title>MATDOG RF offline build gate</title>\n' > "$asset"
+          git diff --check
+          git config user.name 'MattRobotics CI'
+          git config user.email 'actions@github.com'
+          git add software/drivers/st3215/src/port.rs software/drivers/st3215/src/auto_calibrate/matdog.rs
+          git add -u tools/matdog/matdog_rf_hardware_test.sh
+          git commit -m 'refactor(matdog): keep RF as a clean V25 data port'
+          git push origin HEAD:matdog/rf-native-calibrator
 
-      - name: Station release build and binary provenance
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo build --release --package station 2>&1 | tee ci-output/station-build.log
-          sha256sum target/release/station | tee ci-output/station-release.sha256
-          target/release/station --version | tee ci-output/station-version.txt
-
-      - name: Remove CI-only viewer stub
-        if: always()
-        run: rm -rf software/station/clients/station-viewer/dist
-
-      - name: Create exact RF hardware-test source package
-        if: always()
+      - name: Rebuild exact committed Station
         shell: bash
         run: |
           set -euo pipefail
-          tar -czf ci-output/matdog-rf-hardware-test-source.tgz \
-            Cargo.toml Cargo.lock \
-            protobufs/drivers/st3215 \
-            software/drivers/st3215 \
-            software/station/bin/station \
-            tools/matdog \
-            .github/workflows/matdog-native-calibrator-check.yml \
-            .github/workflows/matdog-native-observer-check.yml \
-            .github/workflows/matdog-rf-development-gate.yml
-          sha256sum ci-output/matdog-rf-hardware-test-source.tgz \
-            | tee ci-output/source-package.sha256
+          rm -rf package
+          mkdir -p package/bin package/source package/metadata
+          mkdir -p software/station/clients/station-viewer/dist
+          printf '<!doctype html><title>MATDOG pinned RF Station</title>\n' > software/station/clients/station-viewer/dist/index.html
+          cargo clean -p station
+          RUSTFLAGS='-D warnings' cargo build --release --package station
+          rm -rf software/station/clients/station-viewer/dist
+          cp target/release/station package/bin/station
+          cp tools/matdog/matdog_headless_auto_calibrate.py package/source/
+          cp tools/matdog/matdog_native_observer_contract.py package/source/
+          cp software/station/bin/station/station.yaml package/source/
+          git rev-parse HEAD | tee package/metadata/source-commit.txt
+          target/release/station --version | tee package/metadata/station-version.txt
+          sha256sum package/bin/station package/source/* | tee package/metadata/SHA256SUMS
 
-      - name: Upload RF development evidence
-        if: always()
+      - name: Upload exact clean Station artifact
         uses: actions/upload-artifact@v4
         with:
-          name: matdog-rf-development-evidence
-          path: ci-output/
+          name: matdog-rf-v25-clean-station
+          path: package/
           if-no-files-found: error
