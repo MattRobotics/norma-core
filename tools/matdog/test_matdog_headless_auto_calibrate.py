@@ -484,6 +484,12 @@ class RfProfileContractTests(unittest.TestCase):
         self.assertNotIn(11, runner.CONTROLLED_MOTOR_IDS)
         self.assertIn(11, runner.NONPARTICIPATING_MOTOR_IDS)
 
+    def test_builtin_self_test_passes_for_lf_and_rf(self) -> None:
+        for leg in ("LF", "RF"):
+            with self.subTest(leg=leg):
+                runner.configure_leg(leg)
+                runner.self_test()
+
     def test_unsupported_leg_fails_closed(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "unsupported MATDOG leg"):
             runner.configure_leg("RH")

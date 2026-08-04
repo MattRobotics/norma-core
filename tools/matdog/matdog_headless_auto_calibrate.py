@@ -2030,8 +2030,20 @@ def self_test() -> None:
     assert feedback_magnitude(0x8007) == 7
     assert normalize_position(0x8001) == 4095
     assert circular_distance(4095, 1) == 2
-    assert CONTROLLED_POSITION_CORRIDORS[42] == (2016, 2421)
-    assert CONTROLLED_GOAL_CORRIDORS[42] == (2048, 2389)
+    expected_parking_contract = {
+        "LF": (42, (2016, 2421), (2048, 2389)),
+        "RF": (32, (1675, 2080), (1697, 2048)),
+    }
+    (
+        parking_motor_id,
+        expected_position_corridor,
+        expected_goal_corridor,
+    ) = expected_parking_contract[ACTIVE_LEG]
+    assert (
+        CONTROLLED_POSITION_CORRIDORS[parking_motor_id]
+        == expected_position_corridor
+    )
+    assert CONTROLLED_GOAL_CORRIDORS[parking_motor_id] == expected_goal_corridor
 
     now_ns = station_monotonic_stamp_ns()
     synthetic_motors = []
@@ -2080,7 +2092,7 @@ def self_test() -> None:
     assert all(not sample.torque_enabled for sample in parsed.motors.values())
     assert latest_window["latest_source_age_ns"]["43"] == 1
     assert len(telemetry.m11_records) == 1
-    assert len(parsed.motors[11].raw_ram_0x28_0x46_hex) == (
+    assert len(parsed.motors[EVIDENCE_MOTOR_ID].raw_ram_0x28_0x46_hex) == (
         MIN_STATE_LENGTH - TORQUE_ENABLE
     ) * 2
     asyncio.run(self_test_start_interrupt_guard())
