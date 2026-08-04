@@ -60,6 +60,7 @@ All three motors were read back with EEPROM lock enabled and torque disabled.
 ```text
 release branch: release/matdog-lf-calibrator-v25
 reviewed source head: f87dd1fbc7e8100d275c74f9af448642f3429680
+merged main commit: ad9fdc1e13e8eaaa67193b38a99e4d69dd3a9337
 pull request: #11
 ```
 
@@ -77,9 +78,9 @@ tools/matdog/matdog_native_observer_contract.py
 tools/matdog/matdog_v42_pinned_launcher.py
 ```
 
-## CI gates
+## CI gates and post-merge policy
 
-The final source head passed all four dedicated workflows:
+The reviewed V25 source passed four independent workflows:
 
 - MATDOG Native Calibrator Offline Check;
 - MATDOG Native Observer Check;
@@ -87,3 +88,7 @@ The final source head passed all four dedicated workflows:
 - MATDOG LF Measurement and Freeze Artifact.
 
 The final suite contains 135 ST3215/MATDOG Rust tests plus the runner, observer, launcher, provisioner and persistent-profile Python contracts.
+
+After merge, only the durable source/architecture gate and observer-authority gate remain on `main`. The two release-artifact workflows are preserved on `release/matdog-lf-calibrator-v25` together with the exact reviewed source, but are removed from `main` so ordinary future PRs do not repeat redundant Station/provisioner release builds.
+
+GitHub Actions run numbers are historical execution counters, not active workflow files. Historical runs are retained as evidence; source cleanup is performed by removing temporary workflow files from `main`, not by erasing audit history.
