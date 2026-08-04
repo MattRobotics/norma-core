@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Immutable launcher for the reviewed MATDOG LF measurement/freeze artifact.
+"""Pinned MATDOG LF/RF native-calibrator launcher.
 
-This module creates no register command. It verifies the reviewed headless
-runner and native-authority observer byte-for-byte, installs the observer,
-replaces only the Station executable SHA-256 pin, and delegates to the
-fail-closed runner. EEPROM provisioning remains a separate post-measurement
-transaction performed only after Station has stopped and released the serial
-adapter.
+The historical filename is retained from LF V25. This module creates no
+register command and contains no motion policy. It verifies the reviewed runner
+and the byte-identical LF V25 authority observer, installs that observer once,
+sets only the exact Station executable SHA-256 pin, and delegates to the
+fail-closed runner.
 """
 
 from __future__ import annotations
@@ -20,20 +19,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER_PATH = REPO_ROOT / "tools/matdog/matdog_headless_auto_calibrate.py"
 OBSERVER_PATH = REPO_ROOT / "tools/matdog/matdog_native_observer_contract.py"
 
-EXPECTED_RUNNER_SHA256 = (
-    "9eccb4aa88c3496e6d4e986d9de2d5fea3d8185d1bd3ea4855d1d3aaa6945613"
-)
-EXPECTED_OBSERVER_SHA256 = (
-    "b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167"
-)
-PINNED_STATION_SHA256 = (
-    "df4f6965d5c6b5eaecdc7f937391392dff0a1ca1cac166ab898d9a7c530f4651"
-)
-PINNED_STATION_SOURCE_COMMIT = "3f6a9099ea11f90da5981d9ea2cada1c7779878b"
-PINNED_STATION_ARTIFACT_ID = 8869874935
-PINNED_STATION_ARTIFACT_ZIP_SHA256 = (
-    "ec7fd93805e73ea0691638cf863eda30dc0bbf5212db7bc25032ed6b270560d6"
-)
+EXPECTED_RUNNER_SHA256 = "ab83fad9b93cf7786834cfe54264023178e30922b332411a32000d6193a5eaa0"
+EXPECTED_OBSERVER_SHA256 = "b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167"
+PINNED_STATION_SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+PINNED_STATION_SOURCE_COMMIT = "fa6d0bd1d5f4be89b813faee13b4f02d31877748"
+PINNED_STATION_PROVENANCE = "INTERIM_SOFTWARE_GATE_ONLY_NOT_FOR_HARDWARE"
 
 
 def sha256_file(path: Path) -> str:

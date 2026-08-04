@@ -533,6 +533,7 @@ fn rf_full_sequence_profile() -> Result<ContactProfile, String> {
     full_sequence_profile(Leg::Rf)
 }
 
+#[cfg(test)]
 fn is_lf_full_sequence(profile: &ContactProfile) -> bool {
     full_sequence_leg(profile) == Some(Leg::Lf)
 }
@@ -790,22 +791,27 @@ fn participant_corridor(leg: Leg, motor_id: u8) -> Result<TickCorridor, String> 
     }
 }
 
+#[cfg(test)]
 fn lf_full_sequence_goal_allowed(motor_id: u8, target: u16) -> bool {
     full_sequence_goal_allowed(Leg::Lf, motor_id, target)
 }
 
+#[cfg(test)]
 fn lf_full_joint_corridor(motor_id: u8) -> Option<TickCorridor> {
     full_joint_corridor(Leg::Lf, motor_id)
 }
 
+#[cfg(test)]
 fn lf_parking_corridor() -> Result<TickCorridor, String> {
     parking_corridor(Leg::Lf)
 }
 
+#[cfg(test)]
 fn lf_passive_corridor(state: LfSessionState, motor_id: u8) -> Result<TickCorridor, String> {
     passive_corridor(Leg::Lf, state, motor_id)
 }
 
+#[cfg(test)]
 fn lf_participant_corridor(motor_id: u8) -> Result<TickCorridor, String> {
     participant_corridor(Leg::Lf, motor_id)
 }
@@ -1127,6 +1133,7 @@ struct LfSessionStateMachine {
 }
 
 impl LfSessionStateMachine {
+    #[cfg(test)]
     fn new(entry_positions: Vec<(u8, u16)>) -> Result<Self, String> {
         Self::new_for_leg(Leg::Lf, entry_positions)
     }
@@ -2305,6 +2312,7 @@ fn derive_leg_joint_evidence(
     }
 }
 
+#[cfg(test)]
 fn derive_joint_evidence(spec: JointSpec, contacts: DualContactResult) -> JointCalibrationEvidence {
     derive_leg_joint_evidence(Leg::Lf, spec, contacts)
 }
@@ -2349,6 +2357,7 @@ fn leg_machine_profile_record(leg: Leg, evidence: JointCalibrationEvidence) -> S
     )
 }
 
+#[cfg(test)]
 fn lf_machine_profile_record(evidence: JointCalibrationEvidence) -> String {
     leg_machine_profile_record(Leg::Lf, evidence)
 }
@@ -2412,6 +2421,7 @@ fn leg_degree_evidence(leg: Leg, evidence: JointCalibrationEvidence) -> String {
     )
 }
 
+#[cfg(test)]
 fn joint_degree_evidence(evidence: JointCalibrationEvidence) -> String {
     leg_degree_evidence(Leg::Lf, evidence)
 }

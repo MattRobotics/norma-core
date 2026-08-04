@@ -402,13 +402,6 @@ impl St3215Port {
         drop(done_tx.send(Ok(())));
     }
 
-    fn combine_cached_eeprom_and_ram(eeprom_prefix: &Bytes, ram_data: Bytes) -> Bytes {
-        let mut combined = BytesMut::with_capacity(eeprom_prefix.len() + ram_data.len());
-        combined.extend_from_slice(eeprom_prefix);
-        combined.extend_from_slice(&ram_data);
-        combined.freeze()
-    }
-
     fn overwrite_temperature(full_data: Bytes, temperature_c: u8) -> Bytes {
         let address = protocol::RamRegister::PresentTemperature.address() as usize;
         if full_data.len() <= address {
