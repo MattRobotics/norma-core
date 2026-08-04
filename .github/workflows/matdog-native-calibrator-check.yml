@@ -2,8 +2,7 @@ name: MATDOG RF Exact V25 Port Repair
 
 on:
   pull_request:
-    branches:
-      - main
+    branches: [main]
     paths:
       - ".github/workflows/matdog-native-calibrator-check.yml"
       - "software/drivers/st3215/**"
@@ -20,44 +19,43 @@ jobs:
     if: github.head_ref == 'matdog/rf-native-calibrator'
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout exact RF branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: matdog/rf-native-calibrator
           fetch-depth: 0
 
-      - name: Setup protoc
-        uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           version: "23.x"
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt
 
-      - name: Apply only the exact V25 data-port repair
+      - name: Apply exact V25 data-port repair
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           rust_path = Path("software/drivers/st3215/src/auto_calibrate/matdog.rs")
           tests_path = Path("software/drivers/st3215/src/auto_calibrate/matdog_test.rs")
           rust = rust_path.read_text(encoding="utf-8")
           tests = tests_path.read_text(encoding="utf-8")
 
-          old_gate = '''        let low = HOME_TICK
-              .min(parking.target_tick)
-              .saturating_sub(STATIC_TOLERANCE_TICKS);
-          let high = HOME_TICK
-              .max(parking.target_tick)
-              .min(protocol::MAX_ANGLE_STEP);
-          return (low..=high).contains(&target);
-          '''
-          new_gate = '''        let (low, high) = if parking.target_tick >= HOME_TICK {
+          pattern = re.compile(
+              r"        let low = HOME_TICK\n"
+              r"            \.min\(parking\.target_tick\)\n"
+              r"            \.saturating_sub\(STATIC_TOLERANCE_TICKS\);\n"
+              r"        let high = HOME_TICK\n"
+              r"            \.max\(parking\.target_tick\)\n"
+              r"            \.min\(protocol::MAX_ANGLE_STEP\);\n"
+              r"        return \(low\.\.=high\)\.contains\(&target\);"
+          )
+          replacement = '''        let (low, high) = if parking.target_tick >= HOME_TICK {
               (
                   HOME_TICK.saturating_sub(STATIC_TOLERANCE_TICKS),
                   parking.target_tick,
@@ -70,47 +68,22 @@ jobs:
                       .min(protocol::MAX_ANGLE_STEP),
               )
           };
-          return (low..=high).contains(&target);
-          '''
-          if old_gate in rust:
-              rust = rust.replace(old_gate, new_gate, 1)
-          elif new_gate not in rust:
-              raise SystemExit("reviewed parking goal gate not found")
+          return (low..=high).contains(&target);'''
+          rust, count = pattern.subn(replacement, rust, count=1)
+          if count != 1 and replacement not in rust:
+              raise SystemExit(f"parking goal gate matches={count}, expected 1")
 
-          dead_adapters = (
-              '''#[cfg(test)]
-          fn lf_full_joint_corridor(motor_id: u8) -> Option<TickCorridor> {
-              full_joint_corridor(Leg::Lf, motor_id)
-          }
-
-          ''',
-              '''#[cfg(test)]
-          fn lf_parking_corridor() -> Result<TickCorridor, String> {
-              parking_corridor(Leg::Lf)
-          }
-
-          ''',
-              '''#[cfg(test)]
-          fn lf_participant_corridor(motor_id: u8) -> Result<TickCorridor, String> {
-              participant_corridor(Leg::Lf, motor_id)
-          }
-
-          ''',
-              '''#[cfg(test)]
-          fn lf_machine_profile_record(evidence: JointCalibrationEvidence) -> String {
-              leg_machine_profile_record(Leg::Lf, evidence)
-          }
-
-          ''',
-              '''#[cfg(test)]
-          fn joint_degree_evidence(evidence: JointCalibrationEvidence) -> String {
-              leg_degree_evidence(Leg::Lf, evidence)
-          }
-
-          ''',
-          )
-          for adapter in dead_adapters:
-              rust = rust.replace(adapter, "", 1)
+          dead = [
+              r"#\[cfg\(test\)\]\nfn lf_full_joint_corridor\(motor_id: u8\) -> Option<TickCorridor> \{\n    full_joint_corridor\(Leg::Lf, motor_id\)\n\}\n\n",
+              r"#\[cfg\(test\)\]\nfn lf_parking_corridor\(\) -> Result<TickCorridor, String> \{\n    parking_corridor\(Leg::Lf\)\n\}\n\n",
+              r"#\[cfg\(test\)\]\nfn lf_participant_corridor\(motor_id: u8\) -> Result<TickCorridor, String> \{\n    participant_corridor\(Leg::Lf, motor_id\)\n\}\n\n",
+              r"#\[cfg\(test\)\]\nfn lf_machine_profile_record\(evidence: JointCalibrationEvidence\) -> String \{\n    leg_machine_profile_record\(Leg::Lf, evidence\)\n\}\n\n",
+              r"#\[cfg\(test\)\]\nfn joint_degree_evidence\(evidence: JointCalibrationEvidence\) -> String \{\n    leg_degree_evidence\(Leg::Lf, evidence\)\n\}\n\n",
+          ]
+          for expression in dead:
+              rust, removed = re.subn(expression, "", rust, count=1)
+              if removed not in (0, 1):
+                  raise SystemExit(f"unexpected adapter removal count={removed}")
 
           test_name = "mirrored_front_parking_home_priming_preserves_v25_lf_and_accepts_rf_settle"
           if test_name not in tests:
@@ -118,20 +91,15 @@ jobs:
 
           #[test]
           fn {test_name}() {{
-              // Preserve the exact LF V25 home-side admission.
               assert!(full_sequence_goal_allowed(Leg::Lf, 42, 2052));
               assert!(full_sequence_goal_allowed(Leg::Lf, 42, 2389));
-
-              // Mirror only the home-side tolerance for RF/M32. The observed
-              // hardware priming tick 2054 is within the same 10-tick settle
-              // used by LF V25; 2059 remains outside and must be rejected.
               assert!(full_sequence_goal_allowed(Leg::Rf, 32, 1707));
               assert!(full_sequence_goal_allowed(Leg::Rf, 32, 2054));
               assert!(!full_sequence_goal_allowed(Leg::Rf, 32, 2059));
           }}
           '''
 
-          required_unchanged = (
+          required = (
               'const TORQUE_LIMIT: u16 = 500;',
               'const GOAL_SPEED: u16 = 160;',
               'const ACCELERATION: u8 = 8;',
@@ -143,7 +111,7 @@ jobs:
               'measure_lf_joint_pair_efficient(',
               'global_torque_off_verified()',
           )
-          missing = [token for token in required_unchanged if token not in rust]
+          missing = [token for token in required if token not in rust]
           if missing:
               raise SystemExit(f"V25 invariants missing: {missing}")
 
@@ -181,8 +149,6 @@ jobs:
           test "$changed" = $'software/drivers/st3215/src/auto_calibrate/matdog.rs\nsoftware/drivers/st3215/src/auto_calibrate/matdog_test.rs'
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add \
-            software/drivers/st3215/src/auto_calibrate/matdog.rs \
-            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          git add software/drivers/st3215/src/auto_calibrate/matdog.rs software/drivers/st3215/src/auto_calibrate/matdog_test.rs
           git commit -m "fix(matdog): mirror V25 parking priming for RF"
           git push origin HEAD:matdog/rf-native-calibrator
