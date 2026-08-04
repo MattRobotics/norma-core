@@ -2910,8 +2910,8 @@ fn full_lf_normalizes_all_twelve_joints_before_creating_strict_session_roles() {
         .find("self.inspect_lf_native_session_entry()?;")
         .expect("strict LF session creation");
     let parking = body
-        .find("Park LH upper M42 once for the complete LF session")
-        .expect("M42 operational parking");
+        .find("let rear_parking = static_target(parking_leg")
+        .expect("data-driven operational parking");
 
     assert!(normalize < create_session);
     assert!(create_session < parking);
@@ -2940,7 +2940,7 @@ fn full_lf_q0_normalization_has_no_distance_admission_window() {
 #[test]
 fn accepted_endpoint_q0_is_used_only_for_transactional_staging() {
     let source = include_str!("matdog.rs");
-    assert!(source.contains("MATDOG LF URDF FREEZE GATE: PASS"));
+    assert!(source.contains("URDF RAM-STAGE GATE: PASS"));
     assert!(source.contains("hip_staged_q0"));
     assert!(source.contains("lower_staged_q0"));
     assert!(source.contains("upper_staged_q0"));
@@ -2959,7 +2959,7 @@ fn full_lf_final_order_stages_m13_m11_m12_then_restores_m42() {
     let lower = source.find("let lower_staged_q0").unwrap();
     let upper = source.find("let upper_staged_q0").unwrap();
     let parking = source
-        .find("Restore LH upper M42 once at end of LF calibration")
+        .find("self.remove_held_target(parking_id);")
         .unwrap();
     assert!(hip < lower && lower < upper && upper < parking);
 }
@@ -2989,4 +2989,124 @@ fn lf_parking_goal_gate_accepts_q0_settle_priming_without_widening_beyond_static
         42,
         lowest_q0_prime.saturating_sub(1)
     ));
+}
+
+#[test]
+fn rf_full_sequence_uses_m23_m22_m21_and_m32_parking() {
+    let profile = profile_for_arm_value(RF_FULL_SEQUENCE_ARM_VALUE).unwrap();
+    assert!(is_rf_full_sequence(&profile));
+    assert_eq!(profile.leg, Leg::Rf);
+    assert_eq!(profile.allowed_motor_ids, &RF_ALLOWED);
+    assert_eq!(spec_for(Leg::Rf, JointKind::Hip).motor_id, 23);
+    assert_eq!(spec_for(Leg::Rf, JointKind::Hip).direction, -1);
+    assert_eq!(spec_for(Leg::Rf, JointKind::Upper).motor_id, 22);
+    assert_eq!(spec_for(Leg::Rf, JointKind::Upper).direction, -1);
+    assert_eq!(spec_for(Leg::Rf, JointKind::Lower).motor_id, 21);
+    assert_eq!(spec_for(Leg::Rf, JointKind::Lower).direction, 1);
+
+    let parking = static_target(Leg::Rh, JointKind::Upper, UPPER_30_DELTA).unwrap();
+    assert_eq!(parking.motor_id, 32);
+    assert_eq!(parking.target_tick, 1707);
+    assert_eq!(profile.prerequisites, vec![parking]);
+}
+
+#[test]
+fn rf_full_sequence_goal_corridors_remain_unsigned() {
+    let profile = rf_full_sequence_profile().unwrap();
+    for (joint, motor_id) in [
+        (JointKind::Hip, 23_u8),
+        (JointKind::Upper, 22_u8),
+        (JointKind::Lower, 21_u8),
+    ] {
+        let corridor = full_joint_corridor(Leg::Rf, motor_id).unwrap();
+        assert!(corridor.contains(HOME_TICK));
+        for side in [ContactSide::Min, ContactSide::Max] {
+            let contact = build_profile(Leg::Rf, joint, side).unwrap();
+            assert!(corridor.contains(contact.guard_tick));
+            assert!(armed_goal_target_allowed(
+                &profile,
+                motor_id,
+                contact.guard_tick
+            ));
+        }
+        assert!(!armed_goal_target_allowed(&profile, motor_id, 4095));
+    }
+    assert!(armed_goal_target_allowed(&profile, 32, 1707));
+    assert!(armed_goal_target_allowed(&profile, 32, HOME_TICK));
+    assert!(!armed_goal_target_allowed(&profile, 32, 1600));
+}
+
+#[test]
+fn rf_state_machine_reuses_one_persistent_engine() {
+    let entries = MATDOG_MOTOR_IDS
+        .iter()
+        .map(|motor_id| (*motor_id, HOME_TICK))
+        .collect();
+    let mut session = LfSessionStateMachine::new_for_leg(Leg::Rf, entries).unwrap();
+    assert_eq!(session.participant_ids().unwrap(), RF_ALLOWED);
+    assert_eq!(session.parking_motor_id(), 32);
+    assert_eq!(session.joint_motor_id(JointKind::Upper), 22);
+    assert_eq!(session.joint_motor_id(JointKind::Lower), 21);
+    assert_eq!(session.joint_motor_id(JointKind::Hip), 23);
+
+    session.transition(LfSessionState::InitialRecovery).unwrap();
+    assert!(session.active_motor_allowed(21));
+    assert!(session.active_motor_allowed(22));
+    assert!(session.active_motor_allowed(23));
+    assert!(!session.active_motor_allowed(11));
+    session.transition(LfSessionState::Parking).unwrap();
+    assert!(session.active_motor_allowed(32));
+    assert!(!session.active_motor_allowed(42));
+}
+
+#[test]
+fn rf_profile_record_is_ram_only_and_never_authorizes_persistent_freeze() {
+    let contacts = DualContactResult {
+        minimum: ContactResult {
+            coarse_scout_tick: 2600,
+            first_tick: 2560,
+            second_tick: 2560,
+            spread_ticks: 0,
+            baseline: BaselineStats {
+                median_current: 10,
+                mad_current: 1,
+            },
+        },
+        maximum: ContactResult {
+            coarse_scout_tick: 1500,
+            first_tick: 1536,
+            second_tick: 1536,
+            spread_ticks: 0,
+            baseline: BaselineStats {
+                median_current: 10,
+                mad_current: 1,
+            },
+        },
+    };
+    let evidence = derive_leg_joint_evidence(
+        Leg::Rf,
+        *spec_for(Leg::Rf, JointKind::Hip),
+        contacts,
+    );
+    assert!(evidence.affine.accepted);
+    assert!(evidence.accepted);
+    let record = leg_machine_profile_record(Leg::Rf, evidence);
+    assert!(record.starts_with("MATDOG_RF_PROFILE_V1|"));
+    assert!(record.contains("motor_id=23"));
+    assert!(record.contains("persistent_freeze_authorized=false"));
+    assert!(!record.contains("EEPROM"));
+}
+
+#[test]
+fn rf_failure_contract_keeps_global_torque_off_and_isolated_hip_blocking() {
+    let writes = global_torque_off_writes();
+    assert_eq!(writes.len(), MATDOG_MOTOR_IDS.len());
+    assert!(MATDOG_MOTOR_IDS
+        .iter()
+        .all(|motor_id| writes.contains(&(*motor_id, vec![0]))));
+
+    let full = profile_for_arm_value(RF_FULL_SEQUENCE_ARM_VALUE).unwrap();
+    assert!(hardware_profile_allowed(&full).is_ok());
+    let isolated = profile_for_arm_value("RF_HIP_M23_MIN").unwrap();
+    assert!(hardware_profile_allowed(&isolated).is_err());
 }

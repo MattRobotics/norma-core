@@ -99,6 +99,7 @@ const LOWER_FOLDED_DELTA: i16 = -990;
 const CONTACT_ACCEPTANCE_INNER_TICKS: u16 = 64;
 const LF_HIP_SEQUENCE_ARM_VALUE: &str = "LF_HIP_M13_MIN_MAX";
 const LF_FULL_SEQUENCE_ARM_VALUE: &str = "LF_LEG_STATE_MACHINE";
+const RF_FULL_SEQUENCE_ARM_VALUE: &str = "RF_LEG_STATE_MACHINE";
 const ADAPTIVE_FINE_SCOUT_TICKS: u16 = 32;
 // Fine approaches use smaller increments and may settle slightly before the
 // coarse scout. A lag greater than one fine step is treated as a bounded
@@ -142,6 +143,22 @@ impl Leg {
             Self::Rf => &RF_ALLOWED,
             Self::Rh => &RH_ALLOWED,
             Self::Lh => &LH_ALLOWED,
+        }
+    }
+
+    const fn full_sequence_arm_value(self) -> Option<&'static str> {
+        match self {
+            Self::Lf => Some(LF_FULL_SEQUENCE_ARM_VALUE),
+            Self::Rf => Some(RF_FULL_SEQUENCE_ARM_VALUE),
+            Self::Rh | Self::Lh => None,
+        }
+    }
+
+    const fn parking_leg(self) -> Option<Self> {
+        match self {
+            Self::Lf => Some(Self::Lh),
+            Self::Rf => Some(Self::Rh),
+            Self::Rh | Self::Lh => None,
         }
     }
 }
@@ -481,19 +498,48 @@ fn is_lf_hip_sequence(profile: &ContactProfile) -> bool {
         && profile.motor_id == 13
 }
 
-fn lf_full_sequence_profile() -> Result<ContactProfile, String> {
-    let mut profile = build_profile(Leg::Lf, JointKind::Upper, ContactSide::Min)?;
-    profile.arm_value = LF_FULL_SEQUENCE_ARM_VALUE.to_string();
-    profile.label = LF_FULL_SEQUENCE_ARM_VALUE.to_string();
-    profile.allowed_motor_ids = &LF_ALLOWED;
-    profile.prerequisites = vec![static_target(Leg::Lh, JointKind::Upper, UPPER_30_DELTA)?];
+fn full_sequence_profile(leg: Leg) -> Result<ContactProfile, String> {
+    let arm_value = leg
+        .full_sequence_arm_value()
+        .ok_or_else(|| format!("{} full-leg calibration is not enabled", leg.label()))?;
+    let parking_leg = leg
+        .parking_leg()
+        .ok_or_else(|| format!("{} has no reviewed parking leg", leg.label()))?;
+    let mut profile = build_profile(leg, JointKind::Upper, ContactSide::Min)?;
+    profile.arm_value = arm_value.to_string();
+    profile.label = arm_value.to_string();
+    profile.allowed_motor_ids = leg.allowed_motor_ids();
+    profile.prerequisites = vec![static_target(parking_leg, JointKind::Upper, UPPER_30_DELTA)?];
     Ok(profile)
 }
 
+fn full_sequence_leg(profile: &ContactProfile) -> Option<Leg> {
+    [Leg::Lf, Leg::Rf].into_iter().find(|leg| {
+        profile.arm_value == leg.full_sequence_arm_value().unwrap_or_default()
+            && profile.leg == *leg
+            && profile.allowed_motor_ids == leg.allowed_motor_ids()
+    })
+}
+
+fn lf_full_sequence_profile() -> Result<ContactProfile, String> {
+    full_sequence_profile(Leg::Lf)
+}
+
+fn rf_full_sequence_profile() -> Result<ContactProfile, String> {
+    full_sequence_profile(Leg::Rf)
+}
+
 fn is_lf_full_sequence(profile: &ContactProfile) -> bool {
-    profile.arm_value == LF_FULL_SEQUENCE_ARM_VALUE
-        && profile.leg == Leg::Lf
-        && profile.allowed_motor_ids == &LF_ALLOWED
+    full_sequence_leg(profile) == Some(Leg::Lf)
+}
+
+#[cfg(test)]
+fn is_rf_full_sequence(profile: &ContactProfile) -> bool {
+    full_sequence_leg(profile) == Some(Leg::Rf)
+}
+
+fn is_full_sequence(profile: &ContactProfile) -> bool {
+    full_sequence_leg(profile).is_some()
 }
 
 pub(crate) fn all_profiles() -> Result<Vec<ContactProfile>, String> {
@@ -512,6 +558,9 @@ pub(crate) fn profile_for_arm_value(value: &str) -> Result<ContactProfile, Strin
     if value == LF_FULL_SEQUENCE_ARM_VALUE {
         return lf_full_sequence_profile();
     }
+    if value == RF_FULL_SEQUENCE_ARM_VALUE {
+        return rf_full_sequence_profile();
+    }
     if value == LF_HIP_SEQUENCE_ARM_VALUE {
         return lf_hip_sequence_profile(ContactSide::Min);
     }
@@ -526,6 +575,7 @@ pub(crate) fn profile_for_arm_value(value: &str) -> Result<ContactProfile, Strin
                 .collect::<Vec<_>>();
             supported.push(LF_HIP_SEQUENCE_ARM_VALUE.to_string());
             supported.push(LF_FULL_SEQUENCE_ARM_VALUE.to_string());
+            supported.push(RF_FULL_SEQUENCE_ARM_VALUE.to_string());
             format!(
                 "unsupported {MATDOG_ARM_ENV}={value:?}; expected one of: {}",
                 supported.join(", ")
@@ -536,7 +586,7 @@ pub(crate) fn profile_for_arm_value(value: &str) -> Result<ContactProfile, Strin
 fn hardware_profile_allowed(profile: &ContactProfile) -> Result<(), String> {
     if profile.joint == JointKind::Hip
         && !is_lf_hip_sequence(profile)
-        && !is_lf_full_sequence(profile)
+        && !is_full_sequence(profile)
     {
         return Err(format!("{}: {}", profile.label, HIP_HARDWARE_BLOCK_REASON));
     }
@@ -582,7 +632,9 @@ pub(crate) fn ram_write_allowed_for_profile(
         register.address() as u32 == address && register.size() as usize == value.len()
     });
 
-    let profile_participant = !is_lf_full_sequence(profile) || LF_ALLOWED.contains(&motor_id);
+    let profile_participant = full_sequence_leg(profile)
+        .map(|leg| leg.allowed_motor_ids().contains(&motor_id))
+        .unwrap_or(true);
     let startup_home_recovery_motor = MATDOG_MOTOR_IDS.contains(&motor_id);
     match register {
         // Exact global torque OFF must always remain reachable. Torque ON and
@@ -634,23 +686,21 @@ fn full_sequence_joint_goal_allowed(leg: Leg, joint: JointKind, motor_id: u8, ta
     (low..=high).contains(&target)
 }
 
-fn lf_full_sequence_goal_allowed(motor_id: u8, target: u16) -> bool {
-    if full_sequence_joint_goal_allowed(Leg::Lf, JointKind::Hip, motor_id, target)
-        || full_sequence_joint_goal_allowed(Leg::Lf, JointKind::Upper, motor_id, target)
-        || full_sequence_joint_goal_allowed(Leg::Lf, JointKind::Lower, motor_id, target)
+fn full_sequence_goal_allowed(leg: Leg, motor_id: u8, target: u16) -> bool {
+    if [JointKind::Hip, JointKind::Upper, JointKind::Lower]
+        .into_iter()
+        .any(|joint| full_sequence_joint_goal_allowed(leg, joint, motor_id, target))
     {
         return true;
     }
 
-    if motor_id == spec_for(Leg::Lh, JointKind::Upper).motor_id {
-        let Ok(parking) = static_target(Leg::Lh, JointKind::Upper, UPPER_30_DELTA) else {
+    let Some(parking_leg) = leg.parking_leg() else {
+        return false;
+    };
+    if motor_id == spec_for(parking_leg, JointKind::Upper).motor_id {
+        let Ok(parking) = static_target(parking_leg, JointKind::Upper, UPPER_30_DELTA) else {
             return false;
         };
-        // q=0 normalization accepts a settled readback within the static
-        // tolerance. prepare_motor() then primes the torque-OFF servo at that
-        // observed tick before enabling torque. Admit only that same bounded
-        // q=0 priming band; the parking target and mechanical corridor remain
-        // unchanged.
         let low = HOME_TICK
             .min(parking.target_tick)
             .saturating_sub(STATIC_TOLERANCE_TICKS);
@@ -663,15 +713,12 @@ fn lf_full_sequence_goal_allowed(motor_id: u8, target: u16) -> bool {
     false
 }
 
-fn lf_full_joint_corridor(motor_id: u8) -> Option<TickCorridor> {
-    let joint = match motor_id {
-        11 => Some(JointKind::Lower),
-        12 => Some(JointKind::Upper),
-        13 => Some(JointKind::Hip),
-        _ => None,
-    }?;
-    let minimum = build_profile(Leg::Lf, joint, ContactSide::Min).ok()?;
-    let maximum = build_profile(Leg::Lf, joint, ContactSide::Max).ok()?;
+fn full_joint_corridor(leg: Leg, motor_id: u8) -> Option<TickCorridor> {
+    let joint = [JointKind::Lower, JointKind::Upper, JointKind::Hip]
+        .into_iter()
+        .find(|joint| spec_for(leg, *joint).motor_id == motor_id)?;
+    let minimum = build_profile(leg, joint, ContactSide::Min).ok()?;
+    let maximum = build_profile(leg, joint, ContactSide::Max).ok()?;
     Some(TickCorridor {
         low: minimum.guard_tick.min(maximum.guard_tick),
         high: minimum
@@ -681,8 +728,11 @@ fn lf_full_joint_corridor(motor_id: u8) -> Option<TickCorridor> {
     })
 }
 
-fn lf_parking_corridor() -> Result<TickCorridor, String> {
-    let parking = static_target(Leg::Lh, JointKind::Upper, UPPER_30_DELTA)?;
+fn parking_corridor(leg: Leg) -> Result<TickCorridor, String> {
+    let parking_leg = leg
+        .parking_leg()
+        .ok_or_else(|| format!("{} has no reviewed parking leg", leg.label()))?;
+    let parking = static_target(parking_leg, JointKind::Upper, UPPER_30_DELTA)?;
     Ok(TickCorridor {
         low: HOME_TICK
             .min(parking.target_tick)
@@ -694,12 +744,23 @@ fn lf_parking_corridor() -> Result<TickCorridor, String> {
     })
 }
 
-fn lf_passive_corridor(state: LfSessionState, motor_id: u8) -> Result<TickCorridor, String> {
-    if motor_id == 42 {
-        return lf_parking_corridor();
+fn passive_corridor(
+    leg: Leg,
+    state: LfSessionState,
+    motor_id: u8,
+) -> Result<TickCorridor, String> {
+    let parking_leg = leg
+        .parking_leg()
+        .ok_or_else(|| format!("{} has no reviewed parking leg", leg.label()))?;
+    let parking_id = spec_for(parking_leg, JointKind::Upper).motor_id;
+    if motor_id == parking_id {
+        return parking_corridor(leg);
     }
-    if !matches!(motor_id, 11 | 12 | 13) {
-        return Err(format!("M{motor_id} is not an LF passive participant"));
+    if !leg.allowed_motor_ids().contains(&motor_id) {
+        return Err(format!(
+            "M{motor_id} is not a {} passive participant",
+            leg.label()
+        ));
     }
     if matches!(
         state,
@@ -708,8 +769,8 @@ fn lf_passive_corridor(state: LfSessionState, motor_id: u8) -> Result<TickCorrid
             | LfSessionState::Cleanup
             | LfSessionState::TorqueOff
     ) {
-        return lf_full_joint_corridor(motor_id)
-            .ok_or_else(|| format!("no full LF corridor for M{motor_id}"));
+        return full_joint_corridor(leg, motor_id)
+            .ok_or_else(|| format!("no full {} corridor for M{motor_id}", leg.label()));
     }
     Ok(TickCorridor {
         low: HOME_TICK.saturating_sub(PROBE_PASSIVE_RESTORE_DRIFT_TICKS),
@@ -719,13 +780,36 @@ fn lf_passive_corridor(state: LfSessionState, motor_id: u8) -> Result<TickCorrid
     })
 }
 
-fn lf_participant_corridor(motor_id: u8) -> Result<TickCorridor, String> {
-    if motor_id == 42 {
-        lf_parking_corridor()
+fn participant_corridor(leg: Leg, motor_id: u8) -> Result<TickCorridor, String> {
+    let parking_leg = leg
+        .parking_leg()
+        .ok_or_else(|| format!("{} has no reviewed parking leg", leg.label()))?;
+    if motor_id == spec_for(parking_leg, JointKind::Upper).motor_id {
+        parking_corridor(leg)
     } else {
-        lf_full_joint_corridor(motor_id)
-            .ok_or_else(|| format!("no commanded LF corridor for M{motor_id}"))
+        full_joint_corridor(leg, motor_id)
+            .ok_or_else(|| format!("no commanded {} corridor for M{motor_id}", leg.label()))
     }
+}
+
+fn lf_full_sequence_goal_allowed(motor_id: u8, target: u16) -> bool {
+    full_sequence_goal_allowed(Leg::Lf, motor_id, target)
+}
+
+fn lf_full_joint_corridor(motor_id: u8) -> Option<TickCorridor> {
+    full_joint_corridor(Leg::Lf, motor_id)
+}
+
+fn lf_parking_corridor() -> Result<TickCorridor, String> {
+    parking_corridor(Leg::Lf)
+}
+
+fn lf_passive_corridor(state: LfSessionState, motor_id: u8) -> Result<TickCorridor, String> {
+    passive_corridor(Leg::Lf, state, motor_id)
+}
+
+fn lf_participant_corridor(motor_id: u8) -> Result<TickCorridor, String> {
+    participant_corridor(Leg::Lf, motor_id)
 }
 
 fn armed_goal_target_allowed(profile: &ContactProfile, motor_id: u8, target: u16) -> bool {
@@ -736,8 +820,8 @@ fn armed_goal_target_allowed(profile: &ContactProfile, motor_id: u8, target: u16
     if MATDOG_MOTOR_IDS.contains(&motor_id) && target == HOME_TICK {
         return true;
     }
-    if is_lf_full_sequence(profile) {
-        return lf_full_sequence_goal_allowed(motor_id, target);
+    if let Some(leg) = full_sequence_leg(profile) {
+        return full_sequence_goal_allowed(leg, motor_id, target);
     }
     if is_lf_hip_sequence(profile) && motor_id == profile.motor_id {
         let Ok(minimum) = lf_hip_sequence_profile(ContactSide::Min) else {
@@ -1028,8 +1112,12 @@ enum LfMotorRole {
     ContactProbe { target_tick: u16 },
 }
 
+// Historical LF type names are retained so the immutable V25 regression suite
+// remains readable. The implementation is leg-data-driven and currently
+// admits LF and RF through the same state machine and safety invariants.
 #[derive(Debug, Clone)]
 struct LfSessionStateMachine {
+    leg: Leg,
     state: LfSessionState,
     active: Option<LfActiveMotor>,
     held_targets: Vec<StaticTarget>,
@@ -1042,16 +1130,25 @@ struct LfSessionStateMachine {
 
 impl LfSessionStateMachine {
     fn new(entry_positions: Vec<(u8, u16)>) -> Result<Self, String> {
+        Self::new_for_leg(Leg::Lf, entry_positions)
+    }
+
+    fn new_for_leg(leg: Leg, entry_positions: Vec<(u8, u16)>) -> Result<Self, String> {
+        if leg.full_sequence_arm_value().is_none() || leg.parking_leg().is_none() {
+            return Err(format!("{} full-leg state machine is not enabled", leg.label()));
+        }
         let ids = entry_positions
             .iter()
             .map(|(motor_id, _)| *motor_id)
             .collect::<Vec<_>>();
         if !is_exact_matdog_motor_set(&ids) {
-            return Err(
-                "LF state machine requires one entry position for every canonical ID".into(),
-            );
+            return Err(format!(
+                "{} state machine requires one entry position for every canonical ID",
+                leg.label()
+            ));
         }
         Ok(Self {
+            leg,
             state: LfSessionState::Preflight,
             active: None,
             held_targets: Vec::new(),
@@ -1061,6 +1158,27 @@ impl LfSessionStateMachine {
             affine: [None; 3],
             trace: vec![LfSessionState::Preflight],
         })
+    }
+
+    fn joint_motor_id(&self, joint: JointKind) -> u8 {
+        spec_for(self.leg, joint).motor_id
+    }
+
+    fn parking_motor_id(&self) -> Result<u8, String> {
+        let parking_leg = self
+            .leg
+            .parking_leg()
+            .ok_or_else(|| format!("{} has no reviewed parking leg", self.leg.label()))?;
+        Ok(spec_for(parking_leg, JointKind::Upper).motor_id)
+    }
+
+    fn participant_ids(&self) -> Result<[u8; 4], String> {
+        Ok([
+            self.joint_motor_id(JointKind::Lower),
+            self.joint_motor_id(JointKind::Upper),
+            self.joint_motor_id(JointKind::Hip),
+            self.parking_motor_id()?,
+        ])
     }
 
     fn transition(&mut self, next: LfSessionState) -> Result<(), String> {
@@ -1088,7 +1206,8 @@ impl LfSessionStateMachine {
             );
         if !allowed {
             return Err(format!(
-                "invalid LF state transition: {} -> {}",
+                "invalid {} state transition: {} -> {}",
+                self.leg.label(),
                 self.state.label(),
                 next.label()
             ));
@@ -1107,35 +1226,40 @@ impl LfSessionStateMachine {
     }
 
     fn validate_transition_entry(&self, next: LfSessionState) -> Result<(), String> {
-        let required_holds: &[u8] = match next {
+        let parking = self.parking_motor_id()?;
+        let upper = self.joint_motor_id(JointKind::Upper);
+        let lower = self.joint_motor_id(JointKind::Lower);
+        let hip = self.joint_motor_id(JointKind::Hip);
+        let required_holds = match next {
             LfSessionState::Preflight
             | LfSessionState::InitialRecovery
             | LfSessionState::Parking
             | LfSessionState::Cleanup
-            | LfSessionState::TorqueOff => &[],
+            | LfSessionState::TorqueOff => Vec::new(),
             LfSessionState::UpperMin
             | LfSessionState::UpperMax
-            | LfSessionState::UpperHorizontal => &[42],
+            | LfSessionState::UpperHorizontal => vec![parking],
             LfSessionState::LowerMin | LfSessionState::LowerMax | LfSessionState::LowerFolded => {
-                &[12, 42]
+                vec![upper, parking]
             }
             LfSessionState::HipMin
             | LfSessionState::HipMax
             | LfSessionState::Diagnostics
-            | LfSessionState::ReturnHip => &[11, 12, 42],
+            | LfSessionState::ReturnHip => vec![lower, upper, parking],
             LfSessionState::ReturnLowerHeld
             | LfSessionState::ReturnUpper
-            | LfSessionState::RestoreParking => &[11, 12, 13, 42],
+            | LfSessionState::RestoreParking => vec![lower, upper, hip, parking],
         };
         let observed_holds = self
             .held_targets
             .iter()
             .map(|target| target.motor_id)
             .collect::<BTreeSet<_>>();
-        let expected_holds = required_holds.iter().copied().collect::<BTreeSet<_>>();
+        let expected_holds = required_holds.into_iter().collect::<BTreeSet<_>>();
         if observed_holds != expected_holds {
             return Err(format!(
-                "LF transition {} -> {} has wrong held set: expected={expected_holds:?}, observed={observed_holds:?}",
+                "{} transition {} -> {} has wrong held set: expected={expected_holds:?}, observed={observed_holds:?}",
+                self.leg.label(),
                 self.state.label(),
                 next.label(),
             ));
@@ -1143,18 +1267,19 @@ impl LfSessionStateMachine {
 
         let required_previous_active = match (self.state, next) {
             (LfSessionState::UpperMin, LfSessionState::UpperMax)
-            | (LfSessionState::UpperMax, LfSessionState::UpperHorizontal) => Some(12),
+            | (LfSessionState::UpperMax, LfSessionState::UpperHorizontal) => Some(upper),
             (LfSessionState::LowerMin, LfSessionState::LowerMax)
-            | (LfSessionState::LowerMax, LfSessionState::LowerFolded) => Some(11),
+            | (LfSessionState::LowerMax, LfSessionState::LowerFolded) => Some(lower),
             (LfSessionState::HipMin, LfSessionState::HipMax)
             | (LfSessionState::HipMax, LfSessionState::Diagnostics)
-            | (LfSessionState::Diagnostics, LfSessionState::ReturnHip) => Some(13),
+            | (LfSessionState::Diagnostics, LfSessionState::ReturnHip) => Some(hip),
             _ => None,
         };
         if let Some(required_motor) = required_previous_active {
             if self.active.map(|active| active.motor_id) != Some(required_motor) {
                 return Err(format!(
-                    "LF transition {} -> {} requires active M{required_motor}",
+                    "{} transition {} -> {} requires active M{required_motor}",
+                    self.leg.label(),
                     self.state.label(),
                     next.label(),
                 ));
@@ -1164,21 +1289,27 @@ impl LfSessionStateMachine {
     }
 
     fn active_motor_allowed(&self, motor_id: u8) -> bool {
+        let upper = self.joint_motor_id(JointKind::Upper);
+        let lower = self.joint_motor_id(JointKind::Lower);
+        let hip = self.joint_motor_id(JointKind::Hip);
+        let parking = self.parking_motor_id().ok();
         match self.state {
-            LfSessionState::InitialRecovery => matches!(motor_id, 11 | 12 | 13),
-            LfSessionState::Parking | LfSessionState::RestoreParking => motor_id == 42,
+            LfSessionState::InitialRecovery => [lower, upper, hip].contains(&motor_id),
+            LfSessionState::Parking | LfSessionState::RestoreParking => {
+                parking == Some(motor_id)
+            }
             LfSessionState::UpperMin
             | LfSessionState::UpperMax
-            | LfSessionState::UpperHorizontal => motor_id == 12,
+            | LfSessionState::UpperHorizontal => motor_id == upper,
             LfSessionState::LowerMin | LfSessionState::LowerMax | LfSessionState::LowerFolded => {
-                motor_id == 11
+                motor_id == lower
             }
             LfSessionState::HipMin
             | LfSessionState::HipMax
             | LfSessionState::Diagnostics
-            | LfSessionState::ReturnHip => motor_id == 13,
-            LfSessionState::ReturnLowerHeld => motor_id == 11,
-            LfSessionState::ReturnUpper => motor_id == 12,
+            | LfSessionState::ReturnHip => motor_id == hip,
+            LfSessionState::ReturnLowerHeld => motor_id == lower,
+            LfSessionState::ReturnUpper => motor_id == upper,
             LfSessionState::Preflight | LfSessionState::Cleanup | LfSessionState::TorqueOff => {
                 false
             }
@@ -1193,15 +1324,18 @@ impl LfSessionStateMachine {
     ) -> Result<(), String> {
         if !self.active_motor_allowed(motor_id) {
             return Err(format!(
-                "M{motor_id} cannot be active in LF state {}",
+                "M{motor_id} cannot be active in {} state {}",
+                self.leg.label(),
                 self.state.label()
             ));
         }
-        let corridor = lf_participant_corridor(motor_id)?;
+        let corridor = participant_corridor(self.leg, motor_id)?;
         if !corridor.contains(target_tick) {
             return Err(format!(
-                "M{motor_id} target {target_tick} outside LF state corridor {}..={}",
-                corridor.low, corridor.high
+                "M{motor_id} target {target_tick} outside {} state corridor {}..={}",
+                self.leg.label(),
+                corridor.low,
+                corridor.high
             ));
         }
         self.active = Some(LfActiveMotor {
@@ -1213,11 +1347,13 @@ impl LfSessionStateMachine {
     }
 
     fn update_active_target(&mut self, motor_id: u8, target_tick: u16) -> Result<(), String> {
-        let corridor = lf_participant_corridor(motor_id)?;
+        let corridor = participant_corridor(self.leg, motor_id)?;
         if !corridor.contains(target_tick) {
             return Err(format!(
-                "M{motor_id} target {target_tick} outside LF commanded corridor {}..={}",
-                corridor.low, corridor.high
+                "M{motor_id} target {target_tick} outside {} commanded corridor {}..={}",
+                self.leg.label(),
+                corridor.low,
+                corridor.high
             ));
         }
         let active = self
@@ -1226,7 +1362,8 @@ impl LfSessionStateMachine {
             .filter(|active| active.motor_id == motor_id)
             .ok_or_else(|| {
                 format!(
-                    "M{motor_id} GoalPosition update has no matching active LF role in {}",
+                    "M{motor_id} GoalPosition update has no matching active {} role in {}",
+                    self.leg.label(),
                     self.state.label()
                 )
             })?;
@@ -1241,19 +1378,26 @@ impl LfSessionStateMachine {
     }
 
     fn hold(&mut self, target: StaticTarget) -> Result<(), String> {
-        let allowed = matches!(
-            (self.state, target.motor_id),
-            (LfSessionState::Parking, 42)
-                | (LfSessionState::UpperHorizontal, 12)
-                | (LfSessionState::LowerFolded, 11)
-                | (LfSessionState::ReturnHip, 13)
-                | (LfSessionState::ReturnLowerHeld, 11)
-                | (LfSessionState::ReturnUpper, 12)
-        );
+        let parking = self.parking_motor_id()?;
+        let upper = self.joint_motor_id(JointKind::Upper);
+        let lower = self.joint_motor_id(JointKind::Lower);
+        let hip = self.joint_motor_id(JointKind::Hip);
+        let allowed = match self.state {
+            LfSessionState::Parking => target.motor_id == parking,
+            LfSessionState::UpperHorizontal | LfSessionState::ReturnUpper => {
+                target.motor_id == upper
+            }
+            LfSessionState::LowerFolded | LfSessionState::ReturnLowerHeld => {
+                target.motor_id == lower
+            }
+            LfSessionState::ReturnHip => target.motor_id == hip,
+            _ => false,
+        };
         if !allowed {
             return Err(format!(
-                "M{} cannot be promoted to held in LF state {}",
+                "M{} cannot be promoted to held in {} state {}",
                 target.motor_id,
+                self.leg.label(),
                 self.state.label()
             ));
         }
@@ -1269,7 +1413,7 @@ impl LfSessionStateMachine {
                 target.motor_id, target.target_tick, active.motor_id, active.target_tick
             ));
         }
-        let corridor = lf_participant_corridor(target.motor_id)?;
+        let corridor = participant_corridor(self.leg, target.motor_id)?;
         if !corridor.contains(target.target_tick) {
             return Err(format!(
                 "M{} held target {} outside {}..={}",
@@ -1307,16 +1451,21 @@ impl LfSessionStateMachine {
                 target_tick: target.target_tick,
             });
         }
-        if matches!(motor_id, 11 | 12 | 13 | 42) {
+        if self.participant_ids()?.contains(&motor_id) {
             return Ok(LfMotorRole::PassiveTorqueOffSafe {
-                corridor: lf_passive_corridor(self.state, motor_id)?,
+                corridor: passive_corridor(self.leg, self.state, motor_id)?,
             });
         }
         let entry_tick = self
             .entry_positions
             .iter()
             .find_map(|(entry_id, tick)| (*entry_id == motor_id).then_some(*tick))
-            .ok_or_else(|| format!("M{motor_id} has no LF session-entry observation"))?;
+            .ok_or_else(|| {
+                format!(
+                    "M{motor_id} has no {} session-entry observation",
+                    self.leg.label()
+                )
+            })?;
         Ok(LfMotorRole::NonParticipatingTorqueOff { entry_tick })
     }
 
@@ -1375,7 +1524,8 @@ const fn lf_contact_state(joint: JointKind, side: ContactSide) -> LfSessionState
     }
 }
 
-fn validate_lf_role_observation(
+fn validate_leg_role_observation(
+    leg: Leg,
     motor_id: u8,
     observation: MotorObservation,
     role: LfMotorRole,
@@ -1385,31 +1535,36 @@ fn validate_lf_role_observation(
     let age_ns = now_ns.saturating_sub(observation.monotonic_stamp_ns);
     if observation.monotonic_stamp_ns == 0 || age_ns > max_age_ns {
         return Err(format!(
-            "M{motor_id} telemetry stale in LF role {role:?}: age_ns={age_ns}"
+            "M{motor_id} telemetry stale in {} role {role:?}: age_ns={age_ns}",
+            leg.label()
         ));
     }
     if observation.has_driver_error || observation.status != 0 {
         return Err(format!(
-            "M{motor_id} unhealthy in LF role {role:?}: status=0x{:02X}, driver_error={}",
-            observation.status, observation.has_driver_error
+            "M{motor_id} unhealthy in {} role {role:?}: status=0x{:02X}, driver_error={}",
+            leg.label(),
+            observation.status,
+            observation.has_driver_error
         ));
     }
     if observation.current >= HARD_CURRENT_ABORT_RAW {
         return Err(format!(
-            "M{motor_id} hard current in LF role {role:?}: {} >= {}",
-            observation.current, HARD_CURRENT_ABORT_RAW
+            "M{motor_id} hard current in {} role {role:?}: {} >= {}",
+            leg.label(),
+            observation.current,
+            HARD_CURRENT_ABORT_RAW
         ));
     }
     validate_matdog_temperature(motor_id, observation)
-        .map_err(|message| format!("{message} in LF role {role:?}"))?;
+        .map_err(|message| format!("{message} in {} role {role:?}", leg.label()))?;
 
     match role {
         LfMotorRole::ActivelyCommanded { target_tick }
         | LfMotorRole::ContactProbe { target_tick } => {
-            validate_lf_active_readback(motor_id, observation, target_tick)
+            validate_leg_active_readback(leg, motor_id, observation, target_tick)
         }
         LfMotorRole::ActivelyHeld { target_tick } => {
-            validate_lf_active_readback(motor_id, observation, target_tick)?;
+            validate_leg_active_readback(leg, motor_id, observation, target_tick)?;
             let error = circular_distance(observation.position, target_tick);
             if error > STATIC_TOLERANCE_TICKS {
                 return Err(format!(
@@ -1449,7 +1604,8 @@ fn validate_lf_role_observation(
     }
 }
 
-fn validate_lf_active_readback(
+fn validate_leg_active_readback(
+    leg: Leg,
     motor_id: u8,
     observation: MotorObservation,
     target_tick: u16,
@@ -1469,14 +1625,37 @@ fn validate_lf_active_readback(
             observation.goal_position
         ));
     }
-    let corridor = lf_participant_corridor(motor_id)?;
+    let corridor = participant_corridor(leg, motor_id)?;
     if !corridor.contains(observation.position) || !corridor.contains(target_tick) {
         return Err(format!(
-            "active M{motor_id} left commanded corridor: present={}, target={target_tick}, allowed={}..={}",
-            observation.position, corridor.low, corridor.high
+            "active M{motor_id} left {} commanded corridor: present={}, target={target_tick}, allowed={}..={}",
+            leg.label(),
+            observation.position,
+            corridor.low,
+            corridor.high
         ));
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+fn validate_lf_role_observation(
+    motor_id: u8,
+    observation: MotorObservation,
+    role: LfMotorRole,
+    now_ns: u64,
+) -> Result<(), String> {
+    validate_leg_role_observation(Leg::Lf, motor_id, observation, role, now_ns)
+}
+
+#[cfg(test)]
+fn validate_lf_active_readback(
+    motor_id: u8,
+    observation: MotorObservation,
+    target_tick: u16,
+) -> Result<(), String> {
+    validate_leg_active_readback(Leg::Lf, motor_id, observation, target_tick)
 }
 
 fn validate_lf_session_snapshot(
@@ -1489,7 +1668,8 @@ fn validate_lf_session_snapshot(
     let found = motor_ids_for_bus(state, bus_serial).map_err(|error| error.to_string())?;
     if !is_exact_matdog_motor_set(&found) {
         return Err(format!(
-            "LF runtime ID set changed: expected={:?}, found={found:?}",
+            "{} runtime ID set changed: expected={:?}, found={found:?}",
+            session.leg.label(),
             MATDOG_MOTOR_IDS
         ));
     }
@@ -1500,7 +1680,7 @@ fn validate_lf_session_snapshot(
         let observation = observation_from_state(state, bus_serial, motor_id)
             .map_err(|error| error.to_string())?;
         let role = session.role_for(motor_id)?;
-        validate_lf_role_observation(motor_id, observation, role, now_ns)?;
+        validate_leg_role_observation(session.leg, motor_id, observation, role, now_ns)?;
     }
     Ok(())
 }
@@ -2091,10 +2271,29 @@ fn affine_endpoint_residual_degrees(
     (measured - predicted) * 360.0 / f64::from(TICKS_PER_REVOLUTION)
 }
 
-fn derive_joint_evidence(spec: JointSpec, contacts: DualContactResult) -> JointCalibrationEvidence {
+fn contact_witness_accepted_for_leg(
+    leg: Leg,
+    joint: JointKind,
+    contacts: DualContactResult,
+) -> bool {
+    match leg {
+        Leg::Lf => lf_contact_witness_accepted(joint, contacts),
+        // The first RF run is itself the supervised hardware witness. It may
+        // stage an affine q0 in RAM, but no persistent freeze is authorized by
+        // this native measurement engine.
+        Leg::Rf => true,
+        Leg::Rh | Leg::Lh => false,
+    }
+}
+
+fn derive_leg_joint_evidence(
+    leg: Leg,
+    spec: JointSpec,
+    contacts: DualContactResult,
+) -> JointCalibrationEvidence {
     let fixed_scale = derive_model_zero(spec, contacts);
     let affine = derive_affine_joint_calibration(spec, contacts);
-    let contact_witness_accepted = lf_contact_witness_accepted(spec.kind, contacts);
+    let contact_witness_accepted = contact_witness_accepted_for_leg(leg, spec.kind, contacts);
     JointCalibrationEvidence {
         spec,
         contacts,
@@ -2102,21 +2301,27 @@ fn derive_joint_evidence(spec: JointSpec, contacts: DualContactResult) -> JointC
         affine,
         contact_witness_accepted,
         // Affine span/q0 is authoritative; fixed-scale disagreement remains a
-        // diagnostic. The uniform hardware witness rejects temporary obstacles.
+        // diagnostic. LF additionally retains its frozen supervised witness;
+        // RF produces a new supervised witness and remains RAM-only.
         accepted: affine.accepted && contact_witness_accepted,
     }
 }
 
-fn lf_machine_profile_record(evidence: JointCalibrationEvidence) -> String {
+fn derive_joint_evidence(spec: JointSpec, contacts: DualContactResult) -> JointCalibrationEvidence {
+    derive_leg_joint_evidence(Leg::Lf, spec, contacts)
+}
+
+fn leg_machine_profile_record(leg: Leg, evidence: JointCalibrationEvidence) -> String {
     let spec = evidence.spec;
     let fixed = evidence.fixed_scale;
     let affine = evidence.affine;
-    let minimum =
-        build_profile(Leg::Lf, spec.kind, ContactSide::Min).expect("validated LF MIN profile");
-    let maximum =
-        build_profile(Leg::Lf, spec.kind, ContactSide::Max).expect("validated LF MAX profile");
+    let minimum = build_profile(leg, spec.kind, ContactSide::Min)
+        .expect("validated leg MIN profile");
+    let maximum = build_profile(leg, spec.kind, ContactSide::Max)
+        .expect("validated leg MAX profile");
     format!(
-        "MATDOG_LF_PROFILE_V1|joint={}|joint_name={}|motor_id={}|direction={}|urdf_min_delta={}|urdf_max_delta={}|urdf_min_tick={}|urdf_max_tick={}|coarse_min={}|coarse_max={}|fine_min_1={}|fine_min_2={}|fine_max_1={}|fine_max_2={}|repeatability_min={}|repeatability_max={}|contact_min={}|contact_max={}|q0_fixed={}|q0_affine={}|endpoint_disagreement={}|q0_shift={}|scale_permille={}|safe_min_tick={}|safe_max_tick={}|accepted={}",
+        "MATDOG_{}_PROFILE_V1|joint={}|joint_name={}|motor_id={}|direction={}|urdf_min_delta={}|urdf_max_delta={}|urdf_min_tick={}|urdf_max_tick={}|coarse_min={}|coarse_max={}|fine_min_1={}|fine_min_2={}|fine_max_1={}|fine_max_2={}|repeatability_min={}|repeatability_max={}|contact_min={}|contact_max={}|q0_fixed={}|q0_affine={}|endpoint_disagreement={}|q0_shift={}|scale_permille={}|safe_min_tick={}|safe_max_tick={}|accepted={}|persistent_freeze_authorized=false",
+        leg.label(),
         spec.kind.label(),
         spec.name,
         spec.motor_id,
@@ -2146,7 +2351,11 @@ fn lf_machine_profile_record(evidence: JointCalibrationEvidence) -> String {
     )
 }
 
-fn joint_degree_evidence(evidence: JointCalibrationEvidence) -> String {
+fn lf_machine_profile_record(evidence: JointCalibrationEvidence) -> String {
+    leg_machine_profile_record(Leg::Lf, evidence)
+}
+
+fn leg_degree_evidence(leg: Leg, evidence: JointCalibrationEvidence) -> String {
     let spec = evidence.spec;
     let fixed = evidence.fixed_scale;
     let affine = evidence.affine;
@@ -2157,7 +2366,8 @@ fn joint_degree_evidence(evidence: JointCalibrationEvidence) -> String {
     let measured_degrees = measured_span_degrees(affine);
     let urdf_degrees = urdf_span_degrees(spec);
     format!(
-        "LF {} {} M{} | URDF MIN/MAX {:+.2}°/{:+.2}° | coarse scout MIN/MAX {}/{} tick (discarded) | fine MIN {}/{} tick, fine MAX {}/{} tick | fixed q0 MIN={} MAX={} midpoint={} correction={:+.2}° disagreement={:.2}° (limit {:.2}°) | affine {} M{} q0={} correction={:+.2}° scale={:.4} tick/° ({:+.1}% nominal) span_ticks={}/{} q0_shift={} measured_range={:.2}° URDF_range={:.2}° range_error={:+.2}° residual_MIN={:+.2}° residual_MAX={:+.2}° | Q0_DIAGNOSTIC: {} ({})",
+        "{} {} {} M{} | URDF MIN/MAX {:+.2}°/{:+.2}° | coarse scout MIN/MAX {}/{} tick (discarded) | fine MIN {}/{} tick, fine MAX {}/{} tick | fixed q0 MIN={} MAX={} midpoint={} correction={:+.2}° disagreement={:.2}° (limit {:.2}°) | affine {} M{} q0={} correction={:+.2}° scale={:.4} tick/° ({:+.1}% nominal) span_ticks={}/{} q0_shift={} measured_range={:.2}° URDF_range={:.2}° range_error={:+.2}° residual_MIN={:+.2}° residual_MAX={:+.2}° | Q0_DIAGNOSTIC: {} ({})",
+        leg.label(),
         spec.kind.label(),
         fixed.joint_name,
         fixed.motor_id,
@@ -2191,15 +2401,21 @@ fn joint_degree_evidence(evidence: JointCalibrationEvidence) -> String {
         affine_endpoint_residual_degrees(affine, spec, ContactSide::Max),
         if evidence.accepted { "ACCEPT" } else { "REJECT" },
         if !evidence.contact_witness_accepted {
-            "contact differs from the supervised LF hardware witness"
+            "contact witness gate rejected"
         } else if !affine.accepted {
             "affine span/q0 gate is outside its global reference band"
         } else if !fixed.accepted {
             "affine gate accepted; fixed-scale disagreement retained as diagnostic"
+        } else if leg == Leg::Rf {
+            "first supervised RF witness accepted for RAM staging; persistent freeze remains blocked"
         } else {
             "fine contacts agree with hardware witness, fixed scale and affine checks"
         },
     )
+}
+
+fn joint_degree_evidence(evidence: JointCalibrationEvidence) -> String {
+    leg_degree_evidence(Leg::Lf, evidence)
 }
 
 fn circular_midpoint_tick(first: u16, second: u16) -> u16 {
@@ -2323,8 +2539,8 @@ pub async fn auto_calibrate(
     let comm_for_cleanup = comm.clone();
 
     tokio::spawn(async move {
-        let result = if is_lf_full_sequence(&profile) {
-            run_lf_full_calibration(
+        let result = if is_full_sequence(&profile) {
+            run_leg_full_calibration(
                 profile,
                 serial_for_task,
                 found_motors,
@@ -2506,7 +2722,7 @@ async fn run_lf_hip_min_max(
     }
 }
 
-async fn run_lf_full_calibration(
+async fn run_leg_full_calibration(
     sentinel: ContactProfile,
     target_bus_serial: String,
     found_motors: Vec<u8>,
@@ -2515,11 +2731,13 @@ async fn run_lf_full_calibration(
     stop_requested: Arc<AtomicBool>,
 ) -> Result<(), DynError> {
     if !is_exact_matdog_motor_set(&found_motors) {
-        return Err("MATDOG exact motor set changed before LF native calibration".into());
+        return Err("MATDOG exact motor set changed before native leg calibration".into());
     }
-    if !is_lf_full_sequence(&sentinel) {
-        return Err("LF native calibration did not receive its exact arm sentinel".into());
-    }
+    let leg = full_sequence_leg(&sentinel)
+        .ok_or("native leg calibration did not receive an enabled full-sequence sentinel")?;
+    let hip_id = spec_for(leg, JointKind::Hip).motor_id;
+    let upper_id = spec_for(leg, JointKind::Upper).motor_id;
+    let lower_id = spec_for(leg, JointKind::Lower).motor_id;
 
     let mut calibrator = MatdogRamOnlyCalibrator::new(
         sentinel,
@@ -2531,7 +2749,7 @@ async fn run_lf_full_calibration(
     calibrator.total_steps = 58;
     calibrator.publish_progress(
         0,
-        "single-session LF native calibration preflight",
+        &format!("single-session {} native calibration preflight", leg.label()),
         CalibrationStatus::InProgress,
         None,
     );
@@ -2549,25 +2767,37 @@ async fn run_lf_full_calibration(
             match cleanup {
                 Ok(()) => {
                     for evidence in outcome.joints {
-                        info!("MATDOG LF EVIDENCE: {}", joint_degree_evidence(evidence));
-                        info!("{}", lf_machine_profile_record(evidence));
+                        info!(
+                            "MATDOG {} EVIDENCE: {}",
+                            leg.label(),
+                            leg_degree_evidence(leg, evidence)
+                        );
+                        info!("{}", leg_machine_profile_record(leg, evidence));
                     }
                     info!(
-                        "MATDOG {} measurement complete: M13_q0_fixed={}, M12_q0_fixed={}, M11_q0_fixed={}, M13_q0_affine={}, M12_q0_affine={}, M11_q0_affine={}, status=LF_STAGED, movement_RAM_only=true, EEPROM_written=false",
-                        LF_FULL_SEQUENCE_ARM_VALUE,
+                        "MATDOG {} measurement complete: M{}_q0_fixed={}, M{}_q0_fixed={}, M{}_q0_fixed={}, M{}_q0_affine={}, M{}_q0_affine={}, M{}_q0_affine={}, status={}_STAGED, movement_RAM_only=true, EEPROM_written=false, persistent_freeze_authorized=false",
+                        leg.full_sequence_arm_value().unwrap_or_default(),
+                        hip_id,
                         outcome.joints[0].fixed_scale.estimated_zero_tick,
+                        upper_id,
                         outcome.joints[1].fixed_scale.estimated_zero_tick,
+                        lower_id,
                         outcome.joints[2].fixed_scale.estimated_zero_tick,
+                        hip_id,
                         outcome.joints[0].affine.estimated_zero_tick,
+                        upper_id,
                         outcome.joints[1].affine.estimated_zero_tick,
+                        lower_id,
                         outcome.joints[2].affine.estimated_zero_tick,
+                        leg.label(),
                     );
                     calibrator.mark_done();
                     Ok(())
                 }
                 Err(cleanup_err) => {
                     let message = format!(
-                        "LF native calibration completed but final torque-OFF failed: {cleanup_err}"
+                        "{} native calibration completed but final torque-OFF failed: {cleanup_err}",
+                        leg.label()
                     );
                     calibrator.mark_failed(&message);
                     Err(message.into())
@@ -2847,28 +3077,44 @@ impl MatdogRamOnlyCalibrator {
         })
     }
 
+    // Historical method name retained to preserve LF V25 regression tests.
+    // The implementation is data-driven for the armed LF or RF leg.
     async fn run_lf_state_machine(&mut self) -> Result<LfCalibrationOutcome, DynError> {
+        let leg = full_sequence_leg(&self.profile)
+            .ok_or("persistent state machine requires LF or RF full-sequence arming")?;
+        let parking_leg = leg
+            .parking_leg()
+            .ok_or("armed leg has no reviewed rear parking geometry")?;
+        let hip_id = spec_for(leg, JointKind::Hip).motor_id;
+        let upper_id = spec_for(leg, JointKind::Upper).motor_id;
+        let lower_id = spec_for(leg, JointKind::Lower).motor_id;
+        let parking_id = spec_for(parking_leg, JointKind::Upper).motor_id;
+
         self.next_phase("Verify exact MATDOG ID set once")?;
         self.wait_for_exact_motor_set().await?;
-
         self.next_phase("Verified global torque OFF once at session entry")?;
         self.global_torque_off_verified().await?;
-
         self.next_phase("Normalize every displaced MATDOG joint to q=0 with one uniform rule")?;
         self.normalize_all_matdog_joints_to_q0().await?;
 
-        self.next_phase("Create LF state machine from verified q=0 session entry")?;
+        self.next_phase(&format!(
+            "Create {} state machine from verified q=0 session entry",
+            leg.label()
+        ))?;
         self.inspect_lf_native_session_entry()?;
         self.transition_lf_state(LfSessionState::InitialRecovery)?;
         self.verify_lf_session_others_except(0)?;
 
         self.transition_lf_state(LfSessionState::Parking)?;
-        self.next_phase("Park LH upper M42 once for the complete LF session")?;
-        let rear_parking = static_target(Leg::Lh, JointKind::Upper, UPPER_30_DELTA)
+        self.next_phase(&format!(
+            "Park {} upper M{} once for complete {} session",
+            parking_leg.label(), parking_id, leg.label()
+        ))?;
+        let rear_parking = static_target(parking_leg, JointKind::Upper, UPPER_30_DELTA)
             .map_err(|message| -> DynError { message.into() })?;
-        self.prepare_motor(rear_parking.motor_id).await?;
+        self.prepare_motor(parking_id).await?;
         self.move_lf_session_motor_to(
-            rear_parking.motor_id,
+            parking_id,
             rear_parking.target_tick,
             STATIC_TOLERANCE_TICKS,
         )
@@ -2876,66 +3122,69 @@ impl MatdogRamOnlyCalibrator {
         self.upsert_held_target(rear_parking)?;
 
         self.transition_lf_state(LfSessionState::UpperMin)?;
-        self.next_phase("Prepare LF UPPER M12 once")?;
-        if !self.latest_observation(12)?.torque_enabled {
-            self.prepare_motor(12).await?;
+        self.next_phase(&format!("Prepare {} UPPER M{} once", leg.label(), upper_id))?;
+        if !self.latest_observation(upper_id)?.torque_enabled {
+            self.prepare_motor(upper_id).await?;
         }
         let upper_contacts = self
             .measure_lf_joint_pair_efficient(
-                build_profile(Leg::Lf, JointKind::Upper, ContactSide::Min)
+                build_profile(leg, JointKind::Upper, ContactSide::Min)
                     .map_err(|message| -> DynError { message.into() })?,
-                build_profile(Leg::Lf, JointKind::Upper, ContactSide::Max)
+                build_profile(leg, JointKind::Upper, ContactSide::Max)
                     .map_err(|message| -> DynError { message.into() })?,
             )
             .await?;
         self.record_lf_contacts(JointKind::Upper, upper_contacts)?;
 
         self.transition_lf_state(LfSessionState::UpperHorizontal)?;
-        self.next_phase("Transition M12 directly from MAX contact to horizontal hold")?;
-        self.profile = build_profile(Leg::Lf, JointKind::Lower, ContactSide::Min)
+        self.next_phase(&format!(
+            "Transition M{} directly from MAX contact to horizontal hold",
+            upper_id
+        ))?;
+        self.profile = build_profile(leg, JointKind::Lower, ContactSide::Min)
+            .map_err(|message| -> DynError { message.into() })?;
+        let upper_horizontal = static_target(leg, JointKind::Upper, UPPER_90_DELTA)
             .map_err(|message| -> DynError { message.into() })?;
         self.move_motor_to(
-            12,
-            static_target(Leg::Lf, JointKind::Upper, UPPER_90_DELTA)
-                .map_err(|message| -> DynError { message.into() })?
-                .target_tick,
+            upper_id,
+            upper_horizontal.target_tick,
             STATIC_TOLERANCE_TICKS,
         )
         .await?;
-        self.upsert_held_target(
-            static_target(Leg::Lf, JointKind::Upper, UPPER_90_DELTA)
-                .map_err(|message| -> DynError { message.into() })?,
-        )?;
+        self.upsert_held_target(upper_horizontal)?;
 
         self.transition_lf_state(LfSessionState::LowerMin)?;
-        self.next_phase("Prepare LF LOWER M11 once")?;
-        self.prepare_motor(11).await?;
+        self.next_phase(&format!("Prepare {} LOWER M{} once", leg.label(), lower_id))?;
+        self.prepare_motor(lower_id).await?;
         let lower_contacts = self
             .measure_lf_joint_pair_efficient(
-                build_profile(Leg::Lf, JointKind::Lower, ContactSide::Min)
+                build_profile(leg, JointKind::Lower, ContactSide::Min)
                     .map_err(|message| -> DynError { message.into() })?,
-                build_profile(Leg::Lf, JointKind::Lower, ContactSide::Max)
+                build_profile(leg, JointKind::Lower, ContactSide::Max)
                     .map_err(|message| -> DynError { message.into() })?,
             )
             .await?;
         self.record_lf_contacts(JointKind::Lower, lower_contacts)?;
 
         self.transition_lf_state(LfSessionState::LowerFolded)?;
-        self.next_phase("Transition M11 directly from MAX contact to HIP parallel hold")?;
-        let folded = static_target(Leg::Lf, JointKind::Lower, LOWER_FOLDED_DELTA)
+        self.next_phase(&format!(
+            "Transition M{} directly from MAX contact to HIP parallel hold",
+            lower_id
+        ))?;
+        let folded = static_target(leg, JointKind::Lower, LOWER_FOLDED_DELTA)
             .map_err(|message| -> DynError { message.into() })?;
-        self.move_motor_to(11, folded.target_tick, STATIC_TOLERANCE_TICKS)
+        self.move_motor_to(lower_id, folded.target_tick, STATIC_TOLERANCE_TICKS)
             .await?;
         self.upsert_held_target(folded)?;
 
         self.transition_lf_state(LfSessionState::HipMin)?;
-        self.next_phase("Prepare LF HIP M13 once")?;
-        self.prepare_motor(13).await?;
+        self.next_phase(&format!("Prepare {} HIP M{} once", leg.label(), hip_id))?;
+        self.prepare_motor(hip_id).await?;
         let hip_contacts = self
             .measure_lf_joint_pair_efficient(
-                lf_hip_sequence_profile(ContactSide::Min)
+                build_profile(leg, JointKind::Hip, ContactSide::Min)
                     .map_err(|message| -> DynError { message.into() })?,
-                lf_hip_sequence_profile(ContactSide::Max)
+                build_profile(leg, JointKind::Hip, ContactSide::Max)
                     .map_err(|message| -> DynError { message.into() })?,
             )
             .await?;
@@ -2943,39 +3192,69 @@ impl MatdogRamOnlyCalibrator {
 
         self.transition_lf_state(LfSessionState::Diagnostics)?;
         self.next_phase("Derive endpoint and affine q0 diagnostics from all fine contacts")?;
-        let hip = derive_joint_evidence(*spec_for(Leg::Lf, JointKind::Hip), hip_contacts);
-        let upper = derive_joint_evidence(*spec_for(Leg::Lf, JointKind::Upper), upper_contacts);
-        let lower = derive_joint_evidence(*spec_for(Leg::Lf, JointKind::Lower), lower_contacts);
+        let hip = derive_leg_joint_evidence(leg, *spec_for(leg, JointKind::Hip), hip_contacts);
+        let upper =
+            derive_leg_joint_evidence(leg, *spec_for(leg, JointKind::Upper), upper_contacts);
+        let lower =
+            derive_leg_joint_evidence(leg, *spec_for(leg, JointKind::Lower), lower_contacts);
         let outcome = LfCalibrationOutcome {
             joints: [hip, upper, lower],
         };
         for evidence in outcome.joints {
             self.record_lf_diagnostics(evidence.spec.kind, evidence.fixed_scale, evidence.affine)?;
-            info!("MATDOG LF EVIDENCE: {}", joint_degree_evidence(evidence));
+            info!(
+                "MATDOG {} EVIDENCE: {}",
+                leg.label(),
+                leg_degree_evidence(leg, evidence)
+            );
         }
         let session = self
             .lf_session
             .as_ref()
-            .ok_or("LF diagnostics lost their persistent session")?;
+            .ok_or("leg diagnostics lost their persistent session")?;
         if !session.has_complete_evidence() {
-            return Err("LF diagnostics incomplete after six accepted fine pairs".into());
+            return Err(format!(
+                "{} diagnostics incomplete after six accepted fine pairs",
+                leg.label()
+            )
+            .into());
         }
-        info!("MATDOG LF TRACE: {}", session.trace_summary());
+        info!(
+            "MATDOG {} TRACE: {}",
+            leg.label(),
+            session.trace_summary()
+        );
         for evidence in outcome.joints {
-            let (minimum, maximum) =
-                lf_contact_witness_deviations(evidence.spec.kind, evidence.contacts);
-            info!(
-                "MATDOG LF CONTACT WITNESS: {} M{} min_deviation={} max_deviation={} tolerance={} accepted={}",
-                evidence.spec.kind.label(),
-                evidence.spec.motor_id,
-                minimum,
-                maximum,
-                LF_CONTACT_WITNESS_TOLERANCE_TICKS,
-                evidence.contact_witness_accepted,
-            );
+            if leg == Leg::Lf {
+                let (minimum, maximum) =
+                    lf_contact_witness_deviations(evidence.spec.kind, evidence.contacts);
+                info!(
+                    "MATDOG LF CONTACT WITNESS: {} M{} min_deviation={} max_deviation={} tolerance={} accepted={}",
+                    evidence.spec.kind.label(),
+                    evidence.spec.motor_id,
+                    minimum,
+                    maximum,
+                    LF_CONTACT_WITNESS_TOLERANCE_TICKS,
+                    evidence.contact_witness_accepted,
+                );
+            } else {
+                info!(
+                    "MATDOG RF SUPERVISED WITNESS CANDIDATE: {} M{} MIN={}/{} MAX={}/{} repeatability={}/{} affine_accepted={} persistent_freeze_authorized=false",
+                    evidence.spec.kind.label(),
+                    evidence.spec.motor_id,
+                    evidence.contacts.minimum.first_tick,
+                    evidence.contacts.minimum.second_tick,
+                    evidence.contacts.maximum.first_tick,
+                    evidence.contacts.maximum.second_tick,
+                    evidence.contacts.minimum.spread_ticks,
+                    evidence.contacts.maximum.spread_ticks,
+                    evidence.affine.accepted,
+                );
+            }
             if !evidence.fixed_scale.accepted {
                 info!(
-                    "MATDOG LF FIXED-SCALE DIAGNOSTIC WARNING: {} M{} endpoint_disagreement={} limit={}; affine_q0={} scale_permille={}",
+                    "MATDOG {} FIXED-SCALE DIAGNOSTIC WARNING: {} M{} endpoint_disagreement={} limit={}; affine_q0={} scale_permille={}",
+                    leg.label(),
                     evidence.spec.kind.label(),
                     evidence.spec.motor_id,
                     evidence.fixed_scale.endpoint_disagreement_ticks,
@@ -3002,57 +3281,75 @@ impl MatdogRamOnlyCalibrator {
             .collect::<Vec<_>>();
         if !diagnostic_rejections.is_empty() {
             return Err(format!(
-                "MATDOG LF affine+witness freeze gate rejected before EEPROM staging: {}; contact witness tolerance={} ticks; affine scale reference={}..={} permille; fixed-scale endpoint consistency limit={} ticks is diagnostic only",
+                "MATDOG {} affine/URDF RAM-stage gate rejected: {}; affine scale reference={}..={} permille; fixed-scale endpoint consistency limit={} ticks is diagnostic only",
+                leg.label(),
                 diagnostic_rejections.join("; "),
-                LF_CONTACT_WITNESS_TOLERANCE_TICKS,
                 AFFINE_SCALE_MIN_PERMILLE,
                 AFFINE_SCALE_MAX_PERMILLE,
                 MODEL_ZERO_ENDPOINT_CONSISTENCY_TICKS,
             )
             .into());
         }
-        info!(
-            "MATDOG LF URDF FREEZE GATE: PASS; all three joints accepted by uniform contact-witness and affine span/q0 gates; fixed-scale disagreement retained as diagnostic"
-        );
+        if leg == Leg::Lf {
+            info!(
+                "MATDOG LF URDF FREEZE GATE: PASS; all three joints accepted; EEPROM freeze remains a separate transactional post-measurement phase"
+            );
+        } else {
+            info!(
+                "MATDOG RF URDF RAM-STAGE GATE: PASS; all three joints accepted; EEPROM and persistent freeze remain blocked"
+            );
+        }
 
         self.transition_lf_state(LfSessionState::ReturnHip)?;
-        self.next_phase("Move LF HIP M13 from MAX contact to URDF-derived staged q=0")?;
-        self.profile =
-            lf_full_sequence_profile().map_err(|message| -> DynError { message.into() })?;
+        self.next_phase(&format!(
+            "Move {} HIP M{} from MAX contact to URDF-derived staged q=0",
+            leg.label(), hip_id
+        ))?;
+        self.profile = full_sequence_profile(leg)
+            .map_err(|message| -> DynError { message.into() })?;
         let hip_staged_q0 = outcome.joints[0].affine.estimated_zero_tick;
-        self.move_motor_to(13, hip_staged_q0, STATIC_TOLERANCE_TICKS)
+        self.move_motor_to(hip_id, hip_staged_q0, STATIC_TOLERANCE_TICKS)
             .await?;
         self.upsert_held_target(StaticTarget {
-            motor_id: 13,
+            motor_id: hip_id,
             target_tick: hip_staged_q0,
         })?;
 
         self.transition_lf_state(LfSessionState::ReturnLowerHeld)?;
-        self.next_phase("Move LF LOWER M11 to URDF-derived staged q=0 and hold")?;
-        self.remove_held_target(11);
+        self.next_phase(&format!(
+            "Move {} LOWER M{} to URDF-derived staged q=0 and hold",
+            leg.label(), lower_id
+        ))?;
+        self.remove_held_target(lower_id);
         let lower_staged_q0 = outcome.joints[2].affine.estimated_zero_tick;
-        self.move_motor_to(11, lower_staged_q0, STATIC_TOLERANCE_TICKS)
+        self.move_motor_to(lower_id, lower_staged_q0, STATIC_TOLERANCE_TICKS)
             .await?;
         self.upsert_held_target(StaticTarget {
-            motor_id: 11,
+            motor_id: lower_id,
             target_tick: lower_staged_q0,
         })?;
 
         self.transition_lf_state(LfSessionState::ReturnUpper)?;
-        self.next_phase("Move LF UPPER M12 to URDF-derived staged q=0 while M11 holds")?;
-        self.remove_held_target(12);
+        self.next_phase(&format!(
+            "Move {} UPPER M{} to URDF-derived staged q=0 while M{} holds",
+            leg.label(), upper_id, lower_id
+        ))?;
+        self.remove_held_target(upper_id);
         let upper_staged_q0 = outcome.joints[1].affine.estimated_zero_tick;
-        self.move_motor_to(12, upper_staged_q0, STATIC_TOLERANCE_TICKS)
+        self.move_motor_to(upper_id, upper_staged_q0, STATIC_TOLERANCE_TICKS)
             .await?;
         self.upsert_held_target(StaticTarget {
-            motor_id: 12,
+            motor_id: upper_id,
             target_tick: upper_staged_q0,
         })?;
 
         self.transition_lf_state(LfSessionState::RestoreParking)?;
-        self.next_phase("Restore LH upper M42 once at end of LF calibration")?;
-        self.remove_held_target(42);
-        self.move_motor_to(42, HOME_TICK, STATIC_TOLERANCE_TICKS)
+        self.next_phase(&format!(
+            "Restore {} upper M{} once at end of {} calibration",
+            parking_leg.label(), parking_id, leg.label()
+        ))?;
+        self.remove_held_target(parking_id);
+        self.move_motor_to(parking_id, HOME_TICK, STATIC_TOLERANCE_TICKS)
             .await?;
 
         self.next_phase("Final verified global torque OFF")?;
@@ -3067,7 +3364,7 @@ impl MatdogRamOnlyCalibrator {
             entry_positions.push((motor_id, observation.position));
         }
         self.lf_session = Some(
-            LfSessionStateMachine::new(entry_positions)
+            LfSessionStateMachine::new_for_leg(self.profile.leg, entry_positions)
                 .map_err(|message| -> DynError { message.into() })?,
         );
         self.verify_lf_session_others_except(0)
@@ -3081,7 +3378,8 @@ impl MatdogRamOnlyCalibrator {
         session
             .transition(next)
             .map_err(|message| -> DynError { message.into() })?;
-        info!("MATDOG LF STATE: {}", next.label());
+        let leg = self.lf_session.as_ref().map(|session| session.leg).unwrap_or(self.profile.leg);
+        info!("MATDOG {} STATE: {}", leg.label(), next.label());
         Ok(())
     }
 
@@ -4696,7 +4994,7 @@ impl MatdogRamOnlyCalibrator {
                     LfMotorRole::ActivelyCommanded { target_tick }
                     | LfMotorRole::ContactProbe { target_tick }
                     | LfMotorRole::ActivelyHeld { target_tick } => {
-                        validate_lf_active_readback(motor_id, observation, target_tick)
+                        validate_leg_active_readback(session.leg, motor_id, observation, target_tick)
                             .map_err(|message| -> DynError { message.into() })?;
                     }
                     LfMotorRole::PassiveTorqueOffSafe { .. }

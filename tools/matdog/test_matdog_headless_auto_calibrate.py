@@ -460,5 +460,34 @@ class ShutdownTests(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class RfProfileContractTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        runner.configure_leg("LF")
+
+    def test_rf_profile_selects_only_rf_and_rh_parking_motors(self) -> None:
+        runner.configure_leg("RF")
+        self.assertEqual(runner.ACTIVE_LEG, "RF")
+        self.assertEqual(
+            runner.CONTROLLED_MOTOR_IDS,
+            frozenset((21, 22, 23, 32)),
+        )
+        self.assertEqual(runner.EVIDENCE_MOTOR_ID, 21)
+        self.assertEqual(runner.FULL_PROFILE_PREFIX, "RF_LEG_STATE_MACHINE:")
+        self.assertEqual(
+            runner.FULL_COMPLETED_PHASE,
+            "RF_LEG_STATE_MACHINE: completed",
+        )
+        self.assertEqual(runner.CONTROLLED_GOAL_CORRIDORS[21], (937, 2539))
+        self.assertEqual(runner.CONTROLLED_GOAL_CORRIDORS[22], (590, 2709))
+        self.assertEqual(runner.CONTROLLED_GOAL_CORRIDORS[23], (1472, 2624))
+        self.assertEqual(runner.CONTROLLED_GOAL_CORRIDORS[32], (1697, 2048))
+        self.assertNotIn(11, runner.CONTROLLED_MOTOR_IDS)
+        self.assertIn(11, runner.NONPARTICIPATING_MOTOR_IDS)
+
+    def test_unsupported_leg_fails_closed(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "unsupported MATDOG leg"):
+            runner.configure_leg("RH")
+
+
 if __name__ == "__main__":
     unittest.main()

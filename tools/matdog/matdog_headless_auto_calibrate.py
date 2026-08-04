@@ -63,8 +63,46 @@ EXPECTED_MOTOR_IDS = (
     42,
     43,
 )
-CONTROLLED_MOTOR_IDS = frozenset((11, 12, 13, 42))
+PROFILE_CONFIGS = {
+    "LF": {
+        "arm_value": "LF_LEG_STATE_MACHINE",
+        "controlled_motor_ids": frozenset((11, 12, 13, 42)),
+        "position_corridors": {
+            11: (1557, 3159),
+            12: (1387, 3506),
+            13: (1472, 2624),
+            42: (2016, 2421),
+        },
+        "goal_corridors": {
+            11: (1557, 3159),
+            12: (1387, 3506),
+            13: (1472, 2624),
+            42: (2048, 2389),
+        },
+        "evidence_motor_id": 11,
+    },
+    "RF": {
+        "arm_value": "RF_LEG_STATE_MACHINE",
+        "controlled_motor_ids": frozenset((21, 22, 23, 32)),
+        "position_corridors": {
+            21: (937, 2539),
+            22: (590, 2709),
+            23: (1472, 2624),
+            32: (1675, 2080),
+        },
+        "goal_corridors": {
+            21: (937, 2539),
+            22: (590, 2709),
+            23: (1472, 2624),
+            32: (1697, 2048),
+        },
+        "evidence_motor_id": 21,
+    },
+}
+ACTIVE_LEG = "LF"
+CONTROLLED_MOTOR_IDS = PROFILE_CONFIGS[ACTIVE_LEG]["controlled_motor_ids"]
 NONPARTICIPATING_MOTOR_IDS = frozenset(EXPECTED_MOTOR_IDS) - CONTROLLED_MOTOR_IDS
+EVIDENCE_MOTOR_ID = PROFILE_CONFIGS[ACTIVE_LEG]["evidence_motor_id"]
 
 # ST3215 memory image offsets.  Reading the image published by Station is
 # passive; this runner never asks the bus to write any of these registers.
@@ -94,24 +132,15 @@ EXPECTED_STATION_SHA256 = (
     "29aba7a67bd0d3a80bdf77d293576704a8f61d006c3ba858699f23bb20cc26df"
 )
 EXPECTED_ACTIVE_TORQUE_LIMIT = 500
-CONTROLLED_POSITION_CORRIDORS = {
-    11: (1557, 3159),
-    12: (1387, 3506),
-    13: (1472, 2624),
-    42: (2016, 2421),
-}
-CONTROLLED_GOAL_CORRIDORS = {
-    11: (1557, 3159),
-    12: (1387, 3506),
-    13: (1472, 2624),
-    42: (2048, 2389),
-}
+CONTROLLED_POSITION_CORRIDORS = PROFILE_CONFIGS[ACTIVE_LEG]["position_corridors"]
+CONTROLLED_GOAL_CORRIDORS = PROFILE_CONFIGS[ACTIVE_LEG]["goal_corridors"]
+
 
 EXPECTED_START_BODY_HEX = "0a0a354231343131343935338a01020801"
 EXPECTED_STOP_BODY_HEX = "0a0a354231343131343935339201020801"
 EXPECTED_FULL_TOTAL_STEPS = 58
-FULL_PROFILE_PREFIX = "LF_LEG_STATE_MACHINE:"
-FULL_COMPLETED_PHASE = "LF_LEG_STATE_MACHINE: completed"
+FULL_PROFILE_PREFIX = f"{PROFILE_CONFIGS[ACTIVE_LEG]['arm_value']}:"
+FULL_COMPLETED_PHASE = f"{PROFILE_CONFIGS[ACTIVE_LEG]['arm_value']}: completed"
 
 TERMINAL_STATUSES = frozenset(
     (
@@ -120,6 +149,34 @@ TERMINAL_STATUSES = frozenset(
         st3215.AutoCalibrationState_Status.STOPPED,
     )
 )
+
+
+def configure_leg(leg: str) -> None:
+    """Select the reviewed LF regression or RF hardware-measurement contract."""
+
+    global ACTIVE_LEG
+    global CONTROLLED_MOTOR_IDS
+    global NONPARTICIPATING_MOTOR_IDS
+    global CONTROLLED_POSITION_CORRIDORS
+    global CONTROLLED_GOAL_CORRIDORS
+    global EVIDENCE_MOTOR_ID
+    global FULL_PROFILE_PREFIX
+    global FULL_COMPLETED_PHASE
+
+    leg = leg.upper()
+    if leg not in PROFILE_CONFIGS:
+        raise RunnerError(f"unsupported MATDOG leg profile: {leg}")
+    profile = PROFILE_CONFIGS[leg]
+    ACTIVE_LEG = leg
+    CONTROLLED_MOTOR_IDS = profile["controlled_motor_ids"]
+    NONPARTICIPATING_MOTOR_IDS = (
+        frozenset(EXPECTED_MOTOR_IDS) - CONTROLLED_MOTOR_IDS
+    )
+    CONTROLLED_POSITION_CORRIDORS = profile["position_corridors"]
+    CONTROLLED_GOAL_CORRIDORS = profile["goal_corridors"]
+    EVIDENCE_MOTOR_ID = profile["evidence_motor_id"]
+    FULL_PROFILE_PREFIX = f"{profile['arm_value']}:"
+    FULL_COMPLETED_PHASE = f"{profile['arm_value']}: completed"
 
 
 
@@ -472,7 +529,7 @@ class ThermalSeriesRecorder:
                 sample.temperature_c,
             )
             self.histograms[motor_id][sample.temperature_c] += 1
-            if motor_id == 11:
+            if motor_id == EVIDENCE_MOTOR_ID:
                 phase_changed = phase != self.m11_last_phase
                 period_elapsed = (
                     sample.monotonic_stamp_ns - self.m11_last_recorded_stamp_ns
@@ -501,6 +558,8 @@ class ThermalSeriesRecorder:
                 }
                 for motor_id in EXPECTED_MOTOR_IDS
             },
+            "focus_motor_id": EVIDENCE_MOTOR_ID,
+            "focus_complete_samples": len(self.m11_records),
             "m11_complete_samples": len(self.m11_records),
             "thermal_anomalies": self.anomalies,
         }
@@ -1879,7 +1938,7 @@ class HeadlessRun:
             and not self.evidence.io_errors
         )
         return {
-            "schema": "matdog.lf.headless_auto_calibrate.v1",
+            "schema": f"matdog.{ACTIVE_LEG.lower()}.headless_auto_calibrate.v1",
             "generated_at_utc": utc_now(),
             "result": "PASS" if passed else "FAIL",
             "server": self.args.server,
@@ -2057,10 +2116,12 @@ async def main_async(args: argparse.Namespace) -> int:
                 if recovery_message not in run.faults:
                     run.faults.append(recovery_message)
         report = {
-            "schema": "matdog.lf.headless_auto_calibrate.v1",
+            "schema": f"matdog.{ACTIVE_LEG.lower()}.headless_auto_calibrate.v1",
             "generated_at_utc": utc_now(),
             "result": "FAIL",
             "server": args.server,
+            "leg": ACTIVE_LEG,
+            "arm_value": PROFILE_CONFIGS[ACTIVE_LEG]["arm_value"],
             "bus_serial": args.bus_serial,
             "expected_motor_ids": EXPECTED_MOTOR_IDS,
             "start_attempted": run.start_attempted,
@@ -2142,8 +2203,9 @@ async def main_async(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run and prove the one-shot MATDOG LF native calibrator"
+        description="Run and prove the one-shot MATDOG LF/RF native calibrator"
     )
+    parser.add_argument("--leg", choices=sorted(PROFILE_CONFIGS), default="LF")
     parser.add_argument("--server", default="127.0.0.1:8888")
     parser.add_argument("--bus-serial", default=EXPECTED_BUS_SERIAL)
     parser.add_argument("--preflight-frames", type=int, default=10)
@@ -2160,6 +2222,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+    configure_leg(args.leg)
     if args.self_test:
         return args
     if args.output_dir is None:
@@ -2168,11 +2231,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("--station-pid must identify the single live Station process")
     if args.bus_serial != EXPECTED_BUS_SERIAL:
         parser.error(f"--bus-serial must be exactly {EXPECTED_BUS_SERIAL}")
-    if args.expected_station_sha256 != EXPECTED_STATION_SHA256:
+    if ACTIVE_LEG == "LF" and args.expected_station_sha256 != EXPECTED_STATION_SHA256:
         parser.error(
-            "--expected-station-sha256 must be exactly "
+            "LF --expected-station-sha256 must be exactly "
             f"{EXPECTED_STATION_SHA256}"
         )
+    if ACTIVE_LEG == "RF":
+        value = args.expected_station_sha256.lower()
+        if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+            parser.error("RF --expected-station-sha256 must be an exact 64-character SHA-256")
     if args.preflight_frames < 10:
         parser.error("--preflight-frames must be at least 10")
     if args.preflight_seconds < 1.0:
