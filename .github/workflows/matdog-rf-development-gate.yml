@@ -54,10 +54,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          status="$(git status --porcelain=v1 --untracked-files=all)"
+          test -z "$status"
           mkdir -p ci-output
           git rev-parse HEAD | tee ci-output/HEAD.txt
-          git status --porcelain=v1 --untracked-files=all | tee ci-output/git-status.txt
-          test ! -s ci-output/git-status.txt
+          printf '%s' "$status" > ci-output/git-status.txt
 
       - name: Enforce RF data-driven and fail-closed source contract
         shell: bash
