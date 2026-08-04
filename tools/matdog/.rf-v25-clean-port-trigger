@@ -1,1 +1,1 @@
-execute clean V25 RF port gate; remove after success
+run canonical clean V25 RF gate now; remove after success
