@@ -1,10 +1,11 @@
 name: MATDOG RF Apply Development Patch
 
 on:
-  push:
+  pull_request:
     branches:
-      - matdog/rf-native-calibrator
+      - main
     paths:
+      - ".github/workflows/matdog-rf-apply-development-patch.yml"
       - "tools/matdog/.rf-patch/**"
   workflow_dispatch:
 
@@ -17,6 +18,7 @@ concurrency:
 
 jobs:
   apply-reviewed-patch:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.ref == 'matdog/rf-native-calibrator'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout exact RF branch
@@ -29,13 +31,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$(git branch --show-current)" = "matdog/rf-native-calibrator"
           payload=tools/matdog/.rf-patch
           required=(chunk-00 chunk-01 chunk-02 chunk-03)
           for name in "${required[@]}"; do
-            if [[ ! -f "$payload/$name" ]]; then
-              echo "Patch payload incomplete; waiting for $name"
-              exit 0
-            fi
+            test -f "$payload/$name"
           done
           cat "$payload"/chunk-* | base64 --decode | gzip --decompress > /tmp/matdog-rf.patch
           echo "9734081d67d49c40f0acefd8f740d6bb8a109dbd59f6e25a70ada4c2adad3c88  /tmp/matdog-rf.patch" | sha256sum --check
