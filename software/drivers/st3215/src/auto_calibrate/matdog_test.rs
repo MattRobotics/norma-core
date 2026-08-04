@@ -3104,3 +3104,12 @@ fn rf_failure_contract_keeps_global_torque_off_and_isolated_hip_blocking() {
     let isolated = profile_for_arm_value("RF_HIP_M23_MIN").unwrap();
     assert!(hardware_profile_allowed(&isolated).is_err());
 }
+
+#[test]
+fn mirrored_front_parking_home_priming_preserves_v25_lf_and_accepts_rf_settle() {
+    assert!(full_sequence_goal_allowed(Leg::Lf, 42, 2052));
+    assert!(full_sequence_goal_allowed(Leg::Lf, 42, 2389));
+    assert!(full_sequence_goal_allowed(Leg::Rf, 32, 1707));
+    assert!(full_sequence_goal_allowed(Leg::Rf, 32, 2054));
+    assert!(!full_sequence_goal_allowed(Leg::Rf, 32, 2059));
+}

@@ -704,12 +704,19 @@ fn full_sequence_goal_allowed(leg: Leg, motor_id: u8, target: u16) -> bool {
         let Ok(parking) = static_target(parking_leg, JointKind::Upper, UPPER_30_DELTA) else {
             return false;
         };
-        let low = HOME_TICK
-            .min(parking.target_tick)
-            .saturating_sub(STATIC_TOLERANCE_TICKS);
-        let high = HOME_TICK
-            .max(parking.target_tick)
-            .min(protocol::MAX_ANGLE_STEP);
+        let (low, high) = if parking.target_tick >= HOME_TICK {
+            (
+                HOME_TICK.saturating_sub(STATIC_TOLERANCE_TICKS),
+                parking.target_tick,
+            )
+        } else {
+            (
+                parking.target_tick,
+                HOME_TICK
+                    .saturating_add(STATIC_TOLERANCE_TICKS)
+                    .min(protocol::MAX_ANGLE_STEP),
+            )
+        };
         return (low..=high).contains(&target);
     }
 
@@ -797,23 +804,8 @@ fn lf_full_sequence_goal_allowed(motor_id: u8, target: u16) -> bool {
 }
 
 #[cfg(test)]
-fn lf_full_joint_corridor(motor_id: u8) -> Option<TickCorridor> {
-    full_joint_corridor(Leg::Lf, motor_id)
-}
-
-#[cfg(test)]
-fn lf_parking_corridor() -> Result<TickCorridor, String> {
-    parking_corridor(Leg::Lf)
-}
-
-#[cfg(test)]
 fn lf_passive_corridor(state: LfSessionState, motor_id: u8) -> Result<TickCorridor, String> {
     passive_corridor(Leg::Lf, state, motor_id)
-}
-
-#[cfg(test)]
-fn lf_participant_corridor(motor_id: u8) -> Result<TickCorridor, String> {
-    participant_corridor(Leg::Lf, motor_id)
 }
 
 fn armed_goal_target_allowed(profile: &ContactProfile, motor_id: u8, target: u16) -> bool {
@@ -2357,11 +2349,6 @@ fn leg_machine_profile_record(leg: Leg, evidence: JointCalibrationEvidence) -> S
     )
 }
 
-#[cfg(test)]
-fn lf_machine_profile_record(evidence: JointCalibrationEvidence) -> String {
-    leg_machine_profile_record(Leg::Lf, evidence)
-}
-
 fn leg_degree_evidence(leg: Leg, evidence: JointCalibrationEvidence) -> String {
     let spec = evidence.spec;
     let fixed = evidence.fixed_scale;
@@ -2419,11 +2406,6 @@ fn leg_degree_evidence(leg: Leg, evidence: JointCalibrationEvidence) -> String {
             "fine contacts agree with hardware witness, fixed scale and affine checks"
         },
     )
-}
-
-#[cfg(test)]
-fn joint_degree_evidence(evidence: JointCalibrationEvidence) -> String {
-    leg_degree_evidence(Leg::Lf, evidence)
 }
 
 fn circular_midpoint_tick(first: u16, second: u16) -> u16 {
