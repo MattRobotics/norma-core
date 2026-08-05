@@ -3059,11 +3059,16 @@ fn rf_state_machine_reuses_one_persistent_engine() {
 
 #[test]
 fn rf_profile_record_is_ram_only_and_never_authorizes_persistent_freeze() {
-    let (minimum, maximum) = rf_reference_contact_ticks(JointKind::Hip);
+    // Both RF endpoints are translated +20 ticks from the former digital-home
+    // mirror, while the immutable LF V25 physical span remains exactly 918.
     let contacts = DualContactResult {
-        minimum: contact_result(minimum, minimum),
-        maximum: contact_result(maximum, maximum),
+        minimum: contact_result(2499, 2499),
+        maximum: contact_result(1581, 1581),
     };
+    assert_eq!(
+        rf_measured_span_ticks(JointKind::Hip, contacts),
+        lf_v25_reference_span_ticks(JointKind::Hip)
+    );
     let evidence = derive_leg_joint_evidence(Leg::Rf, *spec_for(Leg::Rf, JointKind::Hip), contacts);
     assert!(evidence.affine.accepted);
     assert!(evidence.contact_witness_accepted);
@@ -3194,87 +3199,6 @@ fn lf_m12_mirror_uses_the_same_existing_guard_rule() {
     );
     assert_eq!(
         detector.observe(sample, target),
-        ContactState::ContactConfirmed
-    );
-}
-
-#[test]
-fn rf_mirror_witness_tightens_only_rf_home_facing_entry_and_preserves_lf_v25() {
-    let lf = profile_for_arm_value("LF_LOWER_M11_MAX").unwrap();
-    let rf = profile_for_arm_value("RF_LOWER_M21_MAX").unwrap();
-
-    assert_eq!(contact_acceptance_bounds(&lf), (1557, 1685));
-    assert_eq!(contact_acceptance_bounds(&rf), (2411, 2539));
-    assert_eq!(adaptive_contact_acceptance_bounds(&lf, None), (1557, 1717));
-    assert_eq!(adaptive_contact_acceptance_bounds(&rf, None), (2422, 2539));
-
-    assert!((1557..=1717).contains(&1697));
-    assert!(!(1557..=1717).contains(&1718));
-    assert!((2422..=2539).contains(&2430));
-    assert!(!(2422..=2539).contains(&2399));
-    assert!(!(2422..=2539).contains(&2421));
-    assert_eq!(lf.guard_tick, 1557);
-    assert_eq!(rf.guard_tick, 2539);
-}
-
-#[test]
-fn rf_early_lower_plateau_is_rejected_while_lf_v25_policy_stays_unchanged() {
-    let baseline = BaselineStats {
-        median_current: 1,
-        mad_current: 0,
-    };
-
-    let rf = profile_for_arm_value("RF_LOWER_M21_MAX").unwrap();
-    let mut rf_detector =
-        HybridContactDetector::new_for_profile_with_scout(HOME_TICK, baseline, &rf, None);
-    let rf_sample = observation(2399, 0, 48, 2439);
-    assert_eq!(
-        rf_detector.observe(rf_sample, 2439),
-        ContactState::FreeMotion
-    );
-    for _ in 0..TARGET_STARTUP_SAMPLES {
-        assert_eq!(
-            rf_detector.observe(rf_sample, 2439),
-            ContactState::FreeMotion
-        );
-    }
-    assert_eq!(
-        rf_detector.observe(rf_sample, 2439),
-        ContactState::ContactSuspected
-    );
-    assert_eq!(
-        rf_detector.observe(rf_sample, 2439),
-        ContactState::ContactSuspected
-    );
-    assert_eq!(
-        rf_detector.observe(rf_sample, 2439),
-        ContactState::EarlyStall
-    );
-
-    let lf = profile_for_arm_value("LF_LOWER_M11_MAX").unwrap();
-    let mut lf_detector =
-        HybridContactDetector::new_for_profile_with_scout(HOME_TICK, baseline, &lf, None);
-    let lf_sample = observation(1697, 0, 48, 1657);
-    assert_eq!(
-        lf_detector.observe(lf_sample, 1657),
-        ContactState::FreeMotion
-    );
-    for _ in 0..TARGET_STARTUP_SAMPLES {
-        assert_eq!(
-            lf_detector.observe(lf_sample, 1657),
-            ContactState::FreeMotion
-        );
-    }
-    assert_eq!(
-        lf_detector.observe(lf_sample, 1657),
-        ContactState::ContactSuspected
-    );
-    assert_eq!(
-        lf_detector.observe(lf_sample, 1657),
-        ContactState::ContactSuspected
-    );
-    assert_eq!(
-        lf_detector.observe(lf_sample, 1657),
         ContactState::ContactConfirmed
     );
 }
@@ -3413,76 +3337,6 @@ fn rf_v25_execution_reorders_results_only_for_urdf_evidence() {
 }
 
 #[test]
-fn rf_reference_contacts_are_exact_mirrors_of_lf_v25() {
-    assert_eq!(rf_reference_contact_ticks(JointKind::Upper), (2653, 654));
-    assert_eq!(rf_reference_contact_ticks(JointKind::Lower), (1003, 2430));
-    assert_eq!(rf_reference_contact_ticks(JointKind::Hip), (2479, 1561));
-
-    let exact = [
-        (JointKind::Hip, 2020_u16),
-        (JointKind::Upper, 2054_u16),
-        (JointKind::Lower, 2017_u16),
-    ];
-    for (joint, expected_q0) in exact {
-        let (minimum, maximum) = rf_reference_contact_ticks(joint);
-        let contacts = DualContactResult {
-            minimum: contact_result(minimum, minimum),
-            maximum: contact_result(maximum, maximum),
-        };
-        let evidence = derive_leg_joint_evidence(Leg::Rf, *spec_for(Leg::Rf, joint), contacts);
-        assert!(evidence.contact_witness_accepted);
-        assert!(evidence.affine.accepted);
-        assert!(evidence.accepted);
-        assert_eq!(evidence.affine.estimated_zero_tick, expected_q0);
-    }
-}
-
-#[test]
-fn rf_search_does_not_accept_the_observed_home_facing_plateaus() {
-    let hip_up = full_sequence_hip_profile(Leg::Rf, ContactSide::Min).unwrap();
-    assert_eq!(reference_contact_tick_for_profile(&hip_up), Some(2479));
-    assert_eq!(rf_mirror_search_entry_tick(&hip_up), Some(2471));
-    assert!(rf_home_facing_before_mirror_search_entry(&hip_up, 2467));
-    assert!(!rf_home_facing_before_mirror_search_entry(&hip_up, 2471));
-    let (hip_low, hip_high) = adaptive_contact_acceptance_bounds(&hip_up, None);
-    assert_eq!(hip_low, 2471);
-    assert!(hip_high >= 2479);
-
-    let lower_max = build_profile(Leg::Rf, JointKind::Lower, ContactSide::Max).unwrap();
-    assert_eq!(reference_contact_tick_for_profile(&lower_max), Some(2430));
-    assert_eq!(rf_mirror_search_entry_tick(&lower_max), Some(2422));
-    assert!(rf_home_facing_before_mirror_search_entry(&lower_max, 2385));
-    assert!(!rf_home_facing_before_mirror_search_entry(&lower_max, 2422));
-    let (lower_low, lower_high) = adaptive_contact_acceptance_bounds(&lower_max, None);
-    assert_eq!(lower_low, 2422);
-    assert!(lower_high >= 2430);
-}
-
-#[test]
-fn rf_affine_only_false_passes_are_rejected_by_the_mirrored_lf_witness() {
-    let shifted_lower = DualContactResult {
-        minimum: contact_result(970, 970),
-        maximum: contact_result(2397, 2397),
-    };
-    let lower =
-        derive_leg_joint_evidence(Leg::Rf, *spec_for(Leg::Rf, JointKind::Lower), shifted_lower);
-    assert_eq!(lower.affine.estimated_zero_tick, 1984);
-    assert!(lower.affine.accepted);
-    assert!(!lower.contact_witness_accepted);
-    assert!(!lower.accepted);
-
-    let shifted_hip = DualContactResult {
-        minimum: contact_result(2459, 2459),
-        maximum: contact_result(1541, 1541),
-    };
-    let hip = derive_leg_joint_evidence(Leg::Rf, *spec_for(Leg::Rf, JointKind::Hip), shifted_hip);
-    assert_eq!(hip.affine.estimated_zero_tick, 2000);
-    assert!(hip.affine.accepted);
-    assert!(!hip.contact_witness_accepted);
-    assert!(!hip.accepted);
-}
-
-#[test]
 fn lf_v25_search_and_witness_contract_remain_unchanged() {
     let hip_min = lf_hip_sequence_profile(ContactSide::Min).unwrap();
     let hip_max = lf_hip_sequence_profile(ContactSide::Max).unwrap();
@@ -3500,4 +3354,122 @@ fn lf_v25_search_and_witness_contract_remain_unchanged() {
         JointKind::Hip,
         supervised_lf_witness_contacts(JointKind::Hip),
     ));
+}
+
+#[test]
+fn rf_witness_uses_lf_v25_travel_span_not_absolute_encoder_coordinates() {
+    assert_eq!(lf_v25_reference_span_ticks(JointKind::Upper), 1999);
+    assert_eq!(lf_v25_reference_span_ticks(JointKind::Lower), 1427);
+    assert_eq!(lf_v25_reference_span_ticks(JointKind::Hip), 918);
+
+    let translated_upper = DualContactResult {
+        minimum: contact_result(2680, 2680),
+        maximum: contact_result(681, 681),
+    };
+    assert_eq!(
+        rf_measured_span_ticks(JointKind::Upper, translated_upper),
+        1999
+    );
+    assert_eq!(
+        rf_span_witness_deviation(JointKind::Upper, translated_upper),
+        0
+    );
+    assert!(contact_witness_accepted_for_leg(
+        Leg::Rf,
+        JointKind::Upper,
+        translated_upper
+    ));
+    let evidence = derive_leg_joint_evidence(
+        Leg::Rf,
+        *spec_for(Leg::Rf, JointKind::Upper),
+        translated_upper,
+    );
+    assert!(evidence.affine.accepted);
+    assert!(evidence.contact_witness_accepted);
+    assert!(evidence.accepted);
+    assert_ne!(evidence.affine.estimated_zero_tick, HOME_TICK);
+}
+
+#[test]
+fn rf_second_contact_entry_is_anchored_to_first_measured_contact() {
+    let first_contact = 2680;
+    let mut second = build_profile(Leg::Rf, JointKind::Upper, ContactSide::Max).unwrap();
+    assert_eq!(second.relative_contact_entry_tick, None);
+
+    configure_rf_relative_second_contact_entry(&mut second, first_contact).unwrap();
+    assert_eq!(second.relative_contact_entry_tick, Some(689));
+    assert!(profile_home_facing_before_relative_search_entry(
+        &second, 700
+    ));
+    assert!(!profile_home_facing_before_relative_search_entry(
+        &second, 689
+    ));
+
+    let (low, high) = adaptive_contact_acceptance_bounds(&second, None);
+    assert!(low <= 681);
+    assert_eq!(high, 689);
+}
+
+#[test]
+fn rf_relative_entry_translates_with_encoder_zero_without_changing_span() {
+    let mut upper_a = build_profile(Leg::Rf, JointKind::Upper, ContactSide::Max).unwrap();
+    let mut upper_b = upper_a.clone();
+    configure_rf_relative_second_contact_entry(&mut upper_a, 2653).unwrap();
+    configure_rf_relative_second_contact_entry(&mut upper_b, 2680).unwrap();
+
+    assert_eq!(upper_a.relative_contact_entry_tick, Some(662));
+    assert_eq!(upper_b.relative_contact_entry_tick, Some(689));
+    assert_eq!(
+        upper_b.relative_contact_entry_tick.unwrap() - upper_a.relative_contact_entry_tick.unwrap(),
+        27
+    );
+}
+
+#[test]
+fn rf_observed_hip_plateau_is_bypassed_relative_to_first_contact() {
+    let mut second = full_sequence_hip_profile(Leg::Rf, ContactSide::Min).unwrap();
+    configure_rf_relative_second_contact_entry(&mut second, 1561).unwrap();
+    assert_eq!(second.relative_contact_entry_tick, Some(2471));
+    assert!(profile_home_facing_before_relative_search_entry(
+        &second, 2467
+    ));
+    assert!(!profile_home_facing_before_relative_search_entry(
+        &second, 2471
+    ));
+
+    let mut translated = full_sequence_hip_profile(Leg::Rf, ContactSide::Min).unwrap();
+    configure_rf_relative_second_contact_entry(&mut translated, 1581).unwrap();
+    assert_eq!(translated.relative_contact_entry_tick, Some(2491));
+}
+
+#[test]
+fn rf_span_witness_rejects_short_travel_even_when_affine_band_is_broad() {
+    let short_lower = DualContactResult {
+        minimum: contact_result(1003, 1003),
+        maximum: contact_result(2400, 2400),
+    };
+    let affine = derive_affine_joint_calibration(*spec_for(Leg::Rf, JointKind::Lower), short_lower);
+    assert!(affine.accepted);
+    assert_eq!(rf_measured_span_ticks(JointKind::Lower, short_lower), 1397);
+    assert_eq!(rf_span_witness_deviation(JointKind::Lower, short_lower), 30);
+    assert!(!contact_witness_accepted_for_leg(
+        Leg::Rf,
+        JointKind::Lower,
+        short_lower
+    ));
+}
+
+#[test]
+fn lf_v25_profiles_never_receive_rf_relative_entries() {
+    for joint in [JointKind::Upper, JointKind::Lower, JointKind::Hip] {
+        let mut maximum = build_profile(Leg::Lf, joint, ContactSide::Max).unwrap();
+        configure_rf_relative_second_contact_entry(&mut maximum, 2000).unwrap();
+        assert_eq!(maximum.relative_contact_entry_tick, None);
+    }
+
+    let contacts = DualContactResult {
+        minimum: contact_result(1443, 1443),
+        maximum: contact_result(3442, 3442),
+    };
+    assert!(lf_contact_witness_accepted(JointKind::Upper, contacts));
 }
