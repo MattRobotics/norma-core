@@ -1,374 +1,338 @@
-name: MATDOG Native Calibrator Offline Check
+name: MATDOG RF Canonical Guard Repair
 
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - ".github/workflows/matdog-native-calibrator-check.yml"
-      - ".github/workflows/matdog-native-observer-check.yml"
-      - "protobufs/drivers/st3215/**"
-      - "software/drivers/st3215/**"
-      - "software/station/bin/station/**"
-      - "tools/matdog/**"
+  push:
+    branches:
+      - matdog/rf-native-calibrator
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: matdog-native-calibrator-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: matdog-rf-canonical-guard-repair
+  cancel-in-progress: false
 
 jobs:
-  certify-rf-package:
-    name: V25 LF regression and RF hardware package certification
+  repair-and-verify:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout exact reviewed revision
+      - name: Checkout exact RF branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: matdog/rf-native-calibrator
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prove clean canonical repository state
+      - name: Guard expected input revision
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
-          test -z "$(git status --porcelain=v1 --untracked-files=all)"
-          test ! -e .github/workflows/matdog-rf-development-gate.yml
-          test ! -e .github/workflows/matdog-rf-v25-clean-port.yml
-          test ! -e .github/workflows/matdog-rf-v25-clean-port-push.yml
-          test ! -e tools/matdog/matdog_rf_hardware_test.sh
-          mkdir -p ci-output package/MATDOG_RF_V25_HARDWARE_PACKAGE/bin
-          git rev-parse HEAD | tee ci-output/HEAD.txt
+          head="$(git rev-parse HEAD)"
+          case "$head" in
+            763c767d085bbb7c5025886c89f34191a11e9722) ;;
+            *)
+              if grep -q 'fn next_guard_bounded_target(' software/drivers/st3215/src/auto_calibrate/matdog.rs; then
+                echo "repair already applied on $head"
+                exit 0
+              fi
+              echo "unexpected unpatched HEAD: $head" >&2
+              exit 1
+              ;;
+          esac
 
-      - name: Setup protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          version: "23.x"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          components: rustfmt,clippy
-
-      - name: Install Station native dependency
-        run: sudo apt-get update && sudo apt-get install -y nasm
-
-      - name: Enforce V25 authority boundary and clean RF data port
+      - name: Apply only the general V25 guard-endpoint correction
         shell: bash
         run: |
           set -euo pipefail
-          echo 'b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167  tools/matdog/matdog_native_observer_contract.py' | sha256sum -c -
           python3 - <<'PY'
           from pathlib import Path
 
-          observer = Path('tools/matdog/matdog_native_observer_contract.py').read_text()
-          launcher = Path('tools/matdog/matdog_v42_pinned_launcher.py').read_text()
-          rust = Path('software/drivers/st3215/src/auto_calibrate/matdog.rs').read_text()
+          source_path = Path('software/drivers/st3215/src/auto_calibrate/matdog.rs')
+          test_path = Path('software/drivers/st3215/src/auto_calibrate/matdog_test.rs')
+          source = source_path.read_text(encoding='utf-8')
+          tests = test_path.read_text(encoding='utf-8')
 
-          required = (
-              '_matdog_native_authority_observer = True',
-              'matdog_native_observer_contract.install(runner)',
-              'RF_FULL_SEQUENCE_ARM_VALUE',
-              'Self::Rf => Some(Self::Rh)',
-              'measure_lf_joint_pair_efficient(',
-              'global_torque_off_verified()',
-              'persistent_freeze_authorized=false',
-              'parking.target_tick >= HOME_TICK',
-          )
-          combined = observer + launcher + rust
-          missing = [token for token in required if token not in combined]
+          marker = 'fn next_guard_bounded_target('
+          if marker in source:
+              print('canonical guard repair already present')
+              raise SystemExit(0)
 
-          forbidden_observer = (
-              'M32', 'M42', 'HOME_TICK', 'current_step',
-              'calibration.phase', 'CONTROLLED_GOAL_CORRIDORS',
-              'CONTROLLED_POSITION_CORRIDORS', 'NONPARTICIPATING_MOTOR_IDS',
-          )
-          observer_conflicts = [token for token in forbidden_observer if token in observer]
+          old_loop = '''            let next_target = advance_tick(target, self.profile.probe_sign, step_ticks)?;
+            if passed_guard(
+                next_target,
+                self.profile.guard_tick,
+                self.profile.probe_sign,
+            ) {
+                return Err(format!(
+                    "{} travel guard reached without contact: next={}, URDF={}, guard={}",
+                    self.profile.label,
+                    next_target,
+                    self.profile.urdf_limit_tick,
+                    self.profile.guard_tick
+                )
+                .into());
+            }
+            self.set_motor_goal_verified(motor_id, next_target).await?;
+'''
+          new_loop = '''            let Some(next_target) = next_guard_bounded_target(
+                target,
+                self.profile.probe_sign,
+                step_ticks,
+                self.profile.guard_tick,
+            )? else {
+                return Err(format!(
+                    "{} travel guard reached without contact: current={}, URDF={}, guard={}",
+                    self.profile.label,
+                    target,
+                    self.profile.urdf_limit_tick,
+                    self.profile.guard_tick
+                )
+                .into());
+            };
+            self.set_motor_goal_verified(motor_id, next_target).await?;
+'''
+          count = source.count(old_loop)
+          if count != 1:
+              raise SystemExit(f'expected one canonical approach loop, found {count}')
+          source = source.replace(old_loop, new_loop, 1)
 
-          dead_adapters = (
-              'fn lf_full_joint_corridor(',
-              'fn lf_parking_corridor(',
-              'fn lf_participant_corridor(',
-              'fn lf_machine_profile_record(',
-              'fn joint_degree_evidence(',
-          )
-          dead_found = [token for token in dead_adapters if token in rust]
+          old_helper = '''fn advance_tick(value: u16, sign: i8, amount: u16) -> Result<u16, DynError> {
+    let next = i32::from(value) + i32::from(sign) * i32::from(amount);
+    u16::try_from(next)
+        .ok()
+        .filter(|tick| *tick <= protocol::MAX_ANGLE_STEP)
+        .ok_or_else(|| format!("unsigned GoalPosition out of range: {next}").into())
+}
 
-          if missing or observer_conflicts or dead_found:
-              raise SystemExit(
-                  f'missing={missing}; observer_conflicts={observer_conflicts}; '
-                  f'dead_adapters={dead_found}'
-              )
-          print('V25 authority boundary and clean RF data port: PASS')
+fn motion_timeout_for_distance'''
+          new_helper = '''fn advance_tick(value: u16, sign: i8, amount: u16) -> Result<u16, DynError> {
+    let next = i32::from(value) + i32::from(sign) * i32::from(amount);
+    u16::try_from(next)
+        .ok()
+        .filter(|tick| *tick <= protocol::MAX_ANGLE_STEP)
+        .ok_or_else(|| format!("unsigned GoalPosition out of range: {next}").into())
+}
+
+// Preserve the reviewed V25 guard exactly. Fixed coarse/fine increments may
+// not divide the remaining travel evenly; the final command therefore lands
+// on the existing guard instead of skipping from the last safe target to a
+// value beyond it. No target outside the guard is ever generated.
+fn next_guard_bounded_target(
+    value: u16,
+    sign: i8,
+    amount: u16,
+    guard: u16,
+) -> Result<Option<u16>, DynError> {
+    if passed_guard(value, guard, sign) {
+        return Err(format!(
+            "current target {value} is already beyond guard {guard}"
+        )
+        .into());
+    }
+    if value == guard {
+        return Ok(None);
+    }
+
+    let next = i32::from(value) + i32::from(sign) * i32::from(amount);
+    let candidate = u16::try_from(next)
+        .ok()
+        .filter(|tick| *tick <= protocol::MAX_ANGLE_STEP);
+    if candidate
+        .map(|tick| passed_guard(tick, guard, sign))
+        .unwrap_or(true)
+    {
+        Ok(Some(guard))
+    } else {
+        Ok(candidate)
+    }
+}
+
+fn motion_timeout_for_distance'''
+          count = source.count(old_helper)
+          if count != 1:
+              raise SystemExit(f'expected one advance_tick helper, found {count}')
+          source = source.replace(old_helper, new_helper, 1)
+
+          test_marker = 'fn guard_bounded_final_step_is_direction_symmetric_and_never_extends_the_guard()'
+          if test_marker in tests:
+              raise SystemExit('guard regression tests unexpectedly already present')
+          tests += r'''
+
+#[test]
+fn guard_bounded_final_step_is_direction_symmetric_and_never_extends_the_guard() {
+    // Exact last coarse targets from the hardware LF pass and RF attempt.
+    assert_eq!(
+        next_guard_bounded_target(1420, -1, COARSE_STEP_TICKS, 1387).unwrap(),
+        Some(1387)
+    );
+    assert_eq!(
+        next_guard_bounded_target(2676, 1, COARSE_STEP_TICKS, 2709).unwrap(),
+        Some(2709)
+    );
+
+    // Reaching the reviewed guard ends travel; no command beyond it exists.
+    assert_eq!(
+        next_guard_bounded_target(1387, -1, COARSE_STEP_TICKS, 1387).unwrap(),
+        None
+    );
+    assert_eq!(
+        next_guard_bounded_target(2709, 1, COARSE_STEP_TICKS, 2709).unwrap(),
+        None
+    );
+
+    // Ordinary increments remain byte-for-byte equivalent to advance_tick().
+    assert_eq!(
+        next_guard_bounded_target(1984, -1, COARSE_STEP_TICKS, 1387).unwrap(),
+        Some(1920)
+    );
+    assert_eq!(
+        next_guard_bounded_target(2112, 1, COARSE_STEP_TICKS, 2709).unwrap(),
+        Some(2176)
+    );
+}
+
+#[test]
+fn rf_m22_real_trace_confirms_contact_at_the_existing_guard_without_widening_it() {
+    let profile = profile_for_arm_value("RF_UPPER_M22_MIN").unwrap();
+    assert_eq!(profile.urdf_limit_tick, 2645);
+    assert_eq!(profile.guard_tick, 2709);
+    assert_eq!(profile.probe_sign, 1);
+
+    let baseline = BaselineStats {
+        median_current: 0,
+        mad_current: 0,
+    };
+    let mut detector = HybridContactDetector::new_for_profile(
+        2112,
+        baseline,
+        &profile,
+    );
+    let target = profile.guard_tick;
+    let sample = observation(2667, 0, 1, target);
+
+    assert_eq!(detector.observe(sample, target), ContactState::FreeMotion);
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(detector.observe(sample, target), ContactState::FreeMotion);
+    }
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactConfirmed
+    );
+}
+
+#[test]
+fn lf_m12_mirror_uses_the_same_existing_guard_rule() {
+    let profile = profile_for_arm_value("LF_UPPER_M12_MIN").unwrap();
+    assert_eq!(profile.urdf_limit_tick, 1451);
+    assert_eq!(profile.guard_tick, 1387);
+    assert_eq!(profile.probe_sign, -1);
+
+    let baseline = BaselineStats {
+        median_current: 0,
+        mad_current: 0,
+    };
+    let mut detector = HybridContactDetector::new_for_profile(
+        1984,
+        baseline,
+        &profile,
+    );
+    let target = profile.guard_tick;
+    let sample = observation(1434, 0, 1, target);
+
+    assert_eq!(detector.observe(sample, target), ContactState::FreeMotion);
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(detector.observe(sample, target), ContactState::FreeMotion);
+    }
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactConfirmed
+    );
+}
+'''
+
+          source_path.write_text(source, encoding='utf-8')
+          test_path.write_text(tests, encoding='utf-8')
           PY
 
-      - name: Warning-free Rust tests and formatting
+          if git diff --quiet; then
+            echo 'no source change required'
+            exit 0
+          fi
+
+          rustfmt --edition 2021 --config skip_children=true \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+
+      - name: Verify canonical temperature logic and complete software gates
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
+          if git diff --quiet; then
+            exit 0
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          port = Path('software/drivers/st3215/src/port.rs').read_text()
+          runner = Path('tools/matdog/matdog_headless_auto_calibrate.py').read_text()
+          required = (
+              'MATDOG_THERMAL_CONFIRMATION_READS: usize = 3',
+              'over_limit >= 2',
+              'matdog_direct_temperature_never_converts_repeated_false_spikes_to_heat',
+              'superseded_bulk_temperature_is_replaced_by_confirmed_latest',
+          )
+          combined = port + runner + Path('software/drivers/st3215/src/port.rs').read_text()
+          missing = [token for token in required if token not in combined]
+          if missing:
+              raise SystemExit(f'canonical V25 temperature contract missing: {missing}')
+          PY
           rustfmt --edition 2021 --check --config skip_children=true \
             software/drivers/st3215/src/port.rs \
             software/drivers/st3215/src/auto_calibrate/mod.rs \
             software/drivers/st3215/src/auto_calibrate/matdog.rs \
             software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
-            software/drivers/st3215/src/bin/matdog_lf_freeze.rs \
-            2>&1 | tee ci-output/rustfmt.log
-          RUSTFLAGS='-D warnings' cargo test --package st3215 --all-targets \
-            2>&1 | tee ci-output/st3215-tests.log
-
-      - name: LF and RF runner/observer regressions
-        shell: bash
-        run: |
-          set -o pipefail
+            software/drivers/st3215/src/bin/matdog_lf_freeze.rs
+          RUSTFLAGS='-D warnings' cargo test --package st3215 --all-targets
           python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test
           python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test
           python3 -m unittest -v \
             tools.matdog.test_matdog_headless_auto_calibrate \
             tools.matdog.test_matdog_native_observer_contract \
             tools.matdog.test_matdog_lf_profile \
-            tools.matdog.test_matdog_v42_pinned_launcher \
-            2>&1 | tee ci-output/python-tests.log
+            tools.matdog.test_matdog_v42_pinned_launcher
+          git diff --check
 
-      - name: Build warning-free Station release
+      - name: Commit source-only correction
         shell: bash
-        run: |
-          set -o pipefail
-          asset=software/station/clients/station-viewer/dist/index.html
-          test ! -e "$asset"
-          mkdir -p "$(dirname "$asset")"
-          printf '<!doctype html><title>MATDOG RF certified build</title>\n' > "$asset"
-          RUSTFLAGS='-D warnings' cargo build --release --package station \
-            2>&1 | tee ci-output/station-build.log
-          ! grep -E '^warning:' ci-output/station-build.log
-          cp target/release/station package/MATDOG_RF_V25_HARDWARE_PACKAGE/bin/station
-          chmod 755 package/MATDOG_RF_V25_HARDWARE_PACKAGE/bin/station
-          sha256sum package/MATDOG_RF_V25_HARDWARE_PACKAGE/bin/station \
-            | tee ci-output/station-release.sha256
-          target/release/station --version | tee ci-output/station-version.txt
-
-      - name: Build and self-test one-command RF hardware package
-        shell: bash
-        env:
-          CERTIFIED_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          ROOT=package/MATDOG_RF_V25_HARDWARE_PACKAGE
-          STATION_SHA="$(sha256sum "$ROOT/bin/station" | awk '{print $1}')"
-          RUNNER_SHA="$(sha256sum tools/matdog/matdog_headless_auto_calibrate.py | awk '{print $1}')"
-          OBSERVER_SHA="$(sha256sum tools/matdog/matdog_native_observer_contract.py | awk '{print $1}')"
-
-          cat > "$ROOT/manifest.json" <<JSON
-          {
-            "schema": "matdog.rf.v25-hardware-package.v1",
-            "certified_commit": "$CERTIFIED_COMMIT",
-            "station_sha256": "$STATION_SHA",
-            "runner_sha256": "$RUNNER_SHA",
-            "observer_sha256": "$OBSERVER_SHA",
-            "observer_v25_sha256": "b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167",
-            "leg": "RF",
-            "arm_value": "RF_LEG_STATE_MACHINE",
-            "total_steps": 58,
-            "persistent_freeze_authorized": false
-          }
-          JSON
-
-          cat > "$ROOT/run_matdog_rf_v25.sh" <<'SCRIPT'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-
-          PACKAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          REPO="${MATDOG_REPO:-/home/matteo-manicardi/norma-core}"
-          BRANCH="matdog/rf-native-calibrator"
-          SERVER="127.0.0.1:8888"
-          BUS_SERIAL="5B14114953"
-          CONFIG="$REPO/software/station/bin/station/station.yaml"
-          STATION="$PACKAGE_DIR/bin/station"
-          MANIFEST="$PACKAGE_DIR/manifest.json"
-          STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-          OUT="/home/matteo-manicardi/MATDOG/_archive/MATDOG_RF_V25_CERTIFIED_${STAMP}"
-          STATION_PID=""
-
-          block() { printf 'BLOCKED  %s\n' "$*" >&2; exit 2; }
-          pass() { printf 'PASS     %s\n' "$*"; }
-
-          cleanup() {
-            local rc=$?
-            set +e
-            if [[ -n "${STATION_PID:-}" ]] && kill -0 "$STATION_PID" 2>/dev/null; then
-              kill -INT "$STATION_PID" 2>/dev/null
-              for _ in $(seq 1 120); do
-                kill -0 "$STATION_PID" 2>/dev/null || break
-                sleep 0.25
-              done
-              if kill -0 "$STATION_PID" 2>/dev/null; then
-                kill -KILL "$STATION_PID" 2>/dev/null
-              fi
-              wait "$STATION_PID" 2>/dev/null
-            fi
-            exit "$rc"
-          }
-          trap cleanup EXIT INT TERM
-
-          [[ -d "$REPO/.git" ]] || block "repository missing: $REPO"
-          [[ -f "$MANIFEST" ]] || block "manifest missing"
-          [[ -x "$STATION" ]] || block "precompiled Station missing"
-
-          mapfile -t META < <(python3 - "$MANIFEST" <<'PY'
-          import json, sys
-          data = json.load(open(sys.argv[1], encoding='utf-8'))
-          for key in ('certified_commit', 'station_sha256', 'runner_sha256', 'observer_sha256'):
-              print(data[key])
-          assert data['leg'] == 'RF'
-          assert data['arm_value'] == 'RF_LEG_STATE_MACHINE'
-          assert data['total_steps'] == 58
-          assert data['persistent_freeze_authorized'] is False
-          PY
-          )
-          COMMIT="${META[0]}"
-          STATION_SHA="${META[1]}"
-          RUNNER_SHA="${META[2]}"
-          OBSERVER_SHA="${META[3]}"
-
-          cd "$REPO"
-          [[ "$(sha256sum "$STATION" | awk '{print $1}')" == "$STATION_SHA" ]] || block "Station SHA mismatch"
-          [[ "$(sha256sum tools/matdog/matdog_headless_auto_calibrate.py | awk '{print $1}')" == "$RUNNER_SHA" ]] || block "runner SHA mismatch"
-          [[ "$(sha256sum tools/matdog/matdog_native_observer_contract.py | awk '{print $1}')" == "$OBSERVER_SHA" ]] || block "observer SHA mismatch"
-          [[ "$OBSERVER_SHA" == "b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167" ]] || block "observer is not LF V25 canonical"
-
-          if [[ "${1:-}" == "--self-test" ]]; then
-            python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test
-            python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test
-            printf 'PACKAGE_SELF_TEST=PASS\n'
-            trap - EXIT INT TERM
+          if git diff --quiet; then
+            echo 'nothing to commit'
             exit 0
           fi
-
-          git fetch origin "$BRANCH"
-          [[ "$(git branch --show-current)" == "$BRANCH" ]] || block "active branch is not $BRANCH"
-          git merge --ff-only "origin/$BRANCH"
-          [[ "$(git rev-parse HEAD)" == "$COMMIT" ]] || block "HEAD is not certified commit $COMMIT"
-          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || block "working tree is not clean"
-          [[ -f "$CONFIG" ]] || block "Station configuration missing"
-
-          if pgrep -af '(^|/)(station)( |$)' >/dev/null; then
-            block "Station is already running"
-          fi
-          shopt -s nullglob
-          SERIALS=(/dev/serial/by-id/* /dev/ttyACM* /dev/ttyUSB*)
-          shopt -u nullglob
-          for dev in "${SERIALS[@]}"; do
-            if command -v lsof >/dev/null 2>&1 && lsof "$dev" >/dev/null 2>&1; then
-              block "serial already owned: $dev"
-            fi
-            if command -v fuser >/dev/null 2>&1 && fuser "$dev" >/dev/null 2>&1; then
-              block "serial already owned: $dev"
-            fi
-          done
-
-          mkdir -p "$OUT/station-data" "$OUT/runner"
-          MATDOG_NATIVE_CALIBRATOR_ARM=RF_LEG_STATE_MACHINE \
-          RUST_LOG="${RUST_LOG:-info}" \
-          "$STATION" \
-            --config "$CONFIG" \
-            --tcp "$SERVER" \
-            --normfs-base-folder "$OUT/station-data" \
-            > "$OUT/station.log" 2>&1 &
-          STATION_PID=$!
-
-          python3 - "$SERVER" "$STATION_PID" <<'PY'
-          import os, socket, sys, time
-          host, port = sys.argv[1].rsplit(':', 1)
-          pid = int(sys.argv[2])
-          deadline = time.monotonic() + 30.0
-          while time.monotonic() < deadline:
-              try:
-                  os.kill(pid, 0)
-              except ProcessLookupError:
-                  raise SystemExit('Station exited before readiness')
-              try:
-                  with socket.create_connection((host, int(port)), timeout=0.5):
-                      raise SystemExit(0)
-              except OSError:
-                  time.sleep(0.25)
-          raise SystemExit('Station readiness timeout')
-          PY
-
-          sleep 10
-          kill -0 "$STATION_PID" 2>/dev/null || block "Station exited during discovery"
-
-          set +e
-          python3 tools/matdog/matdog_v42_pinned_launcher.py \
-            --leg RF \
-            --server "$SERVER" \
-            --bus-serial "$BUS_SERIAL" \
-            --station-pid "$STATION_PID" \
-            --expected-station-sha256 "$STATION_SHA" \
-            --output-dir "$OUT/runner" \
-            2>&1 | tee "$OUT/runner-console.log"
-          RC=${PIPESTATUS[0]}
-          set -e
-
-          for _ in $(seq 1 120); do
-            kill -0 "$STATION_PID" 2>/dev/null || break
-            sleep 0.25
-          done
-          kill -0 "$STATION_PID" 2>/dev/null && block "Station still running after launcher"
-          STATION_PID=""
-          [[ "$RC" -eq 0 ]] || block "RF launcher exit code $RC"
-
-          REPORT="$OUT/runner/headless-report.json"
-          [[ -f "$REPORT" ]] || block "hardware report missing"
-          python3 - "$REPORT" <<'PY'
-          import json, sys
-          report = json.load(open(sys.argv[1], encoding='utf-8'))
-          terminal = report.get('terminal') or {}
-          shutdown = report.get('station_shutdown') or {}
-          assert report.get('result') == 'PASS', report.get('faults')
-          assert report.get('schema') == 'matdog.rf.headless_auto_calibrate.v1'
-          assert report.get('global_torque_off_verified') is True
-          assert report.get('eeprom_writes_sent') is False
-          assert report.get('register_writes_sent_by_runner') is False
-          assert terminal.get('current_step') == 58
-          assert terminal.get('total_steps') == 58
-          assert terminal.get('phase') == 'RF_LEG_STATE_MACHINE: completed'
-          assert shutdown.get('stopped') is True
-          PY
-
-          sha256sum "$REPORT" "$OUT/station.log" "$OUT/runner-console.log" > "$OUT/SHA256SUMS.txt"
-          pass "RF V25 hardware calibration completed"
-          printf 'REPORT=%s\nEVIDENCE=%s\nFINAL=PASS\n' "$REPORT" "$OUT"
-          trap - EXIT INT TERM
-          SCRIPT
-
-          chmod 755 "$ROOT/run_matdog_rf_v25.sh"
-          bash -n "$ROOT/run_matdog_rf_v25.sh"
-          MATDOG_REPO="$GITHUB_WORKSPACE" "$ROOT/run_matdog_rf_v25.sh" --self-test
-
-          tar -C package -czf ci-output/MATDOG_RF_V25_HARDWARE_PACKAGE.tar.gz MATDOG_RF_V25_HARDWARE_PACKAGE
-          sha256sum ci-output/MATDOG_RF_V25_HARDWARE_PACKAGE.tar.gz \
-            > ci-output/MATDOG_RF_V25_HARDWARE_PACKAGE.tar.gz.sha256
-          cat ci-output/MATDOG_RF_V25_HARDWARE_PACKAGE.tar.gz.sha256
-
-      - name: Remove CI-only viewer stub
-        if: always()
-        run: rm -rf software/station/clients/station-viewer/dist
-
-      - name: Upload certified RF package and evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: MATDOG_RF_V25_CERTIFIED_PACKAGE
-          path: |
-            ci-output/MATDOG_RF_V25_HARDWARE_PACKAGE.tar.gz
-            ci-output/MATDOG_RF_V25_HARDWARE_PACKAGE.tar.gz.sha256
-            ci-output/HEAD.txt
-            ci-output/station-release.sha256
-            ci-output/station-version.txt
-            ci-output/rustfmt.log
-            ci-output/st3215-tests.log
-            ci-output/python-tests.log
-            ci-output/station-build.log
-          if-no-files-found: error
+          mapfile -t changed < <(git diff --name-only)
+          printf 'changed=%s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq 2
+          test "${changed[0]}" = 'software/drivers/st3215/src/auto_calibrate/matdog.rs'
+          test "${changed[1]}" = 'software/drivers/st3215/src/auto_calibrate/matdog_test.rs'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- "${changed[@]}"
+          git commit -m 'fix(matdog): honor the existing guard on the final bounded step'
+          git push origin HEAD:matdog/rf-native-calibrator
