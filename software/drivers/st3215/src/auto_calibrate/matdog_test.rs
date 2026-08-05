@@ -3366,3 +3366,198 @@ fn rf_full_sequence_hip_pair_is_v25_min_then_max_with_one_parallel_pose() {
     assert_eq!(maximum.guard_tick, 1472);
     assert_eq!(contact_acceptance_bounds(&maximum), (1472, 1600));
 }
+
+#[test]
+fn rf_measured_affine_prerequisites_reproduce_the_lf_v25_geometry_without_changing_lf() {
+    let baseline = BaselineStats {
+        median_current: 0,
+        mad_current: 0,
+    };
+    let rf_upper_contacts = DualContactResult {
+        minimum: ContactResult {
+            coarse_scout_tick: 2691,
+            first_tick: 2685,
+            second_tick: 2686,
+            spread_ticks: 1,
+            baseline,
+        },
+        maximum: ContactResult {
+            coarse_scout_tick: 667,
+            first_tick: 670,
+            second_tick: 668,
+            spread_ticks: 2,
+            baseline,
+        },
+    };
+    let rf_lower_contacts = DualContactResult {
+        minimum: ContactResult {
+            coarse_scout_tick: 973,
+            first_tick: 977,
+            second_tick: 977,
+            spread_ticks: 0,
+            baseline,
+        },
+        maximum: ContactResult {
+            coarse_scout_tick: 2399,
+            first_tick: 2392,
+            second_tick: 2394,
+            spread_ticks: 2,
+            baseline,
+        },
+    };
+    let rf_upper_affine =
+        derive_affine_joint_calibration(*spec_for(Leg::Rf, JointKind::Upper), rf_upper_contacts);
+    let rf_lower_affine =
+        derive_affine_joint_calibration(*spec_for(Leg::Rf, JointKind::Lower), rf_lower_contacts);
+    assert!(rf_upper_affine.accepted);
+    assert!(rf_lower_affine.accepted);
+    assert_eq!(rf_upper_affine.estimated_zero_tick, 2081);
+    assert_eq!(rf_lower_affine.estimated_zero_tick, 1983);
+    assert_eq!(
+        full_sequence_prerequisite_target(
+            Leg::Rf,
+            JointKind::Upper,
+            UPPER_90_DELTA,
+            rf_upper_affine,
+        )
+        .unwrap(),
+        StaticTarget {
+            motor_id: 22,
+            target_tick: 1044,
+        }
+    );
+    assert_eq!(
+        full_sequence_prerequisite_target(
+            Leg::Rf,
+            JointKind::Lower,
+            LOWER_FOLDED_DELTA,
+            rf_lower_affine,
+        )
+        .unwrap(),
+        StaticTarget {
+            motor_id: 21,
+            target_tick: 1032,
+        }
+    );
+
+    let lf_upper_contacts = DualContactResult {
+        minimum: ContactResult {
+            coarse_scout_tick: 1439,
+            first_tick: 1439,
+            second_tick: 1439,
+            spread_ticks: 0,
+            baseline,
+        },
+        maximum: ContactResult {
+            coarse_scout_tick: 3443,
+            first_tick: 3443,
+            second_tick: 3443,
+            spread_ticks: 0,
+            baseline,
+        },
+    };
+    let lf_lower_contacts = DualContactResult {
+        minimum: ContactResult {
+            coarse_scout_tick: 3093,
+            first_tick: 3093,
+            second_tick: 3093,
+            spread_ticks: 0,
+            baseline,
+        },
+        maximum: ContactResult {
+            coarse_scout_tick: 1658,
+            first_tick: 1658,
+            second_tick: 1658,
+            spread_ticks: 0,
+            baseline,
+        },
+    };
+    let lf_upper_affine =
+        derive_affine_joint_calibration(*spec_for(Leg::Lf, JointKind::Upper), lf_upper_contacts);
+    let lf_lower_affine =
+        derive_affine_joint_calibration(*spec_for(Leg::Lf, JointKind::Lower), lf_lower_contacts);
+    assert_eq!(
+        full_sequence_prerequisite_target(
+            Leg::Lf,
+            JointKind::Upper,
+            UPPER_90_DELTA,
+            lf_upper_affine,
+        )
+        .unwrap(),
+        static_target(Leg::Lf, JointKind::Upper, UPPER_90_DELTA).unwrap()
+    );
+    assert_eq!(
+        full_sequence_prerequisite_target(
+            Leg::Lf,
+            JointKind::Lower,
+            LOWER_FOLDED_DELTA,
+            lf_lower_affine,
+        )
+        .unwrap(),
+        static_target(Leg::Lf, JointKind::Lower, LOWER_FOLDED_DELTA).unwrap()
+    );
+}
+
+#[test]
+fn rf_measured_hip_profiles_remain_one_identical_min_then_max_v25_pose() {
+    let baseline = BaselineStats {
+        median_current: 0,
+        mad_current: 0,
+    };
+    let upper_contacts = DualContactResult {
+        minimum: ContactResult {
+            coarse_scout_tick: 2691,
+            first_tick: 2685,
+            second_tick: 2686,
+            spread_ticks: 1,
+            baseline,
+        },
+        maximum: ContactResult {
+            coarse_scout_tick: 667,
+            first_tick: 670,
+            second_tick: 668,
+            spread_ticks: 2,
+            baseline,
+        },
+    };
+    let lower_contacts = DualContactResult {
+        minimum: ContactResult {
+            coarse_scout_tick: 973,
+            first_tick: 977,
+            second_tick: 977,
+            spread_ticks: 0,
+            baseline,
+        },
+        maximum: ContactResult {
+            coarse_scout_tick: 2399,
+            first_tick: 2392,
+            second_tick: 2394,
+            spread_ticks: 2,
+            baseline,
+        },
+    };
+    let upper = full_sequence_prerequisite_target(
+        Leg::Rf,
+        JointKind::Upper,
+        UPPER_90_DELTA,
+        derive_affine_joint_calibration(*spec_for(Leg::Rf, JointKind::Upper), upper_contacts),
+    )
+    .unwrap();
+    let lower = full_sequence_prerequisite_target(
+        Leg::Rf,
+        JointKind::Lower,
+        LOWER_FOLDED_DELTA,
+        derive_affine_joint_calibration(*spec_for(Leg::Rf, JointKind::Lower), lower_contacts),
+    )
+    .unwrap();
+    let (mut minimum, mut maximum) = full_sequence_hip_profile_pair(Leg::Rf).unwrap();
+    for profile in [&mut minimum, &mut maximum] {
+        replace_prerequisite_target(profile, upper).unwrap();
+        replace_prerequisite_target(profile, lower).unwrap();
+    }
+    assert_eq!(minimum.side, ContactSide::Min);
+    assert_eq!(maximum.side, ContactSide::Max);
+    assert_eq!(minimum.prerequisites, maximum.prerequisites);
+    assert!(minimum.prerequisites.contains(&upper));
+    assert!(minimum.prerequisites.contains(&lower));
+}
