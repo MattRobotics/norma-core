@@ -378,74 +378,6 @@ fn static_target(leg: Leg, kind: JointKind, q_delta: i16) -> Result<StaticTarget
     })
 }
 
-fn round_ratio_nearest(numerator: i32, denominator: i32) -> Result<i32, String> {
-    if denominator <= 0 {
-        return Err(format!("invalid affine denominator: {denominator}"));
-    }
-    if numerator >= 0 {
-        Ok((numerator + denominator / 2) / denominator)
-    } else {
-        Ok(-((-numerator + denominator / 2) / denominator))
-    }
-}
-
-fn affine_static_target(
-    spec: JointSpec,
-    calibration: AffineJointCalibration,
-    q_delta: i16,
-) -> Result<StaticTarget, String> {
-    if calibration.motor_id != spec.motor_id || calibration.joint_name != spec.name {
-        return Err(format!(
-            "affine prerequisite calibration does not match {} M{}",
-            spec.name, spec.motor_id
-        ));
-    }
-    if !calibration.accepted {
-        return Err(format!(
-            "{} M{} affine prerequisite calibration is not accepted",
-            spec.name, spec.motor_id
-        ));
-    }
-    let scaled_delta = round_ratio_nearest(
-        i32::from(q_delta) * i32::from(calibration.measured_span_ticks),
-        i32::from(calibration.expected_span_ticks),
-    )?;
-    let tick =
-        i32::from(calibration.estimated_zero_tick) + i32::from(spec.direction) * scaled_delta;
-    let target_tick = u16::try_from(tick)
-        .ok()
-        .filter(|value| *value <= protocol::MAX_ANGLE_STEP)
-        .ok_or_else(|| {
-            format!(
-                "{} affine prerequisite target is outside unsigned ST3215 range: {tick}",
-                spec.name
-            )
-        })?;
-    Ok(StaticTarget {
-        motor_id: spec.motor_id,
-        target_tick,
-    })
-}
-
-fn full_sequence_prerequisite_target(
-    leg: Leg,
-    kind: JointKind,
-    q_delta: i16,
-    calibration: AffineJointCalibration,
-) -> Result<StaticTarget, String> {
-    match leg {
-        // LF V25 is frozen and its validated raw prerequisite targets are
-        // immutable. RF is still RAM-only, so reproduce the same V25 joint
-        // geometry through the affine map measured earlier in this session.
-        Leg::Lf => static_target(leg, kind, q_delta),
-        Leg::Rf => affine_static_target(*spec_for(leg, kind), calibration, q_delta),
-        Leg::Rh | Leg::Lh => Err(format!(
-            "{} full-sequence prerequisite geometry is not enabled",
-            leg.label()
-        )),
-    }
-}
-
 fn replace_prerequisite_target(
     profile: &mut ContactProfile,
     target: StaticTarget,
@@ -604,22 +536,58 @@ fn full_sequence_hip_profile(leg: Leg, side: ContactSide) -> Result<ContactProfi
     Ok(profile)
 }
 
+fn full_sequence_hip_execution_sides(leg: Leg) -> Result<(ContactSide, ContactSide), String> {
+    match leg {
+        // LF V25 first moves M13 toward increasing ticks, which is the
+        // physically downward contact. RF is mirrored: historical direction
+        // validation proves that decreasing M23 ticks moves the hip downward.
+        // Therefore RF executes URDF MAX first and URDF MIN second while the
+        // state-machine order remains the logical V25 MIN -> MAX sequence.
+        Leg::Lf => Ok((ContactSide::Min, ContactSide::Max)),
+        Leg::Rf => Ok((ContactSide::Max, ContactSide::Min)),
+        Leg::Rh | Leg::Lh => Err(format!(
+            "{} full-sequence HIP execution is not enabled",
+            leg.label()
+        )),
+    }
+}
+
 fn full_sequence_hip_profile_pair(leg: Leg) -> Result<(ContactProfile, ContactProfile), String> {
-    let minimum = full_sequence_hip_profile(leg, ContactSide::Min)?;
-    let maximum = full_sequence_hip_profile(leg, ContactSide::Max)?;
-    if minimum.side != ContactSide::Min || maximum.side != ContactSide::Max {
+    let (first_side, second_side) = full_sequence_hip_execution_sides(leg)?;
+    let first = full_sequence_hip_profile(leg, first_side)?;
+    let second = full_sequence_hip_profile(leg, second_side)?;
+    if first.prerequisites != second.prerequisites {
         return Err(format!(
-            "{} HIP sequence order is not MIN then MAX",
+            "{} HIP sequence changed its V25 parallel prerequisite pose between contacts",
             leg.label()
         ));
     }
-    if minimum.prerequisites != maximum.prerequisites {
-        return Err(format!(
-            "{} HIP sequence changed its V25 parallel prerequisite pose between MIN and MAX",
+    Ok((first, second))
+}
+
+fn v25_hip_contacts_from_execution(
+    leg: Leg,
+    first: ContactResult,
+    second: ContactResult,
+) -> Result<DualContactResult, String> {
+    match leg {
+        Leg::Lf => Ok(DualContactResult {
+            minimum: first,
+            maximum: second,
+        }),
+        // RF physically mirrors the LF sequence: the first/downward contact is
+        // URDF MAX and the second/upward contact is URDF MIN. Reorder only the
+        // evidence container so URDF min/max diagnostics remain mathematically
+        // correct; execution order is not changed.
+        Leg::Rf => Ok(DualContactResult {
+            minimum: second,
+            maximum: first,
+        }),
+        Leg::Rh | Leg::Lh => Err(format!(
+            "{} V25 HIP contact ordering is not enabled",
             leg.label()
-        ));
+        )),
     }
-    Ok((minimum, maximum))
 }
 
 fn is_lf_hip_sequence(profile: &ContactProfile) -> bool {
@@ -3268,9 +3236,8 @@ impl MatdogRamOnlyCalibrator {
             )
             .into());
         }
-        let upper_horizontal =
-            full_sequence_prerequisite_target(leg, JointKind::Upper, UPPER_90_DELTA, upper_affine)
-                .map_err(|message| -> DynError { message.into() })?;
+        let upper_horizontal = static_target(leg, JointKind::Upper, UPPER_90_DELTA)
+            .map_err(|message| -> DynError { message.into() })?;
         let mut lower_minimum_profile = build_profile(leg, JointKind::Lower, ContactSide::Min)
             .map_err(|message| -> DynError { message.into() })?;
         let mut lower_maximum_profile = build_profile(leg, JointKind::Lower, ContactSide::Max)
@@ -3316,13 +3283,8 @@ impl MatdogRamOnlyCalibrator {
             "Transition M{} directly from MAX contact to HIP parallel hold",
             lower_id
         ))?;
-        let folded = full_sequence_prerequisite_target(
-            leg,
-            JointKind::Lower,
-            LOWER_FOLDED_DELTA,
-            lower_affine,
-        )
-        .map_err(|message| -> DynError { message.into() })?;
+        let folded = static_target(leg, JointKind::Lower, LOWER_FOLDED_DELTA)
+            .map_err(|message| -> DynError { message.into() })?;
         self.move_motor_to(lower_id, folded.target_tick, STATIC_TOLERANCE_TICKS)
             .await?;
         self.upsert_held_target(folded)?;
@@ -3330,27 +3292,29 @@ impl MatdogRamOnlyCalibrator {
         self.transition_lf_state(LfSessionState::HipMin)?;
         self.next_phase(&format!("Prepare {} HIP M{} once", leg.label(), hip_id))?;
         self.prepare_motor(hip_id).await?;
-        let (mut hip_minimum_profile, mut hip_maximum_profile) =
+        let (mut hip_first_profile, mut hip_second_profile) =
             full_sequence_hip_profile_pair(leg)
                 .map_err(|message| -> DynError { message.into() })?;
-        for profile in [&mut hip_minimum_profile, &mut hip_maximum_profile] {
+        for profile in [&mut hip_first_profile, &mut hip_second_profile] {
             replace_prerequisite_target(profile, upper_horizontal)
                 .map_err(|message| -> DynError { message.into() })?;
             replace_prerequisite_target(profile, folded)
                 .map_err(|message| -> DynError { message.into() })?;
         }
-        if hip_minimum_profile.side != ContactSide::Min
-            || hip_maximum_profile.side != ContactSide::Max
-            || hip_minimum_profile.prerequisites != hip_maximum_profile.prerequisites
+        let (expected_first_side, expected_second_side) = full_sequence_hip_execution_sides(leg)
+            .map_err(|message| -> DynError { message.into() })?;
+        if hip_first_profile.side != expected_first_side
+            || hip_second_profile.side != expected_second_side
+            || hip_first_profile.prerequisites != hip_second_profile.prerequisites
         {
             return Err(format!(
-                "{} measured HIP prerequisite pair lost V25 MIN->MAX parity",
+                "{} HIP execution pair lost its reviewed V25 physical order or parallel pose",
                 leg.label()
             )
             .into());
         }
         let hip_contacts = self
-            .measure_lf_joint_pair_efficient(hip_minimum_profile, hip_maximum_profile)
+            .measure_v25_hip_pair_efficient(leg, hip_first_profile, hip_second_profile)
             .await?;
         self.record_lf_contacts(JointKind::Hip, hip_contacts)?;
 
@@ -3462,7 +3426,7 @@ impl MatdogRamOnlyCalibrator {
 
         self.transition_lf_state(LfSessionState::ReturnHip)?;
         self.next_phase(&format!(
-            "Move {} HIP M{} from MAX contact to URDF-derived staged q=0",
+            "Move {} HIP M{} from second V25 contact to URDF-derived staged q=0",
             leg.label(),
             hip_id
         ))?;
@@ -3661,6 +3625,65 @@ impl MatdogRamOnlyCalibrator {
         if let Some(session) = &mut self.lf_session {
             session.release(motor_id);
         }
+    }
+
+    async fn measure_v25_hip_pair_efficient(
+        &mut self,
+        leg: Leg,
+        first_profile: ContactProfile,
+        second_profile: ContactProfile,
+    ) -> Result<DualContactResult, DynError> {
+        let (expected_first_side, expected_second_side) = full_sequence_hip_execution_sides(leg)
+            .map_err(|message| -> DynError { message.into() })?;
+        if first_profile.motor_id != second_profile.motor_id
+            || first_profile.joint != JointKind::Hip
+            || second_profile.joint != JointKind::Hip
+            || first_profile.side != expected_first_side
+            || second_profile.side != expected_second_side
+            || first_profile.prerequisites != second_profile.prerequisites
+        {
+            return Err(format!("invalid {} V25 HIP physical execution pair", leg.label()).into());
+        }
+
+        self.remove_held_target(first_profile.motor_id);
+        self.transition_lf_state(LfSessionState::HipMin)?;
+        self.profile = first_profile;
+        info!(
+            "MATDOG {} HIP V25 LOGICAL MIN: execute URDF {} first with probe_sign={}",
+            leg.label(),
+            self.profile.side.label(),
+            self.profile.probe_sign
+        );
+        self.set_lf_active(
+            self.profile.motor_id,
+            self.latest_observation(self.profile.motor_id)?
+                .goal_position,
+            LfActiveKind::ContactProbe,
+        )?;
+        let first = self.measure_lf_contact_side_efficient(None).await?;
+
+        self.stop_pressure(self.profile.motor_id, first.second_tick)
+            .await?;
+        self.transition_lf_state(LfSessionState::HipMax)?;
+        self.profile = second_profile;
+        info!(
+            "MATDOG {} HIP V25 LOGICAL MAX: execute URDF {} second with probe_sign={}",
+            leg.label(),
+            self.profile.side.label(),
+            self.profile.probe_sign
+        );
+        self.set_lf_active(
+            self.profile.motor_id,
+            self.latest_observation(self.profile.motor_id)?
+                .goal_position,
+            LfActiveKind::ContactProbe,
+        )?;
+        let second = self
+            .measure_lf_contact_side_efficient(Some(first.second_tick))
+            .await?;
+
+        v25_hip_contacts_from_execution(leg, first, second)
+            .map_err(|message| -> DynError { message.into() })
     }
 
     async fn measure_lf_joint_pair_efficient(

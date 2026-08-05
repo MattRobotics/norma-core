@@ -3330,8 +3330,8 @@ fn lf_full_sequence_hip_pair_remains_exact_v25() {
 }
 
 #[test]
-fn rf_full_sequence_hip_pair_is_v25_min_then_max_with_one_parallel_pose() {
-    let (minimum, maximum) = full_sequence_hip_profile_pair(Leg::Rf).unwrap();
+fn rf_full_sequence_hip_pair_executes_downward_encoder_decrease_first() {
+    let (first, second) = full_sequence_hip_profile_pair(Leg::Rf).unwrap();
     let expected = vec![
         StaticTarget {
             motor_id: 32,
@@ -3347,217 +3347,85 @@ fn rf_full_sequence_hip_pair_is_v25_min_then_max_with_one_parallel_pose() {
         },
     ];
 
-    assert_eq!(minimum.side, ContactSide::Min);
-    assert_eq!(maximum.side, ContactSide::Max);
-    assert_eq!(minimum.arm_value, RF_HIP_SEQUENCE_ARM_VALUE);
-    assert_eq!(maximum.arm_value, RF_HIP_SEQUENCE_ARM_VALUE);
-    assert_eq!(minimum.prerequisites, expected);
-    assert_eq!(maximum.prerequisites, expected);
+    assert_eq!(first.arm_value, RF_HIP_SEQUENCE_ARM_VALUE);
+    assert_eq!(second.arm_value, RF_HIP_SEQUENCE_ARM_VALUE);
+    assert_eq!(first.prerequisites, expected);
+    assert_eq!(second.prerequisites, expected);
 
-    assert_eq!(minimum.motor_id, 23);
-    assert_eq!(minimum.probe_sign, 1);
-    assert_eq!(minimum.urdf_limit_tick, 2560);
-    assert_eq!(minimum.guard_tick, 2624);
-    assert_eq!(contact_acceptance_bounds(&minimum), (2496, 2624));
+    // Historical hardware direction evidence: decreasing M23 moves RF HIP
+    // downward. That is the physical equivalent of LF V25 logical MIN and
+    // therefore must execute first, even though it is RF URDF MAX.
+    assert_eq!(first.side, ContactSide::Max);
+    assert_eq!(first.motor_id, 23);
+    assert_eq!(first.probe_sign, -1);
+    assert_eq!(first.baseline_target_tick, 1984);
+    assert_eq!(first.urdf_limit_tick, 1536);
+    assert_eq!(first.guard_tick, 1472);
+    assert_eq!(contact_acceptance_bounds(&first), (1472, 1600));
 
-    assert_eq!(maximum.motor_id, 23);
-    assert_eq!(maximum.probe_sign, -1);
-    assert_eq!(maximum.urdf_limit_tick, 1536);
-    assert_eq!(maximum.guard_tick, 1472);
-    assert_eq!(contact_acceptance_bounds(&maximum), (1472, 1600));
+    assert_eq!(second.side, ContactSide::Min);
+    assert_eq!(second.motor_id, 23);
+    assert_eq!(second.probe_sign, 1);
+    assert_eq!(second.baseline_target_tick, 2112);
+    assert_eq!(second.urdf_limit_tick, 2560);
+    assert_eq!(second.guard_tick, 2624);
+    assert_eq!(contact_acceptance_bounds(&second), (2496, 2624));
 }
 
 #[test]
-fn rf_measured_affine_prerequisites_reproduce_the_lf_v25_geometry_without_changing_lf() {
-    let baseline = BaselineStats {
-        median_current: 0,
-        mad_current: 0,
-    };
-    let rf_upper_contacts = DualContactResult {
-        minimum: ContactResult {
-            coarse_scout_tick: 2691,
-            first_tick: 2685,
-            second_tick: 2686,
-            spread_ticks: 1,
-            baseline,
-        },
-        maximum: ContactResult {
-            coarse_scout_tick: 667,
-            first_tick: 670,
-            second_tick: 668,
-            spread_ticks: 2,
-            baseline,
-        },
-    };
-    let rf_lower_contacts = DualContactResult {
-        minimum: ContactResult {
-            coarse_scout_tick: 973,
-            first_tick: 977,
-            second_tick: 977,
-            spread_ticks: 0,
-            baseline,
-        },
-        maximum: ContactResult {
-            coarse_scout_tick: 2399,
-            first_tick: 2392,
-            second_tick: 2394,
-            spread_ticks: 2,
-            baseline,
-        },
-    };
-    let rf_upper_affine =
-        derive_affine_joint_calibration(*spec_for(Leg::Rf, JointKind::Upper), rf_upper_contacts);
-    let rf_lower_affine =
-        derive_affine_joint_calibration(*spec_for(Leg::Rf, JointKind::Lower), rf_lower_contacts);
-    assert!(rf_upper_affine.accepted);
-    assert!(rf_lower_affine.accepted);
-    assert_eq!(rf_upper_affine.estimated_zero_tick, 2081);
-    assert_eq!(rf_lower_affine.estimated_zero_tick, 1983);
+fn rf_v25_prerequisites_use_validated_raw_digital_zero_geometry() {
     assert_eq!(
-        full_sequence_prerequisite_target(
-            Leg::Rf,
-            JointKind::Upper,
-            UPPER_90_DELTA,
-            rf_upper_affine,
-        )
-        .unwrap(),
+        static_target(Leg::Rh, JointKind::Upper, UPPER_30_DELTA).unwrap(),
+        StaticTarget {
+            motor_id: 32,
+            target_tick: 1707,
+        }
+    );
+    assert_eq!(
+        static_target(Leg::Rf, JointKind::Upper, UPPER_90_DELTA).unwrap(),
         StaticTarget {
             motor_id: 22,
-            target_tick: 1044,
+            target_tick: 1024,
         }
     );
     assert_eq!(
-        full_sequence_prerequisite_target(
-            Leg::Rf,
-            JointKind::Lower,
-            LOWER_FOLDED_DELTA,
-            rf_lower_affine,
-        )
-        .unwrap(),
+        static_target(Leg::Rf, JointKind::Lower, LOWER_FOLDED_DELTA).unwrap(),
         StaticTarget {
             motor_id: 21,
-            target_tick: 1032,
+            target_tick: 1058,
         }
-    );
-
-    let lf_upper_contacts = DualContactResult {
-        minimum: ContactResult {
-            coarse_scout_tick: 1439,
-            first_tick: 1439,
-            second_tick: 1439,
-            spread_ticks: 0,
-            baseline,
-        },
-        maximum: ContactResult {
-            coarse_scout_tick: 3443,
-            first_tick: 3443,
-            second_tick: 3443,
-            spread_ticks: 0,
-            baseline,
-        },
-    };
-    let lf_lower_contacts = DualContactResult {
-        minimum: ContactResult {
-            coarse_scout_tick: 3093,
-            first_tick: 3093,
-            second_tick: 3093,
-            spread_ticks: 0,
-            baseline,
-        },
-        maximum: ContactResult {
-            coarse_scout_tick: 1658,
-            first_tick: 1658,
-            second_tick: 1658,
-            spread_ticks: 0,
-            baseline,
-        },
-    };
-    let lf_upper_affine =
-        derive_affine_joint_calibration(*spec_for(Leg::Lf, JointKind::Upper), lf_upper_contacts);
-    let lf_lower_affine =
-        derive_affine_joint_calibration(*spec_for(Leg::Lf, JointKind::Lower), lf_lower_contacts);
-    assert_eq!(
-        full_sequence_prerequisite_target(
-            Leg::Lf,
-            JointKind::Upper,
-            UPPER_90_DELTA,
-            lf_upper_affine,
-        )
-        .unwrap(),
-        static_target(Leg::Lf, JointKind::Upper, UPPER_90_DELTA).unwrap()
-    );
-    assert_eq!(
-        full_sequence_prerequisite_target(
-            Leg::Lf,
-            JointKind::Lower,
-            LOWER_FOLDED_DELTA,
-            lf_lower_affine,
-        )
-        .unwrap(),
-        static_target(Leg::Lf, JointKind::Lower, LOWER_FOLDED_DELTA).unwrap()
     );
 }
 
 #[test]
-fn rf_measured_hip_profiles_remain_one_identical_min_then_max_v25_pose() {
+fn rf_v25_execution_reorders_results_only_for_urdf_evidence() {
     let baseline = BaselineStats {
         median_current: 0,
         mad_current: 0,
     };
-    let upper_contacts = DualContactResult {
-        minimum: ContactResult {
-            coarse_scout_tick: 2691,
-            first_tick: 2685,
-            second_tick: 2686,
-            spread_ticks: 1,
-            baseline,
-        },
-        maximum: ContactResult {
-            coarse_scout_tick: 667,
-            first_tick: 670,
-            second_tick: 668,
-            spread_ticks: 2,
-            baseline,
-        },
+    let downward_first_urdf_max = ContactResult {
+        coarse_scout_tick: 1538,
+        first_tick: 1536,
+        second_tick: 1536,
+        spread_ticks: 0,
+        baseline,
     };
-    let lower_contacts = DualContactResult {
-        minimum: ContactResult {
-            coarse_scout_tick: 973,
-            first_tick: 977,
-            second_tick: 977,
-            spread_ticks: 0,
-            baseline,
-        },
-        maximum: ContactResult {
-            coarse_scout_tick: 2399,
-            first_tick: 2392,
-            second_tick: 2394,
-            spread_ticks: 2,
-            baseline,
-        },
+    let upward_second_urdf_min = ContactResult {
+        coarse_scout_tick: 2558,
+        first_tick: 2560,
+        second_tick: 2560,
+        spread_ticks: 0,
+        baseline,
     };
-    let upper = full_sequence_prerequisite_target(
-        Leg::Rf,
-        JointKind::Upper,
-        UPPER_90_DELTA,
-        derive_affine_joint_calibration(*spec_for(Leg::Rf, JointKind::Upper), upper_contacts),
-    )
-    .unwrap();
-    let lower = full_sequence_prerequisite_target(
-        Leg::Rf,
-        JointKind::Lower,
-        LOWER_FOLDED_DELTA,
-        derive_affine_joint_calibration(*spec_for(Leg::Rf, JointKind::Lower), lower_contacts),
-    )
-    .unwrap();
-    let (mut minimum, mut maximum) = full_sequence_hip_profile_pair(Leg::Rf).unwrap();
-    for profile in [&mut minimum, &mut maximum] {
-        replace_prerequisite_target(profile, upper).unwrap();
-        replace_prerequisite_target(profile, lower).unwrap();
-    }
-    assert_eq!(minimum.side, ContactSide::Min);
-    assert_eq!(maximum.side, ContactSide::Max);
-    assert_eq!(minimum.prerequisites, maximum.prerequisites);
-    assert!(minimum.prerequisites.contains(&upper));
-    assert!(minimum.prerequisites.contains(&lower));
+    let rf =
+        v25_hip_contacts_from_execution(Leg::Rf, downward_first_urdf_max, upward_second_urdf_min)
+            .unwrap();
+    assert_eq!(rf.minimum.first_tick, 2560);
+    assert_eq!(rf.maximum.first_tick, 1536);
+
+    let lf =
+        v25_hip_contacts_from_execution(Leg::Lf, upward_second_urdf_min, downward_first_urdf_max)
+            .unwrap();
+    assert_eq!(lf.minimum.first_tick, 2560);
+    assert_eq!(lf.maximum.first_tick, 1536);
 }
