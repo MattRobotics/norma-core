@@ -145,3 +145,26 @@ branch from current main
 ```
 
 Only one clearly named active next-milestone branch should exist at a time. Version-numbered preparation branches and copied per-leg workflows are prohibited after this cleanup.
+
+## Canonical RF handoff to Claude — 2026-08-05
+
+The unsuccessful RF development cycle has been archived as documentation rather than merged into the active codebase.
+
+Read these files before any further RF work:
+
+```text
+tools/matdog/MATDOG_RF_CALIBRATOR_CLAUDE_HANDOFF_2026-08-05.md
+tools/matdog/CLAUDE_PROMPT_RF_CALIBRATOR_2026-08-05.md
+tools/matdog/MATDOG_RF_CALIBRATOR_HANDOFF_STATE_2026-08-05.json
+```
+
+The archived experimental RF head is:
+
+```text
+9482086baba6fac0c266c3dc509352b6547d0365
+historical PR #18
+```
+
+It is not hardware validated and must not be merged wholesale. It remains useful only for inspecting failed approaches, real-hardware regressions and the unfinished relative-span witness concept.
+
+All RF hardware packages produced before this handoff are revoked. Future development must start from `main`, use exactly one development branch and preserve the immutable LF V25 release unchanged.
