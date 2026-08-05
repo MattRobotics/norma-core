@@ -1,0 +1,85 @@
+name: MATDOG RF V25 Coarse HOME-Side Repair
+
+on:
+  pull_request:
+    branches:
+      - matdog/rf-native-calibrator
+
+permissions:
+  contents: write
+
+concurrency:
+  group: matdog-rf-v25-coarse-home-side-repair
+  cancel-in-progress: false
+
+jobs:
+  apply-test-and-publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout RF branch as source of truth
+        uses: actions/checkout@v4
+        with:
+          ref: matdog/rf-native-calibrator
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
+      - name: Apply only the existing V25 coarse HOME-side rule
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/matdog/apply_coarse_home_side_v25_fix.py
+          rustfmt --edition 2021 --config skip_children=true \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          git diff --check
+
+      - name: Enforce unchanged V25 constants and authority boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'const ADAPTIVE_FINE_SCOUT_TICKS: u16 = 32;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'const OUTSIDE_CORRIDOR_SETTLE_TOLERANCE_TICKS: u16 = 16;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'const STATIC_TOLERANCE_TICKS: u16 = 10;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'const HARD_CURRENT_ABORT_RAW: u16 = 200;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'const COARSE_STEP_TICKS: u16 = 64;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'const FINE_STEP_TICKS: u16 = 8;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          echo 'b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167  tools/matdog/matdog_native_observer_contract.py' | sha256sum -c -
+
+      - name: Complete warning-free LF and RF regression gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS='-D warnings' cargo test --package st3215 --all-targets
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test
+          python3 -m unittest -v \
+            tools.matdog.test_matdog_headless_auto_calibrate \
+            tools.matdog.test_matdog_native_observer_contract \
+            tools.matdog.test_matdog_lf_profile \
+            tools.matdog.test_matdog_v42_pinned_launcher
+
+      - name: Commit only source and regression tests to RF branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t changed < <(git diff --name-only)
+          printf 'changed files:\n'; printf '  %s\n' "${changed[@]}"
+          test "${#changed[@]}" -eq 2
+          test "${changed[0]}" = 'software/drivers/st3215/src/auto_calibrate/matdog.rs'
+          test "${changed[1]}" = 'software/drivers/st3215/src/auto_calibrate/matdog_test.rs'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- "${changed[@]}"
+          git commit -m 'fix(matdog): apply V25 HOME-side scout band during coarse contact'
+          git push origin HEAD:matdog/rf-native-calibrator
