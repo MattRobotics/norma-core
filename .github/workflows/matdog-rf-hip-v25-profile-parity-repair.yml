@@ -6,6 +6,9 @@ on:
       - matdog/rf-native-calibrator
     paths:
       - ".github/workflows/matdog-rf-hip-v25-profile-parity-repair.yml"
+  pull_request:
+    branches:
+      - matdog/rf-native-calibrator
 
 permissions:
   contents: write
