@@ -3213,3 +3213,111 @@ fn lf_m12_mirror_uses_the_same_existing_guard_rule() {
         ContactState::ContactConfirmed
     );
 }
+
+#[test]
+fn coarse_home_side_acceptance_is_v25_symmetric_for_lf_m11_and_rf_m21() {
+    let lf = profile_for_arm_value("LF_LOWER_M11_MAX").unwrap();
+    let rf = profile_for_arm_value("RF_LOWER_M21_MAX").unwrap();
+
+    assert_eq!(contact_acceptance_bounds(&lf), (1557, 1685));
+    assert_eq!(contact_acceptance_bounds(&rf), (2411, 2539));
+    assert_eq!(adaptive_contact_acceptance_bounds(&lf, None), (1557, 1717));
+    assert_eq!(adaptive_contact_acceptance_bounds(&rf, None), (2379, 2539));
+
+    // Exact RF hardware stop and its LF encoder mirror are both admitted.
+    assert!((2379..=2539).contains(&2399));
+    assert!((1557..=1717).contains(&1697));
+
+    // The band remains exactly 32 ticks and does not grow toward the guard.
+    assert!(!(2379..=2539).contains(&2378));
+    assert!(!(1557..=1717).contains(&1718));
+    assert_eq!(lf.guard_tick, 1557);
+    assert_eq!(rf.guard_tick, 2539);
+}
+
+#[test]
+fn real_rf_m21_max_coarse_trace_and_lf_mirror_are_contacts_under_v25_policy() {
+    let baseline = BaselineStats {
+        median_current: 1,
+        mad_current: 0,
+    };
+
+    let rf = profile_for_arm_value("RF_LOWER_M21_MAX").unwrap();
+    let mut rf_detector =
+        HybridContactDetector::new_for_profile_with_scout(HOME_TICK, baseline, &rf, None);
+    let rf_sample = observation(2399, 0, 48, 2439);
+    assert_eq!(
+        rf_detector.observe(rf_sample, 2439),
+        ContactState::FreeMotion
+    );
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(
+            rf_detector.observe(rf_sample, 2439),
+            ContactState::FreeMotion
+        );
+    }
+    assert_eq!(
+        rf_detector.observe(rf_sample, 2439),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        rf_detector.observe(rf_sample, 2439),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        rf_detector.observe(rf_sample, 2439),
+        ContactState::ContactConfirmed
+    );
+
+    let lf = profile_for_arm_value("LF_LOWER_M11_MAX").unwrap();
+    let mut lf_detector =
+        HybridContactDetector::new_for_profile_with_scout(HOME_TICK, baseline, &lf, None);
+    let lf_sample = observation(1697, 0, 48, 1657);
+    assert_eq!(
+        lf_detector.observe(lf_sample, 1657),
+        ContactState::FreeMotion
+    );
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(
+            lf_detector.observe(lf_sample, 1657),
+            ContactState::FreeMotion
+        );
+    }
+    assert_eq!(
+        lf_detector.observe(lf_sample, 1657),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        lf_detector.observe(lf_sample, 1657),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        lf_detector.observe(lf_sample, 1657),
+        ContactState::ContactConfirmed
+    );
+}
+
+#[test]
+fn coarse_stall_beyond_the_existing_v25_home_side_band_still_fails_closed() {
+    let baseline = BaselineStats {
+        median_current: 1,
+        mad_current: 0,
+    };
+    let rf = profile_for_arm_value("RF_LOWER_M21_MAX").unwrap();
+    let mut detector =
+        HybridContactDetector::new_for_profile_with_scout(HOME_TICK, baseline, &rf, None);
+    let sample = observation(2378, 0, 48, 2439);
+    assert_eq!(detector.observe(sample, 2439), ContactState::FreeMotion);
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(detector.observe(sample, 2439), ContactState::FreeMotion);
+    }
+    assert_eq!(
+        detector.observe(sample, 2439),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(sample, 2439),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(detector.observe(sample, 2439), ContactState::EarlyStall);
+}

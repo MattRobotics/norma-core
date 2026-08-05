@@ -896,19 +896,21 @@ fn adaptive_contact_acceptance_bounds(
     coarse_scout_tick: Option<u16>,
 ) -> (u16, u16) {
     let (mut low, mut high) = contact_acceptance_bounds(profile);
-    if let Some(scout) = coarse_scout_tick {
-        // The coarse pass is allowed to discover an earlier real stop on the
-        // HOME-facing side of the model corridor. Never extend beyond the
-        // mechanical guard; extend only away from it by a bounded amount.
-        if profile.probe_sign > 0 {
-            low = low.min(scout.saturating_sub(ADAPTIVE_FINE_SCOUT_TICKS));
-        } else {
-            high = high.max(
-                scout
-                    .saturating_add(ADAPTIVE_FINE_SCOUT_TICKS)
-                    .min(protocol::MAX_ANGLE_STEP),
-            );
-        }
+    // V25 permits the coarse scout to discover an earlier real stop on the
+    // HOME-facing side of the model corridor by the same bounded 32-tick band
+    // later used to anchor the fine passes. With no scout yet, anchor that band
+    // at the model corridor's HOME-facing edge. Never extend toward or beyond
+    // the mechanical guard.
+    let home_facing_anchor =
+        coarse_scout_tick.unwrap_or(if profile.probe_sign > 0 { low } else { high });
+    if profile.probe_sign > 0 {
+        low = low.min(home_facing_anchor.saturating_sub(ADAPTIVE_FINE_SCOUT_TICKS));
+    } else {
+        high = high.max(
+            home_facing_anchor
+                .saturating_add(ADAPTIVE_FINE_SCOUT_TICKS)
+                .min(protocol::MAX_ANGLE_STEP),
+        );
     }
     (low, high)
 }
