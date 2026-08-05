@@ -98,6 +98,7 @@ const UPPER_85_DELTA: i16 = 967;
 const LOWER_FOLDED_DELTA: i16 = -990;
 const CONTACT_ACCEPTANCE_INNER_TICKS: u16 = 64;
 const LF_HIP_SEQUENCE_ARM_VALUE: &str = "LF_HIP_M13_MIN_MAX";
+const RF_HIP_SEQUENCE_ARM_VALUE: &str = "RF_HIP_M23_MIN_MAX";
 const LF_FULL_SEQUENCE_ARM_VALUE: &str = "LF_LEG_STATE_MACHINE";
 const RF_FULL_SEQUENCE_ARM_VALUE: &str = "RF_LEG_STATE_MACHINE";
 const ADAPTIVE_FINE_SCOUT_TICKS: u16 = 32;
@@ -489,6 +490,50 @@ fn lf_hip_sequence_profile(side: ContactSide) -> Result<ContactProfile, String> 
         static_target(Leg::Lf, JointKind::Lower, LOWER_FOLDED_DELTA)?,
     ];
     Ok(profile)
+}
+
+fn full_sequence_hip_profile(leg: Leg, side: ContactSide) -> Result<ContactProfile, String> {
+    if leg == Leg::Lf {
+        // Preserve the hardware-validated LF V25 profile byte-for-byte.
+        return lf_hip_sequence_profile(side);
+    }
+    if leg != Leg::Rf {
+        return Err(format!(
+            "{} full-sequence HIP profile is not enabled",
+            leg.label()
+        ));
+    }
+
+    let parking_leg = leg
+        .parking_leg()
+        .ok_or_else(|| format!("{} has no reviewed parking leg", leg.label()))?;
+    let mut profile = build_profile(leg, JointKind::Hip, side)?;
+    profile.arm_value = RF_HIP_SEQUENCE_ARM_VALUE.to_string();
+    profile.label = RF_HIP_SEQUENCE_ARM_VALUE.to_string();
+    profile.prerequisites = vec![
+        static_target(parking_leg, JointKind::Upper, UPPER_30_DELTA)?,
+        static_target(leg, JointKind::Upper, UPPER_90_DELTA)?,
+        static_target(leg, JointKind::Lower, LOWER_FOLDED_DELTA)?,
+    ];
+    Ok(profile)
+}
+
+fn full_sequence_hip_profile_pair(leg: Leg) -> Result<(ContactProfile, ContactProfile), String> {
+    let minimum = full_sequence_hip_profile(leg, ContactSide::Min)?;
+    let maximum = full_sequence_hip_profile(leg, ContactSide::Max)?;
+    if minimum.side != ContactSide::Min || maximum.side != ContactSide::Max {
+        return Err(format!(
+            "{} HIP sequence order is not MIN then MAX",
+            leg.label()
+        ));
+    }
+    if minimum.prerequisites != maximum.prerequisites {
+        return Err(format!(
+            "{} HIP sequence changed its V25 parallel prerequisite pose between MIN and MAX",
+            leg.label()
+        ));
+    }
+    Ok((minimum, maximum))
 }
 
 fn is_lf_hip_sequence(profile: &ContactProfile) -> bool {
@@ -3173,13 +3218,10 @@ impl MatdogRamOnlyCalibrator {
         self.transition_lf_state(LfSessionState::HipMin)?;
         self.next_phase(&format!("Prepare {} HIP M{} once", leg.label(), hip_id))?;
         self.prepare_motor(hip_id).await?;
+        let (hip_minimum_profile, hip_maximum_profile) = full_sequence_hip_profile_pair(leg)
+            .map_err(|message| -> DynError { message.into() })?;
         let hip_contacts = self
-            .measure_lf_joint_pair_efficient(
-                build_profile(leg, JointKind::Hip, ContactSide::Min)
-                    .map_err(|message| -> DynError { message.into() })?,
-                build_profile(leg, JointKind::Hip, ContactSide::Max)
-                    .map_err(|message| -> DynError { message.into() })?,
-            )
+            .measure_lf_joint_pair_efficient(hip_minimum_profile, hip_maximum_profile)
             .await?;
         self.record_lf_contacts(JointKind::Hip, hip_contacts)?;
 

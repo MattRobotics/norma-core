@@ -3321,3 +3321,48 @@ fn coarse_stall_beyond_the_existing_v25_home_side_band_still_fails_closed() {
     );
     assert_eq!(detector.observe(sample, 2439), ContactState::EarlyStall);
 }
+
+#[test]
+fn lf_full_sequence_hip_pair_remains_exact_v25() {
+    let (minimum, maximum) = full_sequence_hip_profile_pair(Leg::Lf).unwrap();
+    assert_eq!(minimum, lf_hip_sequence_profile(ContactSide::Min).unwrap());
+    assert_eq!(maximum, lf_hip_sequence_profile(ContactSide::Max).unwrap());
+}
+
+#[test]
+fn rf_full_sequence_hip_pair_is_v25_min_then_max_with_one_parallel_pose() {
+    let (minimum, maximum) = full_sequence_hip_profile_pair(Leg::Rf).unwrap();
+    let expected = vec![
+        StaticTarget {
+            motor_id: 32,
+            target_tick: 1707,
+        },
+        StaticTarget {
+            motor_id: 22,
+            target_tick: 1024,
+        },
+        StaticTarget {
+            motor_id: 21,
+            target_tick: 1058,
+        },
+    ];
+
+    assert_eq!(minimum.side, ContactSide::Min);
+    assert_eq!(maximum.side, ContactSide::Max);
+    assert_eq!(minimum.arm_value, RF_HIP_SEQUENCE_ARM_VALUE);
+    assert_eq!(maximum.arm_value, RF_HIP_SEQUENCE_ARM_VALUE);
+    assert_eq!(minimum.prerequisites, expected);
+    assert_eq!(maximum.prerequisites, expected);
+
+    assert_eq!(minimum.motor_id, 23);
+    assert_eq!(minimum.probe_sign, 1);
+    assert_eq!(minimum.urdf_limit_tick, 2560);
+    assert_eq!(minimum.guard_tick, 2624);
+    assert_eq!(contact_acceptance_bounds(&minimum), (2496, 2624));
+
+    assert_eq!(maximum.motor_id, 23);
+    assert_eq!(maximum.probe_sign, -1);
+    assert_eq!(maximum.urdf_limit_tick, 1536);
+    assert_eq!(maximum.guard_tick, 1472);
+    assert_eq!(contact_acceptance_bounds(&maximum), (1472, 1600));
+}
