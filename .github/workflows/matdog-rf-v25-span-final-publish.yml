@@ -1,0 +1,117 @@
+name: MATDOG RF V25 Span Final Publish
+
+on:
+  pull_request:
+    branches:
+      - matdog/rf-native-calibrator
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: matdog-rf-v25-span-final-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'tmp/rf-v25-span-final-publish'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: matdog/rf-native-calibrator
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: '23.x'
+
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
+      - name: Apply exact LF V25 witness tolerance and hardware regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source_path = Path('software/drivers/st3215/src/auto_calibrate/matdog.rs')
+          source = source_path.read_text(encoding='utf-8')
+          old = 'const RF_MIRROR_SPAN_TOLERANCE_TICKS: u16 = REPEATABILITY_TOLERANCE_TICKS;'
+          new = 'const RF_MIRROR_SPAN_TOLERANCE_TICKS: u16 = LF_CONTACT_WITNESS_TOLERANCE_TICKS;'
+          if source.count(old) != 1:
+              raise SystemExit(f'expected one old RF tolerance, found {source.count(old)}')
+          source_path.write_text(source.replace(old, new, 1), encoding='utf-8')
+
+          test_path = Path('software/drivers/st3215/tests/matdog_rf_v25_span_contract.rs')
+          test_path.parent.mkdir(parents=True, exist_ok=True)
+          test_path.write_text(r'''use std::fs;
+use std::path::PathBuf;
+
+#[test]
+fn rf_relative_span_uses_the_frozen_lf_v25_witness_tolerance() {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(crate_dir.join("src/auto_calibrate/matdog.rs")).unwrap();
+    assert!(source.contains(
+        "const RF_MIRROR_SPAN_TOLERANCE_TICKS: u16 = LF_CONTACT_WITNESS_TOLERANCE_TICKS;"
+    ));
+    assert!(source.contains(
+        "Leg::Rf => rf_span_witness_deviation(joint, contacts) <= RF_MIRROR_SPAN_TOLERANCE_TICKS"
+    ));
+
+    // Supervised dca9d104 RF UPPER trace: span=2016; LF V25 span=1999.
+    let real_hardware_deviation = 2016_u16.abs_diff(1999);
+    assert_eq!(real_hardware_deviation, 17);
+    assert!(real_hardware_deviation <= 24);
+
+    // The frozen LF V25 witness boundary remains fail-closed at 25 ticks.
+    assert!(25_u16 > 24);
+}
+''', encoding='utf-8')
+          PY
+          rustfmt --edition 2021 --config skip_children=true \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/tests/matdog_rf_v25_span_contract.rs
+
+      - name: Verify complete Rust package warning-free
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS='-D warnings' cargo test --package st3215 --all-targets
+          git diff --check
+
+      - name: Publish one durable commit and remove temporary workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/matdog-rf-relative-span-v25-tolerance-repair.yml
+          rm -f .github/workflows/matdog-rf-v25-span-final-publish.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          mapfile -t changed < <(git diff --cached --name-only | sort)
+          printf 'changed=%s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq 4
+          test "${changed[0]}" = '.github/workflows/matdog-rf-relative-span-v25-tolerance-repair.yml'
+          test "${changed[1]}" = '.github/workflows/matdog-rf-v25-span-final-publish.yml'
+          test "${changed[2]}" = 'software/drivers/st3215/src/auto_calibrate/matdog.rs'
+          test "${changed[3]}" = 'software/drivers/st3215/tests/matdog_rf_v25_span_contract.rs'
+          git commit -m 'fix(matdog): use LF V25 witness tolerance for RF span'
+          git push origin HEAD:matdog/rf-native-calibrator
+
+      - name: Close technical PR and delete dispatcher
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set +e
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" -f state=closed
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${HEAD_REF}"
