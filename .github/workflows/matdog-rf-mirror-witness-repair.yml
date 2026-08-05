@@ -1,13 +1,13 @@
 name: MATDOG RF Mirrored Witness Repair
 
 on:
-  workflow_dispatch:
-  push:
+  pull_request:
     branches:
-      - matdog/rf-native-calibrator
+      - main
     paths:
       - .github/workflows/matdog-rf-mirror-witness-repair.yml
       - tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64
+  workflow_dispatch:
 
 permissions:
   contents: write
