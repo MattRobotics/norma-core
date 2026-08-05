@@ -1,0 +1,103 @@
+name: MATDOG RF V25 Physical Sequence Repair
+
+on:
+  push:
+    branches:
+      - matdog/rf-native-calibrator
+    paths:
+      - ".github/workflows/matdog-rf-v25-physical-sequence-fix.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: matdog-rf-v25-physical-sequence-fix
+  cancel-in-progress: false
+
+jobs:
+  apply-verify-clean:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact RF branch
+        uses: actions/checkout@v4
+        with:
+          ref: matdog/rf-native-calibrator
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
+      - name: Apply exact physical V25 mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/matdog/apply_rf_v25_physical_sequence_fix.py
+          rustfmt --edition 2021 --config skip_children=true \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          git diff --check
+
+      - name: Enforce physical direction and raw prerequisite contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=software/drivers/st3215/src/auto_calibrate/matdog.rs
+          tests=software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          grep -q 'Leg::Rf => Ok((ContactSide::Max, ContactSide::Min))' "$source"
+          grep -q 'measure_v25_hip_pair_efficient' "$source"
+          grep -q 'v25_hip_contacts_from_execution' "$source"
+          grep -q 'static_target(leg, JointKind::Upper, UPPER_90_DELTA)' "$source"
+          grep -q 'static_target(leg, JointKind::Lower, LOWER_FOLDED_DELTA)' "$source"
+          grep -q 'rf_full_sequence_hip_pair_executes_downward_encoder_decrease_first' "$tests"
+          grep -q 'rf_v25_prerequisites_use_validated_raw_digital_zero_geometry' "$tests"
+          ! grep -q 'full_sequence_prerequisite_target' "$source"
+          ! grep -q 'target_tick: 1044' "$tests"
+          ! grep -q 'target_tick: 1032' "$tests"
+          echo 'b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167  tools/matdog/matdog_native_observer_contract.py' | sha256sum -c -
+
+      - name: Warning-free complete Rust verification
+        shell: bash
+        run: |
+          set -o pipefail
+          RUSTFLAGS='-D warnings' cargo test --package st3215 --all-targets
+
+      - name: Runner observer and launcher regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test
+          python3 -m unittest -v \
+            tools.matdog.test_matdog_headless_auto_calibrate \
+            tools.matdog.test_matdog_native_observer_contract \
+            tools.matdog.test_matdog_lf_profile \
+            tools.matdog.test_matdog_v42_pinned_launcher
+
+      - name: Commit only source and tests and remove temporary tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm \
+            .github/workflows/matdog-rf-v25-physical-sequence-fix.yml \
+            tools/matdog/apply_rf_v25_physical_sequence_fix.py
+          mapfile -t changed < <(git status --porcelain=v1 | sed 's/^...//')
+          printf '%s\n' "${changed[@]}"
+          test "${#changed[@]}" -eq 4
+          printf '%s\n' "${changed[@]}" | grep -qx '.github/workflows/matdog-rf-v25-physical-sequence-fix.yml'
+          printf '%s\n' "${changed[@]}" | grep -qx 'software/drivers/st3215/src/auto_calibrate/matdog.rs'
+          printf '%s\n' "${changed[@]}" | grep -qx 'software/drivers/st3215/src/auto_calibrate/matdog_test.rs'
+          printf '%s\n' "${changed[@]}" | grep -qx 'tools/matdog/apply_rf_v25_physical_sequence_fix.py'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix(matdog): mirror exact V25 physical HIP order on RF'
+          git push origin HEAD:matdog/rf-native-calibrator
