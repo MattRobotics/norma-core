@@ -1,0 +1,184 @@
+name: MATDOG RF V25 Span Tolerance Repair
+
+on:
+  pull_request:
+    branches:
+      - matdog/rf-native-calibrator
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: matdog-rf-v25-span-tolerance-repair
+  cancel-in-progress: false
+
+jobs:
+  repair-test-publish-clean:
+    if: github.event.pull_request.head.ref == 'tmp/rf-v25-span-tolerance-24'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact RF branch
+        uses: actions/checkout@v4
+        with:
+          ref: matdog/rf-native-calibrator
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: '23.x'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
+      - name: Apply only LF V25 witness tolerance to RF relative span
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source_path = Path('software/drivers/st3215/src/auto_calibrate/matdog.rs')
+          tests_path = Path('software/drivers/st3215/src/auto_calibrate/matdog_test.rs')
+          source = source_path.read_text(encoding='utf-8')
+          tests = tests_path.read_text(encoding='utf-8')
+
+          old = 'const RF_MIRROR_SPAN_TOLERANCE_TICKS: u16 = REPEATABILITY_TOLERANCE_TICKS;'
+          new = 'const RF_MIRROR_SPAN_TOLERANCE_TICKS: u16 = LF_CONTACT_WITNESS_TOLERANCE_TICKS;'
+          if source.count(old) != 1:
+              raise SystemExit(f'expected exactly one RF span tolerance definition, found {source.count(old)}')
+          source = source.replace(old, new, 1)
+
+          marker = 'fn rf_upper_real_hardware_span_uses_the_frozen_lf_v25_witness_tolerance()'
+          if marker not in tests:
+              tests += r'''
+
+#[test]
+fn rf_upper_real_hardware_span_uses_the_frozen_lf_v25_witness_tolerance() {
+    let baseline = BaselineStats {
+        median_current: 0,
+        mad_current: 0,
+    };
+    // Supervised dca9d104 hardware evidence:
+    // RF UPPER MIN fine=2685/2686, MAX fine=670/668.
+    let contacts = DualContactResult {
+        minimum: ContactResult {
+            coarse_scout_tick: 2685,
+            first_tick: 2685,
+            second_tick: 2686,
+            spread_ticks: 1,
+            baseline,
+        },
+        maximum: ContactResult {
+            coarse_scout_tick: 670,
+            first_tick: 670,
+            second_tick: 668,
+            spread_ticks: 2,
+            baseline,
+        },
+    };
+
+    assert_eq!(RF_MIRROR_SPAN_TOLERANCE_TICKS, LF_CONTACT_WITNESS_TOLERANCE_TICKS);
+    assert_eq!(RF_MIRROR_SPAN_TOLERANCE_TICKS, 24);
+    assert_eq!(lf_v25_reference_span_ticks(JointKind::Upper), 1999);
+    assert_eq!(rf_measured_span_ticks(JointKind::Upper, contacts), 2016);
+    assert_eq!(rf_span_witness_deviation(JointKind::Upper, contacts), 17);
+    assert!(contact_witness_accepted_for_leg(
+        Leg::Rf,
+        JointKind::Upper,
+        contacts,
+    ));
+}
+
+#[test]
+fn rf_relative_span_still_rejects_one_tick_beyond_the_lf_v25_witness_tolerance() {
+    let baseline = BaselineStats {
+        median_current: 0,
+        mad_current: 0,
+    };
+    // LF V25 UPPER span is 1999. This translated RF pair spans 2024,
+    // exactly 25 ticks high, so it must remain fail-closed.
+    let contacts = DualContactResult {
+        minimum: ContactResult {
+            coarse_scout_tick: 2685,
+            first_tick: 2685,
+            second_tick: 2685,
+            spread_ticks: 0,
+            baseline,
+        },
+        maximum: ContactResult {
+            coarse_scout_tick: 661,
+            first_tick: 661,
+            second_tick: 661,
+            spread_ticks: 0,
+            baseline,
+        },
+    };
+
+    assert_eq!(rf_measured_span_ticks(JointKind::Upper, contacts), 2024);
+    assert_eq!(rf_span_witness_deviation(JointKind::Upper, contacts), 25);
+    assert!(!contact_witness_accepted_for_leg(
+        Leg::Rf,
+        JointKind::Upper,
+        contacts,
+    ));
+}
+'''
+
+          source_path.write_text(source, encoding='utf-8')
+          tests_path.write_text(tests, encoding='utf-8')
+          PY
+          rustfmt --edition 2021 --config skip_children=true \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+
+      - name: Run complete warning-free regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS='-D warnings' cargo test --package st3215 --all-targets
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test
+          python3 -m unittest -v \
+            tools.matdog.test_matdog_headless_auto_calibrate \
+            tools.matdog.test_matdog_native_observer_contract \
+            tools.matdog.test_matdog_lf_profile \
+            tools.matdog.test_matdog_v42_pinned_launcher
+          git diff --check
+
+      - name: Commit only durable source/tests and remove this workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/matdog-rf-relative-span-v25-tolerance-repair.yml
+          mapfile -t changed < <(git diff --name-only HEAD | sort)
+          printf 'changed=%s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq 3
+          test "${changed[0]}" = '.github/workflows/matdog-rf-relative-span-v25-tolerance-repair.yml'
+          test "${changed[1]}" = 'software/drivers/st3215/src/auto_calibrate/matdog.rs'
+          test "${changed[2]}" = 'software/drivers/st3215/src/auto_calibrate/matdog_test.rs'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add software/drivers/st3215/src/auto_calibrate/matdog.rs \
+                  software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          git commit -m 'fix(matdog): use LF V25 witness tolerance for RF span'
+          git push origin HEAD:matdog/rf-native-calibrator
+
+      - name: Close technical PR and delete dispatcher branch
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set +e
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" -f state=closed
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${HEAD_REF}"
