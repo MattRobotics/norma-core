@@ -81,7 +81,7 @@ jobs:
           git rm \
             .github/workflows/matdog-rf-measured-prerequisite-repair.yml \
             tools/matdog/apply_rf_measured_prerequisite_geometry.py
-          mapfile -t changed < <(git diff --name-only)
+          mapfile -t changed < <(git diff --name-only HEAD)
           printf '%s\n' "${changed[@]}"
           test "${#changed[@]}" -eq 4
           printf '%s\n' "${changed[@]}" | grep -qx '.github/workflows/matdog-rf-measured-prerequisite-repair.yml'
