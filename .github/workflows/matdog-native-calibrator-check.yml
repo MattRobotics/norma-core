@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
   group: matdog-rf-final-span-publisher
@@ -16,7 +15,7 @@ concurrency:
 
 jobs:
   publish-final-span-fix:
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'tmp/rf-v25-span-canonical-publish'
+    if: github.event.pull_request.number == 18 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'matdog/rf-native-calibrator'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout RF branch
@@ -109,15 +108,3 @@ fn rf_relative_span_uses_the_frozen_lf_v25_witness_tolerance() {
           test "${changed[4]}" = 'software/drivers/st3215/tests/matdog_rf_v25_span_contract.rs'
           git commit -m 'fix(matdog): use LF V25 witness tolerance for RF span'
           git push origin HEAD:matdog/rf-native-calibrator
-
-      - name: Close technical PR and delete dispatcher branch
-        if: always()
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-        run: |
-          set +e
-          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" -f state=closed
-          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${HEAD_REF}"
