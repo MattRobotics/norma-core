@@ -1,28 +1,25 @@
 name: Final Branch Pruning
 
 on:
-  push:
+  pull_request:
     branches:
       - main
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   prune:
     if: github.repository == 'MattRobotics/norma-core'
     runs-on: ubuntu-24.04
     steps:
-      - name: Enable merged-branch deletion and remove every noncanonical branch
+      - name: Remove every noncanonical branch
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-
-          gh api -X PATCH "repos/${GITHUB_REPOSITORY}" \
-            -F delete_branch_on_merge=true >/dev/null
 
           gh api --paginate "repos/${GITHUB_REPOSITORY}/branches?per_page=100" \
             --jq '.[].name' | while read -r branch; do
