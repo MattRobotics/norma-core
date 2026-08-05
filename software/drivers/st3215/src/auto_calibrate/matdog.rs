@@ -4274,21 +4274,22 @@ impl MatdogRamOnlyCalibrator {
 
         'approach_steps: loop {
             self.check_stop()?;
-            let next_target = advance_tick(target, self.profile.probe_sign, step_ticks)?;
-            if passed_guard(
-                next_target,
-                self.profile.guard_tick,
+            let Some(next_target) = next_guard_bounded_target(
+                target,
                 self.profile.probe_sign,
-            ) {
+                step_ticks,
+                self.profile.guard_tick,
+            )?
+            else {
                 return Err(format!(
-                    "{} travel guard reached without contact: next={}, URDF={}, guard={}",
+                    "{} travel guard reached without contact: current={}, URDF={}, guard={}",
                     self.profile.label,
-                    next_target,
+                    target,
                     self.profile.urdf_limit_tick,
                     self.profile.guard_tick
                 )
                 .into());
-            }
+            };
             self.set_motor_goal_verified(motor_id, next_target).await?;
             target = next_target;
             let settle_deadline = Instant::now() + CONTACT_SETTLE_WINDOW;
@@ -5211,6 +5212,35 @@ fn advance_tick(value: u16, sign: i8, amount: u16) -> Result<u16, DynError> {
         .ok()
         .filter(|tick| *tick <= protocol::MAX_ANGLE_STEP)
         .ok_or_else(|| format!("unsigned GoalPosition out of range: {next}").into())
+}
+
+// Preserve the reviewed V25 guard exactly. Fixed coarse/fine increments may
+// not divide the remaining travel evenly; the final command lands on the
+// existing guard instead of skipping from the last safe target beyond it.
+fn next_guard_bounded_target(
+    value: u16,
+    sign: i8,
+    amount: u16,
+    guard: u16,
+) -> Result<Option<u16>, DynError> {
+    if passed_guard(value, guard, sign) {
+        return Err(format!("current target {value} is already beyond guard {guard}").into());
+    }
+    if value == guard {
+        return Ok(None);
+    }
+    let next = i32::from(value) + i32::from(sign) * i32::from(amount);
+    let candidate = u16::try_from(next)
+        .ok()
+        .filter(|tick| *tick <= protocol::MAX_ANGLE_STEP);
+    if candidate
+        .map(|tick| passed_guard(tick, guard, sign))
+        .unwrap_or(true)
+    {
+        Ok(Some(guard))
+    } else {
+        Ok(candidate)
+    }
 }
 
 fn motion_timeout_for_distance(distance_ticks: u16) -> Duration {

@@ -3113,3 +3113,103 @@ fn mirrored_front_parking_home_priming_preserves_v25_lf_and_accepts_rf_settle() 
     assert!(full_sequence_goal_allowed(Leg::Rf, 32, 2054));
     assert!(!full_sequence_goal_allowed(Leg::Rf, 32, 2059));
 }
+
+#[test]
+fn guard_bounded_final_step_is_direction_symmetric_and_never_extends_the_guard() {
+    assert_eq!(
+        next_guard_bounded_target(1420, -1, COARSE_STEP_TICKS, 1387).unwrap(),
+        Some(1387)
+    );
+    assert_eq!(
+        next_guard_bounded_target(2676, 1, COARSE_STEP_TICKS, 2709).unwrap(),
+        Some(2709)
+    );
+    assert_eq!(
+        next_guard_bounded_target(1387, -1, COARSE_STEP_TICKS, 1387).unwrap(),
+        None
+    );
+    assert_eq!(
+        next_guard_bounded_target(2709, 1, COARSE_STEP_TICKS, 2709).unwrap(),
+        None
+    );
+    assert_eq!(
+        next_guard_bounded_target(1984, -1, COARSE_STEP_TICKS, 1387).unwrap(),
+        Some(1920)
+    );
+    assert_eq!(
+        next_guard_bounded_target(2112, 1, COARSE_STEP_TICKS, 2709).unwrap(),
+        Some(2176)
+    );
+}
+
+#[test]
+fn rf_m22_real_trace_confirms_contact_at_the_existing_guard_without_widening_it() {
+    let profile = profile_for_arm_value("RF_UPPER_M22_MIN").unwrap();
+    assert_eq!(
+        (
+            profile.urdf_limit_tick,
+            profile.guard_tick,
+            profile.probe_sign
+        ),
+        (2645, 2709, 1)
+    );
+    let baseline = BaselineStats {
+        median_current: 0,
+        mad_current: 0,
+    };
+    let mut detector = HybridContactDetector::new_for_profile(2112, baseline, &profile);
+    let target = profile.guard_tick;
+    let sample = observation(2667, 0, 1, target);
+    assert_eq!(detector.observe(sample, target), ContactState::FreeMotion);
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(detector.observe(sample, target), ContactState::FreeMotion);
+    }
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactConfirmed
+    );
+}
+
+#[test]
+fn lf_m12_mirror_uses_the_same_existing_guard_rule() {
+    let profile = profile_for_arm_value("LF_UPPER_M12_MIN").unwrap();
+    assert_eq!(
+        (
+            profile.urdf_limit_tick,
+            profile.guard_tick,
+            profile.probe_sign
+        ),
+        (1451, 1387, -1)
+    );
+    let baseline = BaselineStats {
+        median_current: 0,
+        mad_current: 0,
+    };
+    let mut detector = HybridContactDetector::new_for_profile(1984, baseline, &profile);
+    let target = profile.guard_tick;
+    let sample = observation(1434, 0, 1, target);
+    assert_eq!(detector.observe(sample, target), ContactState::FreeMotion);
+    for _ in 0..TARGET_STARTUP_SAMPLES {
+        assert_eq!(detector.observe(sample, target), ContactState::FreeMotion);
+    }
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactSuspected
+    );
+    assert_eq!(
+        detector.observe(sample, target),
+        ContactState::ContactConfirmed
+    );
+}
