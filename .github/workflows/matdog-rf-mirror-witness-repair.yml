@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/matdog-rf-mirror-witness-repair.yml
       - tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64
+      - tools/matdog/update_rf_mirror_witness_tests.py
   workflow_dispatch:
 
 permissions:
@@ -33,6 +34,7 @@ jobs:
           set -euo pipefail
           test "$(git branch --show-current)" = "matdog/rf-native-calibrator"
           test -f tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64
+          test -f tools/matdog/update_rf_mirror_witness_tests.py
           test -f .github/workflows/matdog-rf-mirror-witness-repair.yml
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
@@ -47,14 +49,16 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Apply fail-closed repair payload
+      - name: Apply fail-closed repair payload and updated regressions
         shell: bash
         run: |
           set -euo pipefail
           base64 -d tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64 \
             | gzip -d > /tmp/apply_rf_mirror_witness_repair.py
           python3 -m py_compile /tmp/apply_rf_mirror_witness_repair.py
+          python3 -m py_compile tools/matdog/update_rf_mirror_witness_tests.py
           python3 /tmp/apply_rf_mirror_witness_repair.py
+          python3 tools/matdog/update_rf_mirror_witness_tests.py
           rustfmt --edition 2021 \
             software/drivers/st3215/src/auto_calibrate/matdog.rs \
             software/drivers/st3215/src/auto_calibrate/matdog_test.rs
@@ -81,17 +85,21 @@ jobs:
               'rf_search_does_not_accept_the_observed_home_facing_plateaus',
               'rf_affine_only_false_passes_are_rejected_by_the_mirrored_lf_witness',
               'lf_v25_search_and_witness_contract_remain_unchanged',
+              'rf_mirror_witness_tightens_only_rf_home_facing_entry_and_preserves_lf_v25',
+              'rf_early_lower_plateau_is_rejected_while_lf_v25_policy_stays_unchanged',
           )
           combined = source + tests
           missing = [token for token in required if token not in combined]
           forbidden = (
               'Leg::Rf => true',
               'RF_MIRROR_WITNESS_TOLERANCE_TICKS: u16 = 24',
+              'fn coarse_home_side_acceptance_is_v25_symmetric_for_lf_m11_and_rf_m21',
+              'fn real_rf_m21_max_coarse_trace_and_lf_mirror_are_contacts_under_v25_policy',
           )
-          conflicts = [token for token in forbidden if token in source]
+          conflicts = [token for token in forbidden if token in combined]
           if missing or conflicts:
               raise SystemExit(f'missing={missing}; conflicts={conflicts}')
-          print('mirrored LF V25 RF witness source contract: PASS')
+          print('mirrored LF V25 RF witness source and regression contract: PASS')
           PY
 
       - name: Run warning-free complete ST3215 regression
@@ -105,11 +113,13 @@ jobs:
         run: |
           set -euo pipefail
           rm -f tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64
+          rm -f tools/matdog/update_rf_mirror_witness_tests.py
           rm -f .github/workflows/matdog-rf-mirror-witness-repair.yml
           git add \
             software/drivers/st3215/src/auto_calibrate/matdog.rs \
             software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
             tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64 \
+            tools/matdog/update_rf_mirror_witness_tests.py \
             .github/workflows/matdog-rf-mirror-witness-repair.yml
           mapfile -t changed < <(git diff --cached --name-only | sort)
           expected=(
@@ -117,6 +127,7 @@ jobs:
             software/drivers/st3215/src/auto_calibrate/matdog.rs
             software/drivers/st3215/src/auto_calibrate/matdog_test.rs
             tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64
+            tools/matdog/update_rf_mirror_witness_tests.py
           )
           mapfile -t expected < <(printf '%s\n' "${expected[@]}" | sort)
           test "${changed[*]}" = "${expected[*]}"
