@@ -1,0 +1,128 @@
+name: MATDOG RF Measured Prerequisite Repair
+
+on:
+  pull_request:
+    branches:
+      - matdog/rf-native-calibrator
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: matdog-rf-measured-prerequisite-repair
+  cancel-in-progress: false
+
+jobs:
+  apply-verify-and-clean:
+    if: github.event.pull_request.head.ref == 'tmp/rf-hip-v25-profile-parity-dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact RF milestone branch
+        uses: actions/checkout@v4
+        with:
+          ref: matdog/rf-native-calibrator
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
+      - name: Apply only measured V25 prerequisite geometry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/matdog/apply_rf_measured_prerequisite_geometry.py
+          rustfmt --edition 2021 --config skip_children=true \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          git diff --check
+
+      - name: Enforce unchanged LF and safety contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'Leg::Lf => static_target(leg, kind, q_delta)' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'Leg::Rf => affine_static_target' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'const STATIC_TOLERANCE_TICKS: u16 = 10;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'const PROBE_HOME_TOLERANCE_TICKS: u16 = 16;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'const TORQUE_LIMIT: u16 = 500;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'const GOAL_SPEED: u16 = 160;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'const HARD_CURRENT_ABORT_RAW: u16 = 200;' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          grep -q 'persistent_freeze_authorized=false' software/drivers/st3215/src/auto_calibrate/matdog.rs
+          echo 'b9521f97ed0a3cf4d7f39d8712c2fb7a060fa56bbbc2a10b8709742d6b0a5167  tools/matdog/matdog_native_observer_contract.py' | sha256sum -c -
+
+      - name: Complete warning-free software verification
+        shell: bash
+        run: |
+          set -o pipefail
+          RUSTFLAGS='-D warnings' cargo test --package st3215 --all-targets
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg LF --self-test
+          python3 tools/matdog/matdog_headless_auto_calibrate.py --leg RF --self-test
+          python3 -m unittest -v \
+            tools.matdog.test_matdog_headless_auto_calibrate \
+            tools.matdog.test_matdog_native_observer_contract \
+            tools.matdog.test_matdog_lf_profile \
+            tools.matdog.test_matdog_v42_pinned_launcher
+
+      - name: Commit source and tests, removing all temporary tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm \
+            .github/workflows/matdog-rf-measured-prerequisite-repair.yml \
+            tools/matdog/apply_rf_measured_prerequisite_geometry.py
+          mapfile -t changed < <(git diff --name-only)
+          printf '%s\n' "${changed[@]}"
+          test "${#changed[@]}" -eq 4
+          printf '%s\n' "${changed[@]}" | grep -qx '.github/workflows/matdog-rf-measured-prerequisite-repair.yml'
+          printf '%s\n' "${changed[@]}" | grep -qx 'software/drivers/st3215/src/auto_calibrate/matdog.rs'
+          printf '%s\n' "${changed[@]}" | grep -qx 'software/drivers/st3215/src/auto_calibrate/matdog_test.rs'
+          printf '%s\n' "${changed[@]}" | grep -qx 'tools/matdog/apply_rf_measured_prerequisite_geometry.py'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          git commit -m 'fix(matdog): reproduce V25 prerequisite geometry from measured RF affine maps'
+          git push origin HEAD:matdog/rf-native-calibrator
+
+      - name: Close technical PR and remove every temporary branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set +e
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" -f state=closed >/dev/null
+          for branch in \
+            tmp/rf-guard-repair-dispatch \
+            tmp/rf-hip-v25-profile-parity-dispatch \
+            tmp/rf-v25-coarse-home-side-dispatch
+          do
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${branch}" >/dev/null 2>&1 || true
+          done
+
+      - name: Delete completed non-canonical workflow runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set +e
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(.status == "completed" and .conclusion != "success") | .id' \
+            | sort -u > /tmp/noncanonical-runs.txt
+          while read -r run_id; do
+            [[ -z "$run_id" || "$run_id" == "$GITHUB_RUN_ID" ]] && continue
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" >/dev/null 2>&1 || true
+          done < /tmp/noncanonical-runs.txt
