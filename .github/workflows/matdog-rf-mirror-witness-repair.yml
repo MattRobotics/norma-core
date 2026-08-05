@@ -1,0 +1,126 @@
+name: MATDOG RF Mirrored Witness Repair
+
+on:
+  push:
+    branches:
+      - matdog/rf-native-calibrator
+    paths:
+      - .github/workflows/matdog-rf-mirror-witness-repair.yml
+      - tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64
+
+permissions:
+  contents: write
+
+concurrency:
+  group: matdog-rf-mirror-witness-repair
+  cancel-in-progress: false
+
+jobs:
+  apply-and-verify:
+    name: Apply exact mirrored LF V25 witness gate to RF
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout RF branch
+        uses: actions/checkout@v4
+        with:
+          ref: matdog/rf-native-calibrator
+          fetch-depth: 0
+
+      - name: Prove expected repair inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = "matdog/rf-native-calibrator"
+          test -f tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64
+          test -f .github/workflows/matdog-rf-mirror-witness-repair.yml
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "23.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
+      - name: Apply fail-closed repair payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64 \
+            | gzip -d > /tmp/apply_rf_mirror_witness_repair.py
+          python3 -m py_compile /tmp/apply_rf_mirror_witness_repair.py
+          python3 /tmp/apply_rf_mirror_witness_repair.py
+          rustfmt --edition 2021 \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+          git diff --check
+
+      - name: Verify exact mirrored geometry and immutable LF behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('software/drivers/st3215/src/auto_calibrate/matdog.rs').read_text()
+          tests = Path('software/drivers/st3215/src/auto_calibrate/matdog_test.rs').read_text()
+          required = (
+              'const RF_MIRROR_WITNESS_TOLERANCE_TICKS: u16 = REPEATABILITY_TOLERANCE_TICKS;',
+              'const RF_MIRROR_SEARCH_ENTRY_TOLERANCE_TICKS: u16 = FINE_STEP_TICKS;',
+              'fn rf_reference_contact_ticks(joint: JointKind) -> (u16, u16)',
+              'fn rf_mirror_search_entry_tick(profile: &ContactProfile) -> Option<u16>',
+              'fn rf_home_facing_before_mirror_search_entry(',
+              'minimum <= tolerance && maximum <= tolerance',
+              'UPPER mirrored-contact prerequisite gate rejected',
+              'LOWER mirrored-contact prerequisite gate rejected',
+              'rf_reference_contacts_are_exact_mirrors_of_lf_v25',
+              'rf_search_does_not_accept_the_observed_home_facing_plateaus',
+              'rf_affine_only_false_passes_are_rejected_by_the_mirrored_lf_witness',
+              'lf_v25_search_and_witness_contract_remain_unchanged',
+          )
+          combined = source + tests
+          missing = [token for token in required if token not in combined]
+          forbidden = (
+              'Leg::Rf => true',
+              'RF_MIRROR_WITNESS_TOLERANCE_TICKS: u16 = 24',
+          )
+          conflicts = [token for token in forbidden if token in source]
+          if missing or conflicts:
+              raise SystemExit(f'missing={missing}; conflicts={conflicts}')
+          print('mirrored LF V25 RF witness source contract: PASS')
+          PY
+
+      - name: Run warning-free complete ST3215 regression
+        shell: bash
+        run: |
+          set -o pipefail
+          RUSTFLAGS='-D warnings' cargo test --package st3215 --all-targets
+
+      - name: Remove temporary repair machinery and commit durable patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64
+          rm -f .github/workflows/matdog-rf-mirror-witness-repair.yml
+          git add \
+            software/drivers/st3215/src/auto_calibrate/matdog.rs \
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs \
+            tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64 \
+            .github/workflows/matdog-rf-mirror-witness-repair.yml
+          mapfile -t changed < <(git diff --cached --name-only | sort)
+          expected=(
+            .github/workflows/matdog-rf-mirror-witness-repair.yml
+            software/drivers/st3215/src/auto_calibrate/matdog.rs
+            software/drivers/st3215/src/auto_calibrate/matdog_test.rs
+            tools/matdog/apply_rf_mirror_witness_repair.py.gz.b64
+          )
+          mapfile -t expected < <(printf '%s\n' "${expected[@]}" | sort)
+          test "${changed[*]}" = "${expected[*]}"
+          git diff --cached --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'fix(matdog): enforce mirrored LF V25 contact witness on RF'
+          git push origin HEAD:matdog/rf-native-calibrator
