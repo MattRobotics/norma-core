@@ -112,6 +112,14 @@ const KINEMATIC_PLATEAU_SAMPLES: usize = 3;
 const KINEMATIC_PLATEAU_POSITION_SPAN_TICKS: u16 = 3;
 const MODEL_ZERO_ENDPOINT_CONSISTENCY_TICKS: u16 = 24;
 const LF_CONTACT_WITNESS_TOLERANCE_TICKS: u16 = 24;
+// RF is the exact mirrored mechanism of the hardware-validated LF leg. Its
+// supervised contacts must therefore reproduce the mirrored LF V25 witness,
+// not merely fall inside the broad affine scale band.
+const RF_MIRROR_WITNESS_TOLERANCE_TICKS: u16 = REPEATABILITY_TOLERANCE_TICKS;
+// Do not accept a HOME-facing friction plateau as the RF contact. Continue the
+// bounded search until at least one fine step from the exact mirrored LF V25
+// endpoint. LF V25 search behavior remains unchanged.
+const RF_MIRROR_SEARCH_ENTRY_TOLERANCE_TICKS: u16 = FINE_STEP_TICKS;
 const MODEL_ZERO_MAX_SHIFT_FROM_DIGITAL_HOME_TICKS: u16 = 96;
 const LF_TRANSITION_SETTLED_SAMPLES: u8 = 4;
 const LF_TRANSITION_SETTLE_WINDOW: Duration = Duration::from_millis(400);
@@ -990,6 +998,39 @@ fn contact_acceptance_bounds(profile: &ContactProfile) -> (u16, u16) {
     )
 }
 
+fn reference_contact_tick_for_profile(profile: &ContactProfile) -> Option<u16> {
+    let (minimum, maximum) = reference_contact_ticks_for_leg(profile.leg, profile.joint)?;
+    Some(match profile.side {
+        ContactSide::Min => minimum,
+        ContactSide::Max => maximum,
+    })
+}
+
+fn rf_mirror_search_entry_tick(profile: &ContactProfile) -> Option<u16> {
+    if profile.leg != Leg::Rf {
+        return None;
+    }
+    let reference = reference_contact_tick_for_profile(profile)?;
+    Some(if profile.probe_sign > 0 {
+        reference.saturating_sub(RF_MIRROR_SEARCH_ENTRY_TOLERANCE_TICKS)
+    } else {
+        reference
+            .saturating_add(RF_MIRROR_SEARCH_ENTRY_TOLERANCE_TICKS)
+            .min(protocol::MAX_ANGLE_STEP)
+    })
+}
+
+fn rf_home_facing_before_mirror_search_entry(profile: &ContactProfile, position: u16) -> bool {
+    let Some(entry) = rf_mirror_search_entry_tick(profile) else {
+        return false;
+    };
+    if profile.probe_sign > 0 {
+        position < entry
+    } else {
+        position > entry
+    }
+}
+
 fn adaptive_contact_acceptance_bounds(
     profile: &ContactProfile,
     coarse_scout_tick: Option<u16>,
@@ -1011,6 +1052,20 @@ fn adaptive_contact_acceptance_bounds(
                 .min(protocol::MAX_ANGLE_STEP),
         );
     }
+
+    // RF is not allowed to certify an early plateau merely because it lies in
+    // the broad model/affine corridor. Its mechanism and travel are the exact
+    // mirror of LF V25, so the contact detector enters its acceptance region
+    // only when the mirrored LF endpoint has been reached to within one fine
+    // step. The existing mechanical guard remains the outer bound.
+    if let Some(entry) = rf_mirror_search_entry_tick(profile) {
+        if profile.probe_sign > 0 {
+            low = low.max(entry);
+        } else {
+            high = high.min(entry);
+        }
+    }
+
     (low, high)
 }
 
@@ -2262,14 +2317,59 @@ fn lf_reference_contact_ticks(joint: JointKind) -> (u16, u16) {
     }
 }
 
-fn lf_contact_witness_deviations(joint: JointKind, contacts: DualContactResult) -> (u16, u16) {
-    let (minimum, maximum) = lf_reference_contact_ticks(joint);
-    (
-        circular_distance(contact_result_tick(contacts.minimum), minimum),
-        circular_distance(contact_result_tick(contacts.maximum), maximum),
-    )
+fn mirror_tick_about_digital_home(tick: u16) -> u16 {
+    (i32::from(HOME_TICK) * 2 - i32::from(tick)).rem_euclid(TICKS_PER_REVOLUTION) as u16
 }
 
+fn rf_reference_contact_ticks(joint: JointKind) -> (u16, u16) {
+    let (lf_minimum, lf_maximum) = lf_reference_contact_ticks(joint);
+    match joint {
+        // RF HIP physical down/up are the mirrored LF MIN/MAX movements but
+        // occupy the opposite RF URDF side labels.
+        JointKind::Hip => (
+            mirror_tick_about_digital_home(lf_maximum),
+            mirror_tick_about_digital_home(lf_minimum),
+        ),
+        JointKind::Upper | JointKind::Lower => (
+            mirror_tick_about_digital_home(lf_minimum),
+            mirror_tick_about_digital_home(lf_maximum),
+        ),
+    }
+}
+
+fn reference_contact_ticks_for_leg(leg: Leg, joint: JointKind) -> Option<(u16, u16)> {
+    match leg {
+        Leg::Lf => Some(lf_reference_contact_ticks(joint)),
+        Leg::Rf => Some(rf_reference_contact_ticks(joint)),
+        Leg::Rh | Leg::Lh => None,
+    }
+}
+
+fn contact_witness_tolerance_for_leg(leg: Leg) -> Option<u16> {
+    match leg {
+        Leg::Lf => Some(LF_CONTACT_WITNESS_TOLERANCE_TICKS),
+        Leg::Rf => Some(RF_MIRROR_WITNESS_TOLERANCE_TICKS),
+        Leg::Rh | Leg::Lh => None,
+    }
+}
+
+fn contact_witness_deviations_for_leg(
+    leg: Leg,
+    joint: JointKind,
+    contacts: DualContactResult,
+) -> Option<(u16, u16)> {
+    let (minimum, maximum) = reference_contact_ticks_for_leg(leg, joint)?;
+    Some((
+        circular_distance(contact_result_tick(contacts.minimum), minimum),
+        circular_distance(contact_result_tick(contacts.maximum), maximum),
+    ))
+}
+
+fn lf_contact_witness_deviations(joint: JointKind, contacts: DualContactResult) -> (u16, u16) {
+    contact_witness_deviations_for_leg(Leg::Lf, joint, contacts).expect("LF V25 witness exists")
+}
+
+#[cfg(test)]
 fn lf_contact_witness_accepted(joint: JointKind, contacts: DualContactResult) -> bool {
     let (minimum, maximum) = lf_contact_witness_deviations(joint, contacts);
     minimum <= LF_CONTACT_WITNESS_TOLERANCE_TICKS && maximum <= LF_CONTACT_WITNESS_TOLERANCE_TICKS
@@ -2374,14 +2474,13 @@ fn contact_witness_accepted_for_leg(
     joint: JointKind,
     contacts: DualContactResult,
 ) -> bool {
-    match leg {
-        Leg::Lf => lf_contact_witness_accepted(joint, contacts),
-        // The first RF run is itself the supervised hardware witness. It may
-        // stage an affine q0 in RAM, but no persistent freeze is authorized by
-        // this native measurement engine.
-        Leg::Rf => true,
-        Leg::Rh | Leg::Lh => false,
-    }
+    let Some((minimum, maximum)) = contact_witness_deviations_for_leg(leg, joint, contacts) else {
+        return false;
+    };
+    let Some(tolerance) = contact_witness_tolerance_for_leg(leg) else {
+        return false;
+    };
+    minimum <= tolerance && maximum <= tolerance
 }
 
 fn derive_leg_joint_evidence(
@@ -3227,12 +3326,14 @@ impl MatdogRamOnlyCalibrator {
             )
             .await?;
         self.record_lf_contacts(JointKind::Upper, upper_contacts)?;
-        let upper_affine =
-            derive_affine_joint_calibration(*spec_for(leg, JointKind::Upper), upper_contacts);
-        if !upper_affine.accepted {
+        let upper_prerequisite_evidence =
+            derive_leg_joint_evidence(leg, *spec_for(leg, JointKind::Upper), upper_contacts);
+        if !upper_prerequisite_evidence.accepted {
             return Err(format!(
-                "{} UPPER affine prerequisite gate rejected before LOWER/HIP geometry",
-                leg.label()
+                "{} UPPER mirrored-contact prerequisite gate rejected before LOWER/HIP geometry: affine_accepted={}, witness_accepted={}",
+                leg.label(),
+                upper_prerequisite_evidence.affine.accepted,
+                upper_prerequisite_evidence.contact_witness_accepted,
             )
             .into());
         }
@@ -3268,12 +3369,14 @@ impl MatdogRamOnlyCalibrator {
             .measure_lf_joint_pair_efficient(lower_minimum_profile, lower_maximum_profile)
             .await?;
         self.record_lf_contacts(JointKind::Lower, lower_contacts)?;
-        let lower_affine =
-            derive_affine_joint_calibration(*spec_for(leg, JointKind::Lower), lower_contacts);
-        if !lower_affine.accepted {
+        let lower_prerequisite_evidence =
+            derive_leg_joint_evidence(leg, *spec_for(leg, JointKind::Lower), lower_contacts);
+        if !lower_prerequisite_evidence.accepted {
             return Err(format!(
-                "{} LOWER affine prerequisite gate rejected before HIP geometry",
-                leg.label()
+                "{} LOWER mirrored-contact prerequisite gate rejected before HIP geometry: affine_accepted={}, witness_accepted={}",
+                leg.label(),
+                lower_prerequisite_evidence.affine.accepted,
+                lower_prerequisite_evidence.contact_witness_accepted,
             )
             .into());
         }
@@ -3362,17 +3465,31 @@ impl MatdogRamOnlyCalibrator {
                     evidence.contact_witness_accepted,
                 );
             } else {
+                let (minimum_deviation, maximum_deviation) = contact_witness_deviations_for_leg(
+                    Leg::Rf,
+                    evidence.spec.kind,
+                    evidence.contacts,
+                )
+                .expect("RF mirrored witness exists");
+                let (reference_minimum, reference_maximum) =
+                    rf_reference_contact_ticks(evidence.spec.kind);
                 info!(
-                    "MATDOG RF SUPERVISED WITNESS CANDIDATE: {} M{} MIN={}/{} MAX={}/{} repeatability={}/{} affine_accepted={} persistent_freeze_authorized=false",
+                    "MATDOG RF MIRRORED LF V25 WITNESS: {} M{} reference_MIN={} reference_MAX={} measured_MIN={}/{} measured_MAX={}/{} deviations={}/{} tolerance={} repeatability={}/{} affine_accepted={} witness_accepted={} persistent_freeze_authorized=false",
                     evidence.spec.kind.label(),
                     evidence.spec.motor_id,
+                    reference_minimum,
+                    reference_maximum,
                     evidence.contacts.minimum.first_tick,
                     evidence.contacts.minimum.second_tick,
                     evidence.contacts.maximum.first_tick,
                     evidence.contacts.maximum.second_tick,
+                    minimum_deviation,
+                    maximum_deviation,
+                    RF_MIRROR_WITNESS_TOLERANCE_TICKS,
                     evidence.contacts.minimum.spread_ticks,
                     evidence.contacts.maximum.spread_ticks,
                     evidence.affine.accepted,
+                    evidence.contact_witness_accepted,
                 );
             }
             if !evidence.fixed_scale.accepted {
@@ -3394,12 +3511,13 @@ impl MatdogRamOnlyCalibrator {
             .filter(|evidence| !evidence.accepted)
             .map(|evidence| {
                 format!(
-                    "{} M{} endpoint_disagreement={}tick/{:.2}deg affine_scale={}permille",
+                    "{} M{} endpoint_disagreement={}tick/{:.2}deg affine_scale={}permille witness_accepted={}",
                     evidence.spec.kind.label(),
                     evidence.spec.motor_id,
                     evidence.fixed_scale.endpoint_disagreement_ticks,
                     ticks_to_degrees(i32::from(evidence.fixed_scale.endpoint_disagreement_ticks)),
                     evidence.affine.scale_permille,
+                    evidence.contact_witness_accepted,
                 )
             })
             .collect::<Vec<_>>();
@@ -4547,6 +4665,23 @@ impl MatdogRamOnlyCalibrator {
                         return Ok(observation.position);
                     }
                     ContactState::EarlyStall => {
+                        if rf_home_facing_before_mirror_search_entry(
+                            &self.profile,
+                            observation.position,
+                        ) {
+                            info!(
+                                "MATDOG {} RF mirrored-witness plateau bypass: target={}, present={}, mirror_entry={}, current={}, threshold={}, velocity={}",
+                                self.profile.label,
+                                target,
+                                observation.position,
+                                rf_mirror_search_entry_tick(&self.profile)
+                                    .expect("RF mirror entry exists"),
+                                observation.current,
+                                baseline.contact_threshold(),
+                                speed_magnitude(observation.velocity),
+                            );
+                            continue 'approach_steps;
+                        }
                         self.stop_pressure(motor_id, observation.position).await?;
                         let (acceptance_low, acceptance_high) =
                             adaptive_contact_acceptance_bounds(&self.profile, coarse_scout_tick);
@@ -4642,6 +4777,18 @@ impl MatdogRamOnlyCalibrator {
                         self.stop_pressure(motor_id, contact.position).await?;
                         return Ok(contact.position);
                     }
+                }
+                if rf_home_facing_before_mirror_search_entry(&self.profile, observation.position) {
+                    info!(
+                        "MATDOG {} RF mirrored-witness tracking plateau bypass: target={}, present={}, mirror_entry={}, current={}",
+                        self.profile.label,
+                        target,
+                        observation.position,
+                        rf_mirror_search_entry_tick(&self.profile)
+                            .expect("RF mirror entry exists"),
+                        observation.current,
+                    );
+                    continue 'approach_steps;
                 }
                 self.stop_pressure(motor_id, observation.position).await?;
                 return Err(format!(
