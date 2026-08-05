@@ -1,6 +1,7 @@
 name: MATDOG RF Mirrored Witness Repair
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - matdog/rf-native-calibrator
