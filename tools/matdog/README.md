@@ -1,5 +1,35 @@
 # MATDOG calibrator — canonical LF V25 state
 
+## Canonical calibration architecture update — 2026-08-07
+
+Before any further RF/RH/LH implementation, read:
+
+```text
+tools/matdog/MATDOG_CALIBRATION_CANONICAL_HANDOFF_2026-08-07.md
+```
+
+That document is the current cross-repository development contract and supersedes the 2026-08-05 RF development prescriptions wherever they conflict.
+
+The immediate development order is now:
+
+```text
+1. robot-dog: offline Geometry Compiler / 24 mesh-predicted contacts and safe paths
+2. norma-core: refactor to one generic V25-derived full-leg engine
+3. hardware: RF -> RH -> LH
+```
+
+Do not continue runtime wiring of the current duplicated local `RfSessionStateMachine` before the geometry/profile review.
+
+The corrected q=0 contract is also explicit there: manual/visual home is a seed only; the final model q=0 is derived from model geometry plus repeatable hardware contacts, staged/verified in RAM/software, and only then may a separately authorized transactional EEPROM freeze be considered.
+
+The current local RF worktree/checkpoint must be preserved as evidence:
+
+```text
+/home/matteo-manicardi/MATDOG/worktrees/norma-core-rf-calibrator
+branch: matdog/rf-calibrator-from-lf-v25
+checkpoint base: b2f7dac2eab7147917fccdfde702360da82ab7de
+```
+
 ## Validation status
 
 The only mechanically hardware-validated MATDOG calibration flow is **LF V25**.
@@ -133,6 +163,8 @@ Release-only workflow definitions remain solely on `release/matdog-lf-calibrator
 
 ## Next development milestone
 
+The previous direct-RF milestone below is historical and is superseded by the geometry-first handoff above. Preserve it for audit context only:
+
 ```text
 branch from current main
 → add data-driven RF geometry/directions/prerequisites
@@ -146,11 +178,11 @@ branch from current main
 
 Only one clearly named active next-milestone branch should exist at a time. Version-numbered preparation branches and copied per-leg workflows are prohibited after this cleanup.
 
-## Canonical RF handoff to Claude — 2026-08-05
+## Historical RF handoff to Claude — 2026-08-05
 
 The unsuccessful RF development cycle has been archived as documentation rather than merged into the active codebase.
 
-Read these files before any further RF work:
+Historical files:
 
 ```text
 tools/matdog/MATDOG_RF_CALIBRATOR_CLAUDE_HANDOFF_2026-08-05.md
@@ -167,4 +199,4 @@ historical PR #18
 
 It is not hardware validated and must not be merged wholesale. It remains useful only for inspecting failed approaches, real-hardware regressions and the unfinished relative-span witness concept.
 
-All RF hardware packages produced before this handoff are revoked. Future development must start from `main`, use exactly one development branch and preserve the immutable LF V25 release unchanged.
+All RF hardware packages produced before that handoff are revoked. Future development follows `MATDOG_CALIBRATION_CANONICAL_HANDOFF_2026-08-07.md`, preserves the immutable LF V25 release, and keeps all hardware blocked until the required offline gates and explicit human authorization are complete.
