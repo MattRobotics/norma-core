@@ -1,38 +1,64 @@
-# MATDOG calibrator — canonical LF V25 state
+# MATDOG calibrator — current canonical state
 
-## Canonical calibration architecture update — 2026-08-07
+## Current development milestone — 2026-08-11
 
-Before any further RF/RH/LH implementation, read:
+Geometry Compiler V5 / Phase 2A0 is now CLOSED and merged in `MattRobotics/robot-dog`.
+
+Current development order:
+
+```text
+PHASE 2A
+one generic V25-derived full-leg engine in norma-core
+↓
+PHASE 2B
+final path/parking safety integration
+↓
+PHASE 2C
+complete offline validation
+↓
+future hardware
+RF -> RH -> LH
+```
+
+Current operational entry handoff:
+
+```text
+tools/matdog/MATDOG_PHASE2A_GENERIC_V25_ENTRY_HANDOFF_2026-08-11.md
+```
+
+The older:
 
 ```text
 tools/matdog/MATDOG_CALIBRATION_CANONICAL_HANDOFF_2026-08-07.md
 ```
 
-That document is the current cross-repository development contract and supersedes the 2026-08-05 RF development prescriptions wherever they conflict.
+is retained as historical/architectural evidence. It is no longer the current milestone entry point where it says Geometry Compiler is still the immediate next task.
 
-The immediate development order is now:
+## Sources of truth
 
-```text
-1. robot-dog: offline Geometry Compiler / 24 mesh-predicted contacts and safe paths
-2. norma-core: refactor to one generic V25-derived full-leg engine
-3. hardware: RF -> RH -> LH
-```
+Always verify live remote/local state before changes.
 
-Do not continue runtime wiring of the current duplicated local `RfSessionStateMachine` before the geometry/profile review.
-
-The corrected q=0 contract is also explicit there: manual/visual home is a seed only; the final model q=0 is derived from model geometry plus repeatable hardware contacts, staged/verified in RAM/software, and only then may a separately authorized transactional EEPROM freeze be considered.
-
-The current local RF worktree/checkpoint must be preserved as evidence:
+Expected entry checkpoints at handoff creation:
 
 ```text
-/home/matteo-manicardi/MATDOG/worktrees/norma-core-rf-calibrator
-branch: matdog/rf-calibrator-from-lf-v25
-checkpoint base: b2f7dac2eab7147917fccdfde702360da82ab7de
+MattRobotics/robot-dog
+main after Geometry V5 merge:
+f07aa094a1b78c5670cc36ef3fdb349422a38955
+
+MattRobotics/norma-core
+main:
+f47b1ba579c623139058a8b0118648015739ab10
+
+immutable LF V25 release:
+release/matdog-lf-calibrator-v25
+f87dd1fbc7e8100d275c74f9af448642f3429680
 ```
 
-## Validation status
+The real GitHub remotes and the real ASUS filesystem override stale handoff metadata if legitimate newer state exists.
 
-The only mechanically hardware-validated MATDOG calibration flow is **LF V25**.
+## LF V25 — immutable hardware oracle
+
+LF V25 remains the only mechanically hardware-validated MATDOG full-leg calibration flow.
 
 ```text
 measurement sequence: 58/58 DONE
@@ -43,30 +69,7 @@ EEPROM transaction: LF_FROZEN
 persistent profile: LF_FROZEN
 ```
 
-```text
-RF: not yet mechanically hardware validated
-RH: not yet mechanically hardware validated
-LH: not yet mechanically hardware validated
-complete all-leg persistent profile: not yet validated
-```
-
-Older V28–V42 and “all legs” branches were development experiments. They must not be used, merged or revived as current calibration programs.
-
-## What LF V25 does
-
-The digital-home commissioning program remains separate. LF V25:
-
-1. measures all six physical LF endpoints through Station;
-2. checks repeatability and supervised hardware evidence;
-3. compares the measured span with the URDF;
-4. derives an affine joint model and q0;
-5. stages q0 in RAM;
-6. stops Station and verifies serial-adapter release;
-7. performs an explicit transactional EEPROM freeze;
-8. writes the persistent LF and partial global profiles;
-9. verifies global torque OFF.
-
-## Final LF evidence
+Final LF evidence:
 
 | Joint | Motor | Final MIN contact | Final MAX contact | Affine q0 before EEPROM |
 |---|---:|---:|---:|---:|
@@ -74,43 +77,193 @@ The digital-home commissioning program remains separate. LF V25:
 | LF upper | M12 | 1439 | 3443 | 2040 |
 | LF lower | M11 | 3093 | 1658 | 2074 |
 
-Measured mechanical spans versus the URDF:
-
-| Joint | URDF span | Measured span | Difference |
-|---|---:|---:|---:|
-| M13 hip | 90.00 deg | 82.18 deg | -7.82 deg |
-| M12 upper | 174.99 deg | 176.13 deg | +1.14 deg |
-| M11 lower | 129.55 deg | 126.12 deg | -3.43 deg |
-
-The affine endpoint residuals were below 0.1 degree for all six contacts.
-
-## EEPROM freeze result
-
-| Motor | Previous Position Offset | Frozen Position Offset | Final displayed q0 |
-|---|---:|---:|---:|
-| M11 lower | 101 | 127 | 2046 |
-| M12 upper | 859 | 851 | 2051 |
-| M13 hip | -505 | -486 | 2048 |
-
-All three motors were read back with EEPROM lock enabled and torque disabled.
-
-## Canonical source refs
+Final hardware contact angles:
 
 ```text
-main
-→ current development base
-→ future RF/RH/LH generalization starts here
-
-release/matdog-lf-calibrator-v25
-→ immutable exact reviewed release
-→ reviewed source head: f87dd1fbc7e8100d275c74f9af448642f3429680
-→ implementation PR: #11
-→ post-merge CI cleanup PR: #12
+HIP   MIN -42.803°   MAX +39.375°
+UPPER MIN -53.525°   MAX +122.607°
+LOWER MIN -91.846°   MAX +34.277°
 ```
 
-The release branch must never be rewritten. LF V25 must not be rerun unless LF mechanics, servo, mounting, URDF or calibration state changes.
+Exact validated release:
 
-## Principal implementation files
+```text
+release/matdog-lf-calibrator-v25
+f87dd1fbc7e8100d275c74f9af448642f3429680
+```
+
+The release branch must never be rewritten and LF V25 must not be retrospectively modified to fit later geometry or other legs.
+
+RF/RH/LH are not hardware validated.
+
+## Phase 2A target architecture
+
+Required:
+
+```text
+LegSessionStateMachine
++
+LegCalibrationSpec
+```
+
+not independent LF/RF/RH/LH state machines.
+
+Conceptually:
+
+```text
+Generic V25 Full-Leg Engine
+  -> LF LegCalibrationSpec
+  -> RF LegCalibrationSpec
+  -> RH LegCalibrationSpec
+  -> LH LegCalibrationSpec
+```
+
+Before refactoring LF V25, classify every materially relevant constant/helper/state transition:
+
+```text
+A — truly generic calibration behavior
+B — geometry/profile/spec data
+C — global ST3215 hardware/safety parameter
+D — historical LF-only evidence / witness
+```
+
+Review this mapping before moving logic.
+
+Do not alter a detector/safety threshold merely to make another leg pass.
+
+## Geometry Compiler V5 contract from robot-dog
+
+Canonical merged `robot-dog` baseline immediately after PR #19:
+
+```text
+f07aa094a1b78c5670cc36ef3fdb349422a38955
+```
+
+Corrected V5 semantic hashes:
+
+```text
+endpoint
+  de205209f6015734f43af7f49146ecf60f89a74d6ce1276ce134c189a89c9f7e
+parking
+  67c58430e78241af1a636cdcc22092ff855371713fc7f26bc56412f7c7181139
+combined
+  0a772234a46afad14eb4af0999294020bb0fb8974ca0b68f3ccd780fa057db51
+```
+
+Permanent semantic boundary:
+
+```text
+CANONICAL V5 != G4 REPLAY
+```
+
+Legacy G4 30/50/90-degree contexts are replay evidence only and must never re-enter the generic runtime/spec as canonical prerequisite truth.
+
+## Safety-policy state to preserve
+
+Final external reference policy:
+
+```text
+16 PASS
+0 FAIL
+8 UNRESOLVED
+0 motion authorizations
+3 mm threshold unchanged
+```
+
+All eight `UNRESOLVED` are outside the executable URDF target domain.
+
+Permanent contract:
+
+```text
+UNRESOLVED != PASS
+DIAGNOSTIC != EXECUTABLE
+GEOMETRIC CONTACT != MOTION AUTHORIZATION
+```
+
+The generic engine must make it impossible for a diagnostic/outside-limit target to silently become executable.
+
+## Historical RF worktree — preserve, do not continue as architecture
+
+On the ASUS, verify and preserve:
+
+```text
+/home/matteo-manicardi/MATDOG/worktrees/norma-core-rf-calibrator
+branch: matdog/rf-calibrator-from-lf-v25
+historical checkpoint: b2f7dac2eab7147917fccdfde702360da82ab7de
+```
+
+It is evidence only. Do not reset/delete it and do not merge its duplicated RF state-machine design wholesale.
+
+## Phase 2A is offline software-foundation work
+
+Phase 2A does not authorize:
+
+```text
+physical servo motion
+Station motion execution
+direct serial probing
+EEPROM writes
+Position Offset changes
+RF/RH/LH hardware calibration
+persistent q0 freeze
+```
+
+Hardware remains gated behind later Phase 2B/2C offline validation and explicit current-session human authorization.
+
+## Permanent ST3215 / Station rules
+
+- Station remains the sole owner of the ST3215 serial adapter during motion.
+- `GoalPosition` remains unsigned standard `0..4095`; signed-wrap is forbidden.
+- Digital-home commissioning remains separate from mechanical endpoint calibration.
+- Static joints are validated by real position drift/state integrity, not one isolated raw-speed sample.
+- Every hardware contact must pass repeatability, model consistency and supervised evidence.
+- EEPROM access starts only after complete measurement PASS, Station shutdown and verified serial release.
+- EEPROM provisioning must be transactional: backup, unlock, write, action, readback, relock, rollback on failure.
+- No per-leg exception may hide a generic detector problem.
+
+## q0 / scale / affine distinction
+
+The generalized system must distinguish:
+
+```text
+physical encoder/transmission scale
+q0 offset
+geometry/endstop mismatch
+fitted affine diagnostic normalization
+```
+
+A fitted affine model must not erase raw model-vs-hardware disagreement.
+
+LF measured spans remain evidence, never mandatory RF/RH/LH coordinates.
+
+## Known entry risk: live-FK status mismatch
+
+`robot-dog` contains a pre-existing contract mismatch:
+
+```text
+tracked state:
+DIGITAL_ZERO_CALIBRATED_AND_VERIFIED
+
+live-FK loader expects:
+VISUAL_ZERO_CAPTURED_PENDING_LIVE_VALIDATION
+```
+
+Phase 2A G0 must explicitly determine whether the generic calibrator depends on this loader/contract.
+
+If it does, resolve the semantic contradiction before relying on live FK. Do not change the established digital zero merely to make tests green.
+
+## Durable MATDOG CI
+
+Current reusable checks on `norma-core/main` include:
+
+```text
+.github/workflows/matdog-native-calibrator-check.yml
+.github/workflows/matdog-native-observer-check.yml
+```
+
+Use existing CI coverage before creating redundant workflows.
+
+## Principal implementation files to inventory before refactor
 
 ```text
 software/drivers/st3215/src/auto_calibrate/matdog.rs
@@ -121,82 +274,8 @@ tools/matdog/matdog_lf_profile.py
 tools/matdog/matdog_native_observer_contract.py
 ```
 
-The exact release also contains an internally named pinned-Station launcher created during development. Its historical filename is part of the byte-identical release artifact; it does **not** identify a newer validated calibration version. The validated release name remains LF V25.
+## Current first gate
 
-## Permanent safety and architecture rules
+Do not begin by rewriting `matdog.rs`.
 
-- Station remains the sole owner of the ST3215 serial adapter during motion.
-- `GoalPosition` remains unsigned standard `0..4095`; signed-wrap is forbidden.
-- Digital-home commissioning remains separate from mechanical endpoint calibration.
-- Static joints are validated by real position drift and state integrity, not by one isolated raw-speed sample.
-- A bounded friction/chamfer plateau may be crossed only when a deeper coarse scout already proved that travel.
-- Every contact must pass repeatability, affine/URDF consistency and supervised hardware evidence.
-- EEPROM access starts only after complete measurement PASS, Station shutdown and serial release.
-- EEPROM provisioning must back up, unlock, write, trigger Action, read back, relock and roll back on failure.
-- No later leg may introduce per-motor exceptions to hide a general detector problem.
-
-## CI and workflow evidence
-
-The reviewed V25 source completed four successful release checks:
-
-```text
-30881806113  MATDOG Native Calibrator Offline Check
-30881806178  MATDOG Native Observer Check
-30881806060  pinned Station release artifact
-30881806080  LF measurement and freeze release artifact
-```
-
-The post-merge main cleanup completed:
-
-```text
-30882331333  MATDOG Native Calibrator Offline Check
-```
-
-On `main`, only durable reusable checks remain:
-
-```text
-.github/workflows/matdog-native-calibrator-check.yml
-.github/workflows/matdog-native-observer-check.yml
-```
-
-Release-only workflow definitions remain solely on `release/matdog-lf-calibrator-v25` with the exact validated source. Failed, cancelled, incomplete, duplicate and superseded runs are removed from the canonical Actions history.
-
-## Next development milestone
-
-The previous direct-RF milestone below is historical and is superseded by the geometry-first handoff above. Preserve it for audit context only:
-
-```text
-branch from current main
-→ add data-driven RF geometry/directions/prerequisites
-→ preserve LF V25 tests and evidence unchanged
-→ supervised RF six-contact calibration
-→ RF affine gate
-→ transactional RF freeze
-→ repeat individually for RH and LH
-→ validate the complete twelve-joint persistent profile
-```
-
-Only one clearly named active next-milestone branch should exist at a time. Version-numbered preparation branches and copied per-leg workflows are prohibited after this cleanup.
-
-## Historical RF handoff to Claude — 2026-08-05
-
-The unsuccessful RF development cycle has been archived as documentation rather than merged into the active codebase.
-
-Historical files:
-
-```text
-tools/matdog/MATDOG_RF_CALIBRATOR_CLAUDE_HANDOFF_2026-08-05.md
-tools/matdog/CLAUDE_PROMPT_RF_CALIBRATOR_2026-08-05.md
-tools/matdog/MATDOG_RF_CALIBRATOR_HANDOFF_STATE_2026-08-05.json
-```
-
-The archived experimental RF head is:
-
-```text
-9482086baba6fac0c266c3dc509352b6547d0365
-historical PR #18
-```
-
-It is not hardware validated and must not be merged wholesale. It remains useful only for inspecting failed approaches, real-hardware regressions and the unfinished relative-span witness concept.
-
-All RF hardware packages produced before that handoff are revoked. Future development follows `MATDOG_CALIBRATION_CANONICAL_HANDOFF_2026-08-07.md`, preserves the immutable LF V25 release, and keeps all hardware blocked until the required offline gates and explicit human authorization are complete.
+Start with a read-only G0 audit and a source-level LF V25 behavioral inventory. Only after the A/B/C/D mapping is reviewed may the generic-engine refactor begin.
